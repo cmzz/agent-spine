@@ -1,0 +1,13 @@
+{
+  "name": "agent-spine",
+  "version": "1.2.0",
+  "description": "本地自主 harness（跑在 Claude Code 进程内，无需任何服务/容器）。/spine-run 编排长时自主的 implement→review→fix→archive 循环；spine-coder subagent 负责执行并产出详细过程日志；/spine-analyze 读跨 run 指标提 harness 自迭代建议。确定性动作全部委托给 npc CLI。",
+  "author": {
+    "name": "alpha"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/winewei/agent-spine",
+  "repository": "https://github.com/winewei/agent-spine",
+  "category": "workflow",
+  "keywords": ["harness", "autonomous", "orchestration", "openspec", "code-review", "subagent", "npc"]
+}
