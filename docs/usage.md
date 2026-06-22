@@ -6,9 +6,13 @@
 
 ## 层 1：装 `npc` CLI（机器级，所有 Claude Code session 共享）
 
+`npc` 现为独立仓库 [cmzz/npc](https://github.com/cmzz/npc)，本仓库以子模块 `vendor/npc` 引入：
+
 ```bash
-uv tool install --reinstall git+https://github.com/winewei/agent-spine.git
-npc --version          # 应输出 npc 1.2.0
+git submodule update --init                       # 拉取 vendor/npc 子模块
+uv tool install --force --from vendor/npc npc     # 从子模块装 CLI
+npc --version          # 应输出 npc 1.3.0
+# 或直接从远程装：uv tool install --from git+ssh://git@z.github.com/cmzz/npc.git npc
 ```
 
 首次在某工程内 `npc init` 时会自举 `~/task_log/.new-plan-review-schema.json` 与 `~/.local/bin/portable-timeout`。

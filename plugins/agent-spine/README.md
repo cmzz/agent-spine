@@ -20,7 +20,8 @@
 
 ## 前置依赖
 
-- **`npc` CLI**（必需）：`uv tool install --reinstall git+https://github.com/winewei/agent-spine.git`
+- **`npc` CLI**（必需，独立仓库 [cmzz/npc](https://github.com/cmzz/npc)，本仓库以子模块 `vendor/npc` 引入）：
+  `git submodule update --init` 后 `uv tool install --force --from vendor/npc npc`
 - **`git`**、**`openspec`**（archive + 目标拆解需要）
 - **`codex`**（默认 review 引擎；可经 `.npc/config.toml` 切 `claude` 引擎）
 

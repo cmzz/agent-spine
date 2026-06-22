@@ -1,62 +1,35 @@
 # agent-spine
 
-> Deterministic execution layer for Agent skills — the "Non-Player Character" that runs the scripted work while the LLM plays.
+> 人驾驭的自主 harness（跑在 Claude Code 进程内）——从 spec 到结果交付。
 >
-> Agent skill 的确定性执行层：执行脚本化机械动作的 NPC，让 LLM 专注决策。
+> 主 session 调度、spine-coder 执行、确定性动作委托给 [`npc`](https://github.com/cmzz/npc)。
 
-[![tests](https://github.com/winewei/agent-spine/actions/workflows/test.yml/badge.svg)](https://github.com/winewei/agent-spine/actions/workflows/test.yml)
+本仓库是 **harness 的上层**（plugin + skill + 宪法）。确定性执行层 `npc` 已抽成**独立仓库 [cmzz/npc](https://github.com/cmzz/npc)**，本仓库以**子模块 `vendor/npc`** 引入——同一套 `npc` 工具也被 aidevos 等复用。
 
-把 skill.md 中**确定性的** bash + jq 散落逻辑（路径计算、状态读写、模板渲染、事件追加、指标派生、commit 校验，以及外部子进程 codex/openspec/git 的编排）迁移到 Python CLI，达成：
-
-- **减少 LLM 上下文压力**：skill.md 行数大幅下降，每次调用 token 成本下降
-- **提升执行确定性**：纯字符串拼接 / 状态读写 / 模板渲染 / 子进程编排交给软件，而不是 LLM
-- **降低维护成本**：bash + jq 散落片段 → Python 类型化模块 + pytest 覆盖
-- **统一调用契约**：CLI 子命令名稳定，skill.md 引用接口而非内部实现
-
-配套 skill：[`/new-plan-changes-v2`](plugins/agent-spine/commands/new-plan-changes-v2.md)——主 session 侧负责 plan→implement→review→archive 的编排与人机交互，把确定性动作委托给 `npc`。skill 通过 Claude Code **plugin 体系**分发（见下文「Claude Code Plugin 安装」段）。
-
-> **推荐用法**：`npc` 单独可用，但要发挥最大价值需 **CLI + plugin + CLAUDE.md 三层一起配置**。完整步骤（含可直接粘贴的 CLAUDE.md 片段）见 [docs/usage.md](docs/usage.md)。
+- **智能层**：[`/spine-run`](plugins/agent-spine/commands/spine-run.md) 编排 plan→implement→review→fix→archive；[`/spine-analyze`](plugins/agent-spine/commands/spine-analyze.md) 自迭代。
+- **执行层**：[`spine-coder`](plugins/agent-spine/agents/spine-coder.md) subagent。
+- **底座**：`npc` CLI（子模块 `vendor/npc`）。
+- **宪法**：[docs/principles.md](docs/principles.md) 4 条不变量。
 
 ---
 
 ## 安装
 
-### 从 GitHub 安装（推荐）
-
-直接从仓库安装，无需克隆到本地：
-
 ```bash
-# SSH（私有仓库，需配置 GitHub SSH key）
-uv tool install --reinstall git+ssh://git@github.com/winewei/agent-spine.git
-
-# HTTPS（仓库公开时）
-uv tool install --reinstall git+https://github.com/winewei/agent-spine.git
-
-npc --version
-npc --help
-```
-
-升级到远端最新：
-
-```bash
-uv tool upgrade agent-spine
-```
-
-卸载：
-
-```bash
-uv tool uninstall agent-spine
-```
-
-### 本地源码安装
-
-先克隆仓库，再从本地目录安装（`--reinstall` 必需：从本地路径装时 uv 不会自动感知版本变化）：
-
-```bash
-git clone git@github.com:winewei/agent-spine.git
+git clone --recurse-submodules git@z.github.com:cmzz/agent-spine.git
 cd agent-spine
-uv tool install --reinstall --from . agent-spine
+# 已克隆但没带子模块：git submodule update --init
+
+# 1) 装 npc CLI（来自子模块）
+uv tool install --force --from vendor/npc npc
+npc --version          # npc 1.3.0
+
+# 2) 装 harness plugin（Claude Code 内）
+#   /plugin marketplace add <本仓库路径或 cmzz/agent-spine>
+#   /plugin install agent-spine@agent-spine
 ```
+
+> **推荐三层配置**（CLI + plugin + CLAUDE.md 片段）见 [docs/usage.md](docs/usage.md)。`npc` 完整契约见其仓库的 `docs/cli.md`。
 
 ### 开发模式
 
