@@ -1,3 +1,3 @@
 [submodule "vendor/npc"]
 	path = vendor/npc
-	url = git@z.github.com:cmzz/npc.git
+	url = https://github.com/cmzz/npc.git

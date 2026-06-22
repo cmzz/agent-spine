@@ -16,7 +16,7 @@
 ## 安装
 
 ```bash
-git clone --recurse-submodules git@z.github.com:cmzz/agent-spine.git
+git clone --recurse-submodules https://github.com/cmzz/agent-spine.git
 cd agent-spine
 # 已克隆但没带子模块：git submodule update --init
 
@@ -31,37 +31,23 @@ npc --version          # npc 1.3.0
 
 > **推荐三层配置**（CLI + plugin + CLAUDE.md 片段）见 [docs/usage.md](docs/usage.md)。`npc` 完整契约见其仓库的 `docs/cli.md`。
 
-### 开发模式
+### 一键安装
 
 ```bash
-git clone git@github.com:winewei/agent-spine.git
-cd agent-spine
-uv sync                # 创建 .venv + 装依赖
-uv run npc --help      # 跑 CLI
-uv run pytest -q       # 跑测试套件
+bash install.sh        # 子模块 → npc CLI → plugin → 体检（幂等，详见 INSTALL.md）
 ```
 
-或者用 editable 模式（源码改动直接生效，仅 `pyproject.toml` 元数据变化时才需重装）：
-
-```bash
-uv tool install --reinstall --editable .
-```
-
-### Claude Code Plugin 安装
-
-`npc` CLI 提供机械动作执行能力，**配套 slash command `/new-plan-changes-v2`** 通过本仓库自带的 Claude Code marketplace 分发，标准两步安装：
+### Claude Code Plugin 安装（手动）
 
 ```text
-# 在 Claude Code 中执行（任选其一）：
-/plugin marketplace add winewei/agent-spine        # 从 GitHub 装（推荐）
-/plugin marketplace add /Users/alpha/claude_tools  # 从本地仓库装（开发态）
-
+# 在 Claude Code 中执行：
+/plugin marketplace add <本仓库绝对路径>   # 或 cmzz/agent-spine
 /plugin install agent-spine@agent-spine
 ```
 
-随后在任意工程内输入 `/new-plan-changes-v2` 即可。Plugin 升级用 `/plugin update agent-spine@agent-spine`。
+装完得到 `/spine-run`、`/spine-analyze`、`spine-coder`（**重启 Claude Code 后生效**）。Plugin 升级 `/plugin update agent-spine@agent-spine`。
 
-> Plugin 与 CLI 互相独立：CLI 装一次（机器级，所有 Claude Code session 共享），plugin 装一次（用户级，所有 Claude Code project 共享）。两者版本应保持一致——升级 CLI 后建议同步 `/plugin update`。
+> npc CLI（来自子模块 `vendor/npc`）与 plugin 相互独立：CLI 机器级装一次，plugin 用户级装一次。`npc` 的命令速查/契约见其独立仓库 [cmzz/npc](https://github.com/cmzz/npc) 的 README 与 `docs/cli.md`。
 
 ### 系统依赖
 

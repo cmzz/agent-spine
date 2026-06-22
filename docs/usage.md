@@ -12,7 +12,7 @@
 git submodule update --init                       # 拉取 vendor/npc 子模块
 uv tool install --force --from vendor/npc npc     # 从子模块装 CLI
 npc --version          # 应输出 npc 1.3.0
-# 或直接从远程装：uv tool install --from git+ssh://git@z.github.com/cmzz/npc.git npc
+# 或直接从远程装：uv tool install --from git+ssh://git@github.com/cmzz/npc.git npc
 ```
 
 首次在某工程内 `npc init` 时会自举 `~/task_log/.new-plan-review-schema.json` 与 `~/.local/bin/portable-timeout`。
