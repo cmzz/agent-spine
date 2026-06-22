@@ -24,6 +24,22 @@ tags: [harness, autonomous, orchestration, openspec, review-loop]
 
 ---
 
+## 成本感知路由（模型分层，见 docs/principles.md 不变量 1 & 4）
+
+按 **provider 两档**，把高 token 消耗的 bulk 工作卸到便宜后端：
+
+| 层 | 角色 | 跑在哪 |
+|---|---|---|
+| **廉价层（执行）** | coder（implement / fix 写代码） | MiMo `mimo-v2.5-pro`，经 `${CLAUDE_PLUGIN_ROOT}/scripts/spine-coder-mimo.sh` |
+| **premium 层（决策 + 分析/验证）** | 主 session 编排、`npc review run`、`/spine-analyze` | Claude / codex |
+
+**铁律**：MiMo **只许执行，绝不用于决策与分析/验证**。review 必须留在 codex/Claude——coder 在 MiMo 时，review 天然异源，满足"生成⊥验证"。
+
+**启用条件**：仓库外存在 `~/.config/npc/mimo.env`（含 MiMo base_url + token + `mimo-v2.5-pro`，chmod 600，绝不入 git）。
+**回退**：mimo.env 缺失 → coder 回退到 Claude 上的 `spine-coder` subagent（脚本退出码 3 即信号）。
+
+---
+
 ## Step 0 — 前置检查（缺依赖立即停）
 
 ```bash
@@ -94,18 +110,21 @@ npc state add-change $SEQ "$CID"
 
 ### 3a. Implement
 
+**廉价层路由（默认，mimo.env 存在时）**——coder 跑在 MiMo，bulk token 不耗 Claude：
 ```bash
-npc agent prompt render --phase implement --change-id "$CID"   # 完整模板落盘，你看不到内容
+RESULT_LINE=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/spine-coder-mimo.sh" implement "$CID")
+# 脚本内部已自动 render prompt + 经 MiMo headless 跑 coder + 抽 RESULT 行
+```
+
+**回退路由（mimo.env 缺失，脚本退出码 3）**——coder 跑在 Claude：
+```bash
+npc agent prompt render --phase implement --change-id "$CID"
 SPAWN=$(npc agent spawn-prompt --phase implement --change-id "$CID")
 PROMPT_TEXT=$(echo "$SPAWN" | jq -r '.prompt')
 ```
+然后用 `Agent` 工具 spawn：`subagent_type=spine-coder`、`description=Implement <CID>`、`prompt=$PROMPT_TEXT`，取其返回的 RESULT 行。
 
-用 `Agent` 工具 spawn 执行体（**这是你与 coder 唯一的交接**）：
-- `subagent_type`: `spine-coder`
-- `description`: `Implement <CID>`
-- `prompt`: `$PROMPT_TEXT`（~150 tokens 引导语，指向落盘的完整 prompt 文件）
-
-subagent 返回**一行 RESULT**。装订：
+装订（两条路由一致）：
 ```bash
 IMPL=$(npc implement record --seq $SEQ --result "$RESULT_LINE")
 [ "$(echo "$IMPL" | jq -r '.ok')" = "true" ] || { 进入 Step 3d 决策点; }
@@ -120,10 +139,9 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
    && [ "$(echo "$R" | jq -r '.stale')" = "false" ] \
    && [ $N -lt 20 ]; do
   N=$((N+1))
-  npc agent prompt render --phase fix --change-id "$CID" --round $N   # 自动注入上一轮 blocking findings + 修复历史
-  SPAWN=$(npc agent spawn-prompt --phase fix --change-id "$CID" --round $N)
-  PROMPT_TEXT=$(echo "$SPAWN" | jq -r '.prompt')
-  # Agent(subagent_type="spine-coder", description="Fix <CID> r$N", prompt=$PROMPT_TEXT)
+  # 廉价层：coder 跑 MiMo（脚本内部 render fix prompt + 注入上一轮 blocking findings + 修复历史）
+  FIX_RESULT_LINE=$(bash "${CLAUDE_PLUGIN_ROOT}/scripts/spine-coder-mimo.sh" fix "$CID" "$N")
+  # 回退（脚本退出码 3）：render + Agent(subagent_type="spine-coder", description="Fix <CID> r$N") 取 RESULT
   FIX=$(npc fix record --seq $SEQ --round $N --result "$FIX_RESULT_LINE")
   [ "$(echo "$FIX" | jq -r '.ok')" = "true" ] || break
   R=$(npc review run --seq $SEQ --round $N)
@@ -193,7 +211,9 @@ npc index append          # 追加跨 run 索引
 
 ## Guardrails（硬约束）
 
-- **你不写业务代码**。所有实现/修复一律 spawn `spine-coder`。你只 spawn、收 RESULT 行、调 npc 装订。
+- **你不写业务代码**。所有实现/修复一律交给 coder（默认 MiMo 启动器，回退 `spine-coder` subagent）。你只触发 coder、收 RESULT 行、调 npc 装订。
+- **生成 ⊥ 验证（不变量 1）**：coder（生成）与 review（验证）永不同源。coder 跑 MiMo 时，`npc review run` 必须仍走 codex/Claude——绝不把 review 路由到 MiMo。
+- **MiMo 只许执行（不变量 4）**：MiMo 仅用于 coder 层。你（主 session 决策）和 `/spine-analyze`（分析）、`npc review run`（验证）一律 premium 层（Claude/codex），绝不路由到 MiMo。
 - **你不读 prompt 模板 / review.json / summary.md 原文**。只读 npc 子命令返回的一行 JSON 的关键字段。需要细节时引用 npc 给的 `pointer` 路径，不要把原文拉进 context。
 - **每个 npc 命令后检查 `.ok` 与 exit code**：exit 1 业务失败 / 2 用法错 / 3 环境错 / 4 依赖缺失。依赖缺失（4）立即停并提示安装。
 - **review-fix 循环必须有上限**（默认 20 轮）且尊重 `stale` 闸门——绝不无限打磨。
