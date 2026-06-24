@@ -154,14 +154,31 @@ class MimoEnvError(Exception):
     """
 
 
-def _mimo_env(cfg: Config) -> dict[str, str]:
-    """读取并解析 mimo_env_file，叠加到当前进程 env 之上返回。
+_ANTHROPIC_BILLING_KEYS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
-    - 文件缺失 → ``FileNotFoundError``（CLI 转 dependency_missing exit 4）
-    - 读取受阻（PermissionError 等，chmod 600 密钥很常见）→ ``MimoEnvError``（CLI 转 env exit 3）
+
+def _scrubbed_base_env() -> dict[str, str]:
+    """返回当前进程环境剔除 Anthropic 计费凭据后的 baseline dict。
+
+    剔除 ``ANTHROPIC_API_KEY`` 与 ``ANTHROPIC_AUTH_TOKEN``，确保子进程永不因
+    继承到的 Anthropic API 凭据而被 headless ``claude -p`` 静默路由到付费 API。
+    其余环境变量（PATH、HOME 等）原样保留。
     """
     import os
 
+    return {k: v for k, v in os.environ.items() if k not in _ANTHROPIC_BILLING_KEYS}
+
+
+def _mimo_env(cfg: Config) -> dict[str, str]:
+    """读取并解析 mimo_env_file，叠加到 scrubbed baseline 之上返回。
+
+    - 文件缺失 → ``FileNotFoundError``（CLI 转 dependency_missing exit 4）
+    - 读取受阻（PermissionError 等，chmod 600 密钥很常见）→ ``MimoEnvError``（CLI 转 env exit 3）
+
+    使用 scrubbed baseline（已剔除继承的 Anthropic 计费凭据）作底，再叠加
+    ``mimo.env`` 解析出的键值——MiMo 自带的凭据（指向第三方端点）正常覆盖，
+    不受剔除逻辑影响。
+    """
     env_file = _resolve_mimo_env_file(cfg)
     if not env_file.is_file():
         raise FileNotFoundError(
@@ -177,7 +194,7 @@ def _mimo_env(cfg: Config) -> dict[str, str]:
             f"mimo.env 读取失败：{env_file}：{e}（密钥文件通常 chmod 600，请检查权限）"
         ) from e
     parsed = parse_env_file(text)
-    merged = dict(os.environ)
+    merged = _scrubbed_base_env()
     merged.update(parsed)
     return merged
 
@@ -296,7 +313,7 @@ def _run_backend(
             env = _mimo_env(cfg)
         else:
             model = cfg.coder.model
-            env = None
+            env = _scrubbed_base_env()
         argv = _build_claude_argv(claude_bin, spawn_text, model)
         result = runner(argv=argv, cwd=repo_root, env=env, timeout=timeout)
         return result, model
