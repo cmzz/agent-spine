@@ -242,7 +242,36 @@ def check_routing(cfg: _config.Config) -> list[dict]:
             }
         )
 
+    # 规则 4：in-session 绝不与 mimo 同源（mimo 只许 headless）
+    _check_mimo_in_session(cfg, violations)
+
     return violations
+
+
+def _check_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
+    """校验 mimo 后端不得使用 in-session 分发（纯函数，原地追加 violation）。
+
+    遍历所有可能的 phase（implement、fix）校验全局 dispatch 与 per-phase dispatch。
+    """
+    coder = cfg.coder
+    phases_to_check = ["implement", "fix"]
+
+    for phase in phases_to_check:
+        resolved_backend = coder.backend_for_phase(phase) or coder.effective_backend
+        if resolved_backend != "mimo":
+            continue
+        # backend 是 mimo，检查该 phase 的 dispatch
+        resolved_dispatch = coder.dispatch_for_phase(phase, resolved_backend)
+        if resolved_dispatch == "in-session":
+            violations.append(
+                {
+                    "rule": "mimo_in_session",
+                    "detail": (
+                        f"coder phase={phase!r} 后端=mimo 但 dispatch=in-session，"
+                        "违反 MiMo 只许 headless"
+                    ),
+                }
+            )
 
 
 def run_routing(args: argparse.Namespace) -> None:

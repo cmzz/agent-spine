@@ -51,6 +51,20 @@ class CoderRunResult:
 Runner = Callable[..., CoderRunResult]
 
 
+def resolve_dispatch(
+    cfg: Config, phase: str, backend: str, cli_override: str | None = None
+) -> str:
+    """决定某 phase 的 coder dispatch（headless | in-session）。
+
+    优先级：
+    1. ``cli_override``（CLI ``--dispatch``）
+    2. per-phase 覆盖 ``[coder].dispatch_phase.<phase>``
+    3. 全局 ``[coder].dispatch``
+    4. 内置默认表（claude ⇒ in-session，mimo/codex ⇒ headless）
+    """
+    return cfg.coder.dispatch_for_phase(phase, backend, cli_override)
+
+
 def resolve_backend(cfg: Config, phase: str, override: str | None = None) -> str:
     """决定某 phase 的 coder backend。
 
@@ -333,15 +347,24 @@ def run_implement(
     change_id: str,
     *,
     backend: str | None = None,
+    dispatch: str | None = None,
     timeout: int | None = None,
     config_path: Path | None = None,
     runner: Runner = _default_runner,
 ) -> dict:
-    """跑完整 implement coder：phase enter → 渲染 prompt → backend 子进程 → record。"""
+    """跑完整 implement coder：phase enter → 渲染 prompt → backend 子进程 → record。
+
+    当 dispatch=in-session 时：phase enter + render，返回 deferred 指令，不 spawn 子进程，
+    不 record（留编排者拿 RESULT 后调 npc implement record）。
+    """
     cfg = load_config(p.repo_root, override_path=config_path)
     selected = resolve_backend(cfg, "implement", backend)
+    dispatch_mode = resolve_dispatch(cfg, "implement", selected, dispatch)
 
     _pipeline._do_phase_enter(p, seq, "implement")
+
+    if dispatch_mode == "in-session":
+        return _do_implement_in_session(p, seq, change_id, selected)
 
     # enter 之后必须保证配对 exit：从渲染到 backend 子进程整段兜底，
     # 任何异常都先把 phase 落 failed 再走错误返回（避免 phase 悬挂在 in-progress）。
@@ -364,6 +387,65 @@ def run_implement(
             progress_updates={"status": "failed", "reason": "coder-setup-error"},
         )
         raise
+
+
+def _do_implement_in_session(
+    p: _paths.Paths,
+    seq: int,
+    change_id: str,
+    backend: str,
+) -> dict:
+    """in-session 分支：渲染 prompt 并返回 deferred 分发指令（不 spawn 子进程，不 record）。"""
+    state = read_state(p.state_json)
+    entry = state.get("progress", [{}])[seq - 1] if state.get("progress") else {}
+    base = Path(entry.get("base") or _paths.base_for(p, seq, change_id))
+
+    prompt_file, spawn_text = _render_prompt_file(
+        p, seq, change_id, base, "implement", None, None
+    )
+
+    return {
+        "ok": True,
+        "deferred": True,
+        "dispatch": "in-session",
+        "seq": seq,
+        "change_id": change_id,
+        "phase": "implement",
+        "backend": backend,
+        "spawn_prompt": spawn_text,
+        "prompt_file": str(prompt_file.resolve()),
+    }
+
+
+def _do_fix_in_session(
+    p: _paths.Paths,
+    seq: int,
+    change_id: str,
+    round_n: int,
+    backend: str,
+) -> dict:
+    """in-session 分支（fix）：渲染 prompt 并返回 deferred 分发指令（不 spawn，不 record）。"""
+    state = read_state(p.state_json)
+    entry = state.get("progress", [{}])[seq - 1] if state.get("progress") else {}
+    implement_commit = entry.get("implement_commit")
+    base = Path(entry.get("base") or _paths.base_for(p, seq, change_id))
+
+    prompt_file, spawn_text = _render_prompt_file(
+        p, seq, change_id, base, "fix", round_n, implement_commit
+    )
+
+    return {
+        "ok": True,
+        "deferred": True,
+        "dispatch": "in-session",
+        "seq": seq,
+        "change_id": change_id,
+        "phase": f"fix-r{round_n}",
+        "round": round_n,
+        "backend": backend,
+        "spawn_prompt": spawn_text,
+        "prompt_file": str(prompt_file.resolve()),
+    }
 
 
 def _do_implement_body(
@@ -440,16 +522,25 @@ def run_fix(
     round_n: int,
     *,
     backend: str | None = None,
+    dispatch: str | None = None,
     timeout: int | None = None,
     config_path: Path | None = None,
     runner: Runner = _default_runner,
 ) -> dict:
-    """跑完整 fix coder：phase enter → 渲染 prompt → backend 子进程 → record。"""
+    """跑完整 fix coder：phase enter → 渲染 prompt → backend 子进程 → record。
+
+    当 dispatch=in-session 时：phase enter + render，返回 deferred 指令（含 round），
+    不 spawn 子进程，不 record。
+    """
     cfg = load_config(p.repo_root, override_path=config_path)
     selected = resolve_backend(cfg, "fix", backend)
+    dispatch_mode = resolve_dispatch(cfg, "fix", selected, dispatch)
 
     phase = f"fix-r{round_n}"
     _pipeline._do_phase_enter(p, seq, phase)
+
+    if dispatch_mode == "in-session":
+        return _do_fix_in_session(p, seq, change_id, round_n, selected)
 
     try:
         return _do_fix_body(
@@ -560,6 +651,7 @@ def cli_implement_run(args: argparse.Namespace) -> None:
             args.seq,
             change_id,
             backend=getattr(args, "backend", None),
+            dispatch=getattr(args, "dispatch", None),
             timeout=getattr(args, "timeout", None),
             config_path=Path(args.config) if getattr(args, "config", None) else None,
         )
@@ -602,6 +694,7 @@ def cli_fix_run(args: argparse.Namespace) -> None:
             change_id,
             args.round_n,
             backend=getattr(args, "backend", None),
+            dispatch=getattr(args, "dispatch", None),
             timeout=getattr(args, "timeout", None),
             config_path=Path(args.config) if getattr(args, "config", None) else None,
         )

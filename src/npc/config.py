@@ -34,6 +34,14 @@ from pathlib import Path
 CONFIG_FILENAME = "config.toml"
 SUPPORTED_ENGINES = ("codex", "claude")
 SUPPORTED_CODER_BACKENDS = ("claude", "mimo", "codex")
+SUPPORTED_DISPATCH_VALUES = ("headless", "in-session")
+
+# 内置默认分发表：按 backend 决定 dispatch 默认值
+DISPATCH_DEFAULTS: dict[str, str] = {
+    "claude": "in-session",
+    "mimo": "headless",
+    "codex": "headless",
+}
 
 
 class ConfigError(Exception):
@@ -73,6 +81,10 @@ class CoderConfig:
     bin: str | None = None  # claude/codex 可执行文件覆盖
     # per-phase 后端覆盖（如只把 fix 给 mimo）。((phase, backend), ...)，保持 frozen 可哈希。
     phase_backends: tuple[tuple[str, str], ...] = ()
+    # dispatch 全局覆盖（headless | in-session）；None = 使用内置默认表。
+    dispatch: str | None = None
+    # per-phase dispatch 覆盖。((phase, dispatch), ...)，保持 frozen 可哈希。
+    phase_dispatches: tuple[tuple[str, str], ...] = ()
 
     @property
     def effective_backend(self) -> str:
@@ -86,6 +98,20 @@ class CoderConfig:
                 return be
         return self.backend
 
+    def dispatch_for_phase(self, phase: str, backend: str, cli_override: str | None = None) -> str:
+        """解析某 phase 的 dispatch 值。
+
+        优先级：CLI override → per-phase → 全局 → 内置默认（按 backend）。
+        """
+        if cli_override:
+            return cli_override
+        for ph, dp in self.phase_dispatches:
+            if ph == phase:
+                return dp
+        if self.dispatch is not None:
+            return self.dispatch
+        return DISPATCH_DEFAULTS.get(backend, "headless")
+
     def __post_init__(self) -> None:
         if self.backend is not None and self.backend not in SUPPORTED_CODER_BACKENDS:
             raise ConfigError(
@@ -96,6 +122,16 @@ class CoderConfig:
                 raise ConfigError(
                     f"未知 coder phase 后端：[coder.phase].{ph}={be!r}"
                     f"（仅支持 {'/'.join(SUPPORTED_CODER_BACKENDS)}）"
+                )
+        if self.dispatch is not None and self.dispatch not in SUPPORTED_DISPATCH_VALUES:
+            raise ConfigError(
+                f"未知 coder dispatch：{self.dispatch!r}（仅支持 {'/'.join(SUPPORTED_DISPATCH_VALUES)}）"
+            )
+        for ph, dp in self.phase_dispatches:
+            if dp not in SUPPORTED_DISPATCH_VALUES:
+                raise ConfigError(
+                    f"未知 coder phase dispatch：[coder.dispatch.phase].{ph}={dp!r}"
+                    f"（仅支持 {'/'.join(SUPPORTED_DISPATCH_VALUES)}）"
                 )
 
 
@@ -218,6 +254,18 @@ def _build(data: dict, source: str) -> Config:
         phase_backends_list.append((str(ph), be))
     phase_backends = tuple(sorted(phase_backends_list))
 
+    dispatch_val = coder_raw.get("dispatch")
+    coder_dispatch = str(dispatch_val) if dispatch_val is not None else None
+    dispatch_phase_raw = coder_raw.get("dispatch_phase") or {}
+    if not isinstance(dispatch_phase_raw, dict):
+        raise ConfigError(f"[coder].dispatch_phase 节必须是 table（{source}）")
+    phase_dispatches_list: list[tuple[str, str]] = []
+    for ph, dp in dispatch_phase_raw.items():
+        if not isinstance(dp, str):
+            raise ConfigError(f"[coder].dispatch_phase.{ph} 必须是字符串（{source}）")
+        phase_dispatches_list.append((str(ph), dp))
+    phase_dispatches = tuple(sorted(phase_dispatches_list))
+
     verify_raw = data.get("verify") or {}
     if not isinstance(verify_raw, dict):
         raise ConfigError(f"[verify] 节必须是 table（{source}）")
@@ -236,6 +284,8 @@ def _build(data: dict, source: str) -> Config:
             model=coder_model,
             bin=coder_bin,
             phase_backends=phase_backends,
+            dispatch=coder_dispatch,
+            phase_dispatches=phase_dispatches,
         ),
         verify=VerifyConfig(
             test=_opt_str(verify_raw.get("test"), "verify.test", source),
