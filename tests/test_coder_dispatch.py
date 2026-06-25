@@ -481,3 +481,100 @@ def test_verify_routing_mimo_fix_phase_in_session_violation():
     violations = _verify.check_routing(cfg)
     rules = {v["rule"] for v in violations}
     assert "mimo_in_session" in rules
+
+
+# ============================================================
+# F1 回归：CLI --backend mimo --dispatch in-session 不变量守卫
+# ============================================================
+
+
+def test_implement_mimo_in_session_raises_before_phase_enter(
+    tmp_path: Path, fake_repo: Path
+):
+    """CLI --backend mimo --dispatch in-session：run_implement 必须在 phase_enter 之前拒绝。
+
+    期望抛 ValueError，且 state 中 implement phase 完全不存在（未 enter）。
+    """
+    p, _ = _make_paths_and_state(tmp_path, fake_repo)
+
+    with pytest.raises(ValueError, match="mimo"):
+        _coder.run_implement(
+            p,
+            1,
+            "foo-change",
+            backend="mimo",
+            dispatch="in-session",
+            runner=_never_called_runner,
+        )
+
+    # phase 未 enter → state 里 implement phase 记录不存在
+    s = json.loads(p.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "implement" not in phases, (
+        f"phase_enter 不应被调用（mimo+in-session 应在 enter 前被拒绝）；phases={phases}"
+    )
+
+
+def test_fix_mimo_in_session_raises_before_phase_enter(
+    tmp_path: Path, fake_repo: Path
+):
+    """CLI --backend mimo --dispatch in-session：run_fix 必须在 phase_enter 之前拒绝。
+
+    期望抛 ValueError，且 state 中 fix-r1 phase 完全不存在（未 enter）。
+    """
+    impl_commit = _real_commit(fake_repo, "impl_mimo.txt", "m")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+
+    with pytest.raises(ValueError, match="mimo"):
+        _coder.run_fix(
+            p,
+            1,
+            "foo-change",
+            1,
+            backend="mimo",
+            dispatch="in-session",
+            runner=_never_called_runner,
+        )
+
+    # phase 未 enter
+    s = json.loads(p.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "fix-r1" not in phases, (
+        f"phase_enter 不应被调用（mimo+in-session 应在 enter 前被拒绝）；phases={phases}"
+    )
+
+
+def test_implement_mimo_headless_still_works(tmp_path: Path, fake_repo: Path):
+    """明确 --backend mimo --dispatch headless：不应触发不变量守卫，应正常走 runner。"""
+    p, run_dir = _make_paths_and_state(tmp_path, fake_repo)
+
+    commit = _real_commit(fake_repo, "mimo_ok.txt", "ok")
+    summary = run_dir / "implement.summary.md"
+    summary.write_text("# s\n")
+
+    env_file = tmp_path / "mimo2.env"
+    env_file.write_text(
+        "export ANTHROPIC_BASE_URL=https://mimo.example\nexport ANTHROPIC_AUTH_TOKEN=tok\n"
+    )
+    cfg_path = tmp_path / "cfg2.toml"
+    cfg_path.write_text(
+        f'[coder]\nbackend = "mimo"\n[coder.mimo]\nenv_file = "{env_file}"\n'
+    )
+
+    stdout = f"RESULT: commit={commit} tasks=1 tests=pass summary={summary} notes=-\n"
+    runner = _fake_runner(stdout, exit_code=0)
+
+    # dispatch=headless 显式传入 → 不触发守卫
+    result = _coder.run_implement(
+        p,
+        1,
+        "foo-change",
+        backend="mimo",
+        dispatch="headless",
+        config_path=cfg_path,
+        runner=runner,
+    )
+
+    assert len(runner.calls) == 1, "mimo headless 应调用 runner"
+    assert result.get("ok") is True
+    assert not result.get("deferred", False)

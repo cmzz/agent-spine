@@ -51,6 +51,20 @@ class CoderRunResult:
 Runner = Callable[..., CoderRunResult]
 
 
+def _reject_mimo_in_session(backend: str, dispatch_mode: str, phase: str) -> None:
+    """MiMo headless 不变量守卫：mimo+in-session 是非法组合，无论来源（配置/CLI）。
+
+    必须在 phase_enter 之前调用，避免在 phase 悬挂后才报错。
+    抛 ValueError（CLI 层已将其映射为 exit 1 invalid-args 错误）。
+    """
+    if backend == "mimo" and dispatch_mode == "in-session":
+        raise ValueError(
+            f"mimo backend 必须 headless；在 phase={phase!r} 中检测到 "
+            f"dispatch=in-session，这违反了 MiMo 无头不变量。"
+            f"请移除 --dispatch in-session，或将 backend 切回 claude。"
+        )
+
+
 def resolve_dispatch(
     cfg: Config, phase: str, backend: str, cli_override: str | None = None
 ) -> str:
@@ -361,6 +375,9 @@ def run_implement(
     selected = resolve_backend(cfg, "implement", backend)
     dispatch_mode = resolve_dispatch(cfg, "implement", selected, dispatch)
 
+    # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
+    _reject_mimo_in_session(selected, dispatch_mode, "implement")
+
     _pipeline._do_phase_enter(p, seq, "implement")
 
     if dispatch_mode == "in-session":
@@ -537,6 +554,10 @@ def run_fix(
     dispatch_mode = resolve_dispatch(cfg, "fix", selected, dispatch)
 
     phase = f"fix-r{round_n}"
+
+    # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
+    _reject_mimo_in_session(selected, dispatch_mode, phase)
+
     _pipeline._do_phase_enter(p, seq, phase)
 
     if dispatch_mode == "in-session":
