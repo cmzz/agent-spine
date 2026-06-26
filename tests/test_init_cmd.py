@@ -405,3 +405,55 @@ def test_init_no_dangling_worktree_creates_new(worktree_env, capsys, make_args):
     assert payload["worktree_root"] is not None
     assert payload["spine_branch"] is not None
     assert payload["spine_branch"].startswith("spine/")
+
+
+def test_init_worktree_ignores_canonical_task_log_in_progress(worktree_env, capsys, make_args):
+    """Regression F1: worktree 模式下，若 canonical task_log 有 in-progress 状态，
+    init 不应将旧 run_ts 用于新 worktree 的 Paths，而应以 needs_resume=false 新建。
+
+    修复前：canonical in-progress → needs_resume=True → 以旧 run_ts 键入新 worktree
+    → state 路径错位（worktree 路径 != 旧 run_ts 对应路径）。
+    修复后：worktree 模式跳过 canonical 检查，always needs_resume=false（无悬空时）。
+    """
+    repo, home = worktree_env
+
+    # 在 canonical task_log 写一个 in-progress state
+    from npc import paths as _paths
+    canonical_proj_key = _paths.proj_key_for(repo)
+    canonical_task_log = home / "task_log" / canonical_proj_key
+    canonical_task_log.mkdir(parents=True, exist_ok=True)
+    old_run_ts = "2026-01-01-0000"
+    old_state = canonical_task_log / f"{old_run_ts}-plan-state.json"
+    old_state.write_text(json.dumps({
+        "schema_version": 2,
+        "run_ts": old_run_ts,
+        "status": "in-progress",
+        "progress": [],
+    }))
+
+    # 无悬空 spine worktree，worktree list 返回空
+    mock_runner = _make_mock_runner(
+        worktree_list_output="",
+        worktree_add_rc=0,
+        current_branch="main",
+    )
+    args = make_args(auto=False, fresh=False, shell_exports=False)
+    _init.run(args, runner=mock_runner)
+
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+    # worktree 模式：canonical 旧状态不应触发 resume
+    assert payload["needs_resume"] is False, (
+        "worktree 模式下不应因 canonical task_log 的旧状态触发 needs_resume=True"
+    )
+
+    # run_ts 应与 spine_branch 一致（不是旧 run_ts）
+    assert payload["run_ts"] != old_run_ts, (
+        f"run_ts 不应复用旧 canonical run_ts ({old_run_ts})，实际={payload['run_ts']}"
+    )
+    spine_branch = payload["spine_branch"]
+    assert spine_branch is not None and spine_branch.startswith("spine/")
+    branch_run_ts = spine_branch.split("spine/", 1)[1]
+    assert payload["run_ts"] == branch_run_ts, (
+        f"worktree 模式 run_ts({payload['run_ts']}) 应与 spine_branch 后缀({branch_run_ts})一致"
+    )

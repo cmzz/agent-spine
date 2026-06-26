@@ -202,11 +202,13 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             })
             return
 
-    # 3. 续跑探测：按 canonical repo 的 task_log（旧行为 + no-worktree 路径）
+    # 3. 续跑探测：仅 --no-worktree 时检查 canonical task_log。
+    #    worktree 模式下悬空扫描（步骤 2）若未命中，直接建新 worktree + needs_resume=false；
+    #    不能用 canonical task_log 的旧 run_ts 来键入新 worktree，否则 state 路径错位。
     task_log_dir_for_resume = home / "task_log" / canonical_proj_key
     resume_state_json: Path | None = None
     needs_resume = False
-    if not args.fresh:
+    if not args.fresh and no_worktree:
         if task_log_dir_for_resume.is_dir():
             resume_state_json = resume.find_latest_in_progress(task_log_dir_for_resume)
             needs_resume = resume_state_json is not None
