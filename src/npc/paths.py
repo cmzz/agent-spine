@@ -42,7 +42,15 @@ _run_ts_counter = 0
 
 @dataclass(frozen=True)
 class Paths:
-    """本次 run 所需的所有路径与 key。"""
+    """本次 run 所需的所有路径与 key。
+
+    worktree 模式下，``repo_root`` 指向 worktree 路径，canonical 字段记录主 checkout 信息：
+
+    - ``canonical_repo_root``：主 checkout 的绝对路径（非 worktree 模式为 None）
+    - ``canonical_proj_key``：主 checkout 的 proj_key（非 worktree 模式为 None）
+    - ``base_branch``：建 worktree 时主 checkout 所在分支（非 worktree 模式为 None）
+    - ``spine_branch``：本 run 的 spine worktree 分支名（非 worktree 模式为 None）
+    """
 
     repo_root: Path
     proj_key: str
@@ -54,6 +62,11 @@ class Paths:
     index_file: Path
     schema_path: Path
     run_events: Path
+    # worktree 模式回指字段（非 worktree 模式为 None）
+    canonical_repo_root: Path | None = None
+    canonical_proj_key: str | None = None
+    base_branch: str | None = None
+    spine_branch: str | None = None
 
     def to_env(self) -> dict[str, str]:
         """投影为环境变量字典（仅供 ``--shell-exports`` 兼容路径使用）。"""
@@ -71,8 +84,11 @@ class Paths:
         }
 
     def to_run_json_dict(self) -> dict:
-        """序列化为 ``run.json`` 的 dict 形态。"""
-        return {
+        """序列化为 ``run.json`` 的 dict 形态。
+
+        worktree 回指字段仅在非 None 时写入（兼容旧格式）。
+        """
+        d: dict = {
             "schema_version": RUN_JSON_SCHEMA_VERSION,
             "repo_root": str(self.repo_root),
             "proj_key": self.proj_key,
@@ -85,6 +101,16 @@ class Paths:
             "schema_path": str(self.schema_path),
             "run_events": str(self.run_events),
         }
+        # worktree 回指字段（仅 worktree 模式写入）
+        if self.canonical_repo_root is not None:
+            d["canonical_repo_root"] = str(self.canonical_repo_root)
+        if self.canonical_proj_key is not None:
+            d["canonical_proj_key"] = self.canonical_proj_key
+        if self.base_branch is not None:
+            d["base_branch"] = self.base_branch
+        if self.spine_branch is not None:
+            d["spine_branch"] = self.spine_branch
+        return d
 
 
 class PathsError(Exception):
@@ -273,6 +299,11 @@ def read_run_json(run_json_path: Path) -> Paths:
     missing = required - data.keys()
     if missing:
         raise PathsError(f"run.json 缺少字段 {sorted(missing)}：{run_json_path}")
+    # 容错还原 worktree 回指字段（旧 run.json 缺字段时不报错）
+    canonical_repo_root_raw = data.get("canonical_repo_root")
+    canonical_proj_key_raw = data.get("canonical_proj_key")
+    base_branch_raw = data.get("base_branch")
+    spine_branch_raw = data.get("spine_branch")
     return Paths(
         repo_root=Path(data["repo_root"]),
         proj_key=data["proj_key"],
@@ -284,6 +315,10 @@ def read_run_json(run_json_path: Path) -> Paths:
         index_file=Path(data["index_file"]),
         schema_path=Path(data["schema_path"]),
         run_events=Path(data["run_events"]),
+        canonical_repo_root=Path(canonical_repo_root_raw) if canonical_repo_root_raw else None,
+        canonical_proj_key=canonical_proj_key_raw if canonical_proj_key_raw else None,
+        base_branch=base_branch_raw if base_branch_raw else None,
+        spine_branch=spine_branch_raw if spine_branch_raw else None,
     )
 
 

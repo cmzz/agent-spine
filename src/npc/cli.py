@@ -79,6 +79,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="输出 export KEY=VALUE 行供 eval 注入环境",
     )
+    p_init.add_argument(
+        "--no-worktree",
+        action="store_true",
+        help="跳过 worktree 创建，使用就地行为（调试 / 受信单 run）",
+    )
     p_init.set_defaults(handler=_make_handler("init_cmd", "run"), _cmd_path="init")
 
     # ===== resume detect =====

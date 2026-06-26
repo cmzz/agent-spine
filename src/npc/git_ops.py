@@ -13,6 +13,11 @@
 所有 git 调用走可注入 runner（默认 :func:`subprocess.run`），repo 用
 :func:`paths.detect_repo_root`。退出码：成功 0 / 业务失败 1 / 用法错 2 /
 非 git 仓库 3。
+
+Worktree 工具函数（供 init_cmd 调用）：
+
+- ``add_worktree(repo_root, path, branch, base_ref, runner)``：git worktree add -b
+- ``list_worktrees(repo_root, runner)``：解析 git worktree list --porcelain → [{path, branch}]
 """
 
 from __future__ import annotations
@@ -25,6 +30,87 @@ from pathlib import Path
 
 from . import _io
 from . import paths as _paths
+
+
+# ============================================================
+# Worktree 工具（可注入 runner，供 init_cmd 调用）
+# ============================================================
+
+
+class WorktreeError(Exception):
+    """git worktree 操作失败。"""
+
+
+def add_worktree(
+    repo_root: Path,
+    path: Path,
+    branch: str,
+    base_ref: str = "HEAD",
+    runner=subprocess.run,
+) -> None:
+    """``git worktree add -b <branch> <path> <base_ref>``。
+
+    失败抛 :class:`WorktreeError`（由调用方转成 exit 3）。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    proc = runner(
+        ["git", "worktree", "add", "-b", branch, str(path), base_ref],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+    )
+    if proc.returncode != 0:
+        raise WorktreeError(
+            f"git worktree add 失败 (rc={proc.returncode}): {(proc.stderr or '').strip()}"
+        )
+
+
+def list_worktrees(
+    repo_root: Path,
+    runner=subprocess.run,
+) -> list[dict[str, str]]:
+    """解析 ``git worktree list --porcelain`` → list of {path, branch}。
+
+    branch 值为 ``refs/heads/<name>`` 形式（porcelain 原值），或缺失时为空字符串。
+    detached HEAD 的 worktree branch 字段为空字符串。
+    """
+    proc = runner(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+    )
+    if proc.returncode != 0:
+        raise WorktreeError(
+            f"git worktree list 失败 (rc={proc.returncode}): {(proc.stderr or '').strip()}"
+        )
+    return _parse_worktree_porcelain(proc.stdout or "")
+
+
+def _parse_worktree_porcelain(output: str) -> list[dict[str, str]]:
+    """解析 ``git worktree list --porcelain`` 文本（纯函数）。
+
+    每段由空行分隔，每段包含若干 ``key value`` 行。
+    返回每段的 path 与 branch（refs/heads/xxx 或 ""）。
+    """
+    result: list[dict[str, str]] = []
+    segments = output.strip().split("\n\n")
+    for seg in segments:
+        seg = seg.strip()
+        if not seg:
+            continue
+        entry: dict[str, str] = {"path": "", "branch": ""}
+        for line in seg.splitlines():
+            line = line.strip()
+            if line.startswith("worktree "):
+                entry["path"] = line[len("worktree "):].strip()
+            elif line.startswith("branch "):
+                entry["branch"] = line[len("branch "):].strip()
+        if entry["path"]:
+            result.append(entry)
+    return result
 
 
 # git 子进程的确定性环境：强制 LC_ALL=C，让 "nothing to commit" 等
