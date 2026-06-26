@@ -130,16 +130,18 @@ def make_run_ts(now: datetime | None = None) -> str:
     """生成唯一 run timestamp。
 
     格式：``YYYY-MM-DD-HHMM-<suffix>``，其中 suffix 由三部分组成：
-    ``{SS:02d}{pid:04x}{cnt:02d}``（共 8 字符），含义：
-    - ``SS``：当前秒（00-59）
+    ``{SS:02d}{pid:04x}{cnt:x}``，含义：
+    - ``SS``：当前秒（00-59），2 hex chars
     - ``pid``：进程 PID 低 16 位（4 位十六进制，标识调用进程）
-    - ``cnt``：进程内单调计数器低 8 位（00-ff，保证同进程同秒调用不冲突）
+    - ``cnt``：进程内单调计数器，**不截断**，从 0 开始单调递增；
+      位数随调用次数增长（0→"0", 256→"100", ...），保证同进程同秒
+      任意次调用均不碰撞，不存在回绕上限。
 
     设计保证：
     - 不同分钟：前缀天然不同。
     - 同分钟不同秒：SS 不同，后缀不同。
     - 同分钟同秒不同进程：pid 不同，后缀不同（PID 空间隔离）。
-    - 同进程同秒多次调用：cnt 单调递增，永不重复。
+    - 同进程同秒多次调用：cnt 单调递增，无上限，永不重复。
 
     后缀仅含 ``[0-9a-f]``，文件名安全。
     """
@@ -149,9 +151,9 @@ def make_run_ts(now: datetime | None = None) -> str:
     ss = dt.second
     pid_hex = os.getpid() & 0xFFFF  # 低 16 位，4 hex chars
     with _run_ts_lock:
-        cnt = _run_ts_counter & 0xFF  # 低 8 位，2 hex chars
+        cnt = _run_ts_counter  # 不截断：无限单调递增，不存在回绕
         _run_ts_counter += 1
-    suffix = f"{ss:02d}{pid_hex:04x}{cnt:02x}"
+    suffix = f"{ss:02d}{pid_hex:04x}{cnt:x}"
     return f"{prefix}-{suffix}"
 
 

@@ -35,10 +35,11 @@ def test_compute_paths_layout(fake_home: Path):
 
 def test_compute_paths_run_ts_default_format(fake_home: Path):
     p = _paths.compute_paths(Path("/Users/you/foo"), home=fake_home)
-    # YYYY-MM-DD-HHMM-<8 hex chars>
+    # YYYY-MM-DD-HHMM-<suffix>
+    # suffix = SS(2) + pid(4) + cnt(1+)，最短 7 位，随计数器增长可更长
     import re
 
-    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[0-9a-f]{8}$", p.run_ts)
+    assert re.match(r"^\d{4}-\d{2}-\d{2}-\d{4}-[0-9a-f]{7,}$", p.run_ts)
 
 
 def test_detect_repo_root(fake_repo: Path):
@@ -239,7 +240,8 @@ def test_make_run_ts_prefix_format_and_sortability():
     ts_early = _paths.make_run_ts(now=t_early)
     ts_late = _paths.make_run_ts(now=t_late)
 
-    pattern = r"^\d{4}-\d{2}-\d{2}-\d{4}-[0-9a-f]{8}$"
+    # suffix = SS(2) + pid(4) + cnt(1+)，最短 7 位，随计数器增长可更长
+    pattern = r"^\d{4}-\d{2}-\d{2}-\d{4}-[0-9a-f]{7,}$"
     assert re.match(pattern, ts_early), f"格式不匹配: {ts_early}"
     assert re.match(pattern, ts_late), f"格式不匹配: {ts_late}"
     # 字典序与时间顺序一致
@@ -288,8 +290,9 @@ def test_make_run_ts_suffix_contains_seconds_and_pid():
     # SS=42 -> "42", pid=low16 hex (4 chars), cnt=hex (2 chars)
     assert ts.startswith("2026-06-26-1758-")
     suffix = ts.split("-", 4)[4]
-    assert len(suffix) == 8
-    assert re.match(r"^[0-9a-f]{8}$", suffix)
+    # suffix 格式：SS(2) + pid(4) + cnt(1+)，最短 7 位
+    assert len(suffix) >= 7, f"suffix 过短: {suffix}"
+    assert re.match(r"^[0-9a-f]{7,}$", suffix), f"suffix 含非法字符: {suffix}"
     # SS 部分（前 2 字符）必须是 "42"（十进制，秒数）
     assert suffix[:2] == "42", f"期望 SS=42，实际 suffix={suffix}"
     # PID 部分（中间 4 字符）= os.getpid() & 0xFFFF 的十六进制
@@ -336,6 +339,27 @@ def test_make_run_ts_concurrent_no_collision():
     assert len(set(results)) == n_threads, (
         f"发现碰撞！unique={len(set(results))}，total={n_threads}，"
         f"重复值: {[ts for ts in results if results.count(ts) > 1]}"
+    )
+
+
+def test_make_run_ts_no_wraparound_beyond_256():
+    """回归测试：同进程同秒调用超过 256 次，所有产出值仍全部唯一（无回绕碰撞）。
+
+    Round 1 fix 中 cnt & 0xFF 会在第 257 次调用与第 1 次产出相同 cnt，
+    导致 run_ts 碰撞。本测试直接覆盖该回绕路径，确保移除截断后无碰撞。
+    触发真实代码路径：_run_ts_lock + _run_ts_counter（不截断）。
+    """
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 6, 26, 17, 58, 42)
+    n_calls = 300  # 超过 256，覆盖回绕区域
+
+    results = [_paths.make_run_ts(now=fixed_now) for _ in range(n_calls)]
+
+    assert len(results) == n_calls
+    assert len(set(results)) == n_calls, (
+        f"发现碰撞！unique={len(set(results))}，total={n_calls}，"
+        f"重复值（前 5）: {[ts for ts in results if results.count(ts) > 1][:5]}"
     )
 
 
