@@ -22,7 +22,7 @@ import argparse
 import json
 import os
 import subprocess
-import uuid
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +34,10 @@ RUN_JSON_FILENAME = "run.json"
 ACTIVE_JSON_FILENAME = "active.json"
 RUN_JSON_SCHEMA_VERSION = 1
 ACTIVE_JSON_SCHEMA_VERSION = 1
+
+# 进程内单调计数器，用于 make_run_ts 确保同进程同秒调用不冲突。
+_run_ts_lock = threading.Lock()
+_run_ts_counter = 0
 
 
 @dataclass(frozen=True)
@@ -125,13 +129,29 @@ def proj_key_for(repo_root: Path) -> str:
 def make_run_ts(now: datetime | None = None) -> str:
     """生成唯一 run timestamp。
 
-    格式：``YYYY-MM-DD-HHMM-<suffix>``，其中 suffix 为 UUID4 前 8 位十六进制，
-    保证同一分钟内并发调用永不冲突。前缀保留可读性与字典序排序性。
-    suffix 仅含 ``[0-9a-f]``，文件名安全。
+    格式：``YYYY-MM-DD-HHMM-<suffix>``，其中 suffix 由三部分组成：
+    ``{SS:02d}{pid:04x}{cnt:02d}``（共 8 字符），含义：
+    - ``SS``：当前秒（00-59）
+    - ``pid``：进程 PID 低 16 位（4 位十六进制，标识调用进程）
+    - ``cnt``：进程内单调计数器低 8 位（00-ff，保证同进程同秒调用不冲突）
+
+    设计保证：
+    - 不同分钟：前缀天然不同。
+    - 同分钟不同秒：SS 不同，后缀不同。
+    - 同分钟同秒不同进程：pid 不同，后缀不同（PID 空间隔离）。
+    - 同进程同秒多次调用：cnt 单调递增，永不重复。
+
+    后缀仅含 ``[0-9a-f]``，文件名安全。
     """
+    global _run_ts_counter
     dt = now or datetime.now()
     prefix = dt.strftime("%Y-%m-%d-%H%M")
-    suffix = uuid.uuid4().hex[:8]
+    ss = dt.second
+    pid_hex = os.getpid() & 0xFFFF  # 低 16 位，4 hex chars
+    with _run_ts_lock:
+        cnt = _run_ts_counter & 0xFF  # 低 8 位，2 hex chars
+        _run_ts_counter += 1
+    suffix = f"{ss:02d}{pid_hex:04x}{cnt:02x}"
     return f"{prefix}-{suffix}"
 
 

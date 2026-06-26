@@ -270,3 +270,104 @@ def test_resume_parse_old_format_run_ts(fake_repo: Path, fake_home: Path):
     _paths.write_run_json(p)
     restored = _paths.read_run_json(_paths.run_json_path_for(p.task_log_dir, old_ts))
     assert restored.run_ts == old_ts
+
+
+# ============================================================
+# run-ts-unique-suffix: 真实并发回归（F1 fix 验证）
+# ============================================================
+
+
+def test_make_run_ts_suffix_contains_seconds_and_pid():
+    """验证 suffix 包含当前秒和进程标识（PID 低 16 位），而非随机 UUID。"""
+    import re
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 6, 26, 17, 58, 42)  # second=42
+    ts = _paths.make_run_ts(now=fixed_now)
+    # 格式：YYYY-MM-DD-HHMM-SSppppcc
+    # SS=42 -> "42", pid=low16 hex (4 chars), cnt=hex (2 chars)
+    assert ts.startswith("2026-06-26-1758-")
+    suffix = ts.split("-", 4)[4]
+    assert len(suffix) == 8
+    assert re.match(r"^[0-9a-f]{8}$", suffix)
+    # SS 部分（前 2 字符）必须是 "42"（十进制，秒数）
+    assert suffix[:2] == "42", f"期望 SS=42，实际 suffix={suffix}"
+    # PID 部分（中间 4 字符）= os.getpid() & 0xFFFF 的十六进制
+    import os
+
+    expected_pid_hex = f"{os.getpid() & 0xFFFF:04x}"
+    assert suffix[2:6] == expected_pid_hex, (
+        f"期望 PID hex={expected_pid_hex}，实际 suffix={suffix}"
+    )
+
+
+def test_make_run_ts_concurrent_no_collision():
+    """真实并发回归：多线程同时调用 make_run_ts，产出值全部唯一（无碰撞）。
+
+    该测试触发真实的 _run_ts_lock 和 _run_ts_counter 代码路径。
+    """
+    import threading
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 6, 26, 17, 58, 5)
+    results: list[str] = []
+    errors: list[Exception] = []
+    lock = threading.Lock()
+    n_threads = 64
+
+    def worker() -> None:
+        try:
+            ts = _paths.make_run_ts(now=fixed_now)
+            with lock:
+                results.append(ts)
+        except Exception as exc:
+            with lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"线程异常: {errors}"
+    assert len(results) == n_threads, f"期望 {n_threads} 个结果，实际 {len(results)}"
+    # 核心断言：无任何碰撞
+    assert len(set(results)) == n_threads, (
+        f"发现碰撞！unique={len(set(results))}，total={n_threads}，"
+        f"重复值: {[ts for ts in results if results.count(ts) > 1]}"
+    )
+
+
+def test_make_run_ts_cross_process_suffix_differs():
+    """跨进程调用（通过 subprocess）产出不同 PID 部分，验证进程标识有效性。"""
+    import subprocess
+    import sys
+
+    script = (
+        "import sys; sys.path.insert(0, 'src'); "
+        "from npc import paths; "
+        "from datetime import datetime; "
+        "print(paths.make_run_ts(now=datetime(2026, 6, 26, 17, 58, 15)))"
+    )
+    # 启动两个子进程，各自调用 make_run_ts
+    r1 = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd="/Users/ethan/Workspace/agent-spine",
+    )
+    r2 = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd="/Users/ethan/Workspace/agent-spine",
+    )
+    assert r1.returncode == 0, f"子进程 1 失败: {r1.stderr}"
+    assert r2.returncode == 0, f"子进程 2 失败: {r2.stderr}"
+
+    ts1 = r1.stdout.strip()
+    ts2 = r2.stdout.strip()
+    # 两个子进程的 PID 不同 → suffix 中 PID 部分不同 → run_ts 不同
+    # （极端情况：PID 重用且 cnt 相同；但 OS 不会在如此短时间内重用 PID）
+    assert ts1 != ts2, f"跨进程应产出不同 run_ts，实际均为: {ts1}"
