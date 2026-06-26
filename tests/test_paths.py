@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -280,27 +281,31 @@ def test_resume_parse_old_format_run_ts(fake_repo: Path, fake_home: Path):
 
 
 def test_make_run_ts_suffix_contains_seconds_and_pid():
-    """验证 suffix 包含当前秒和进程标识（PID 低 16 位），而非随机 UUID。"""
+    """验证 suffix 包含当前秒和完整进程 PID（不截断），而非随机 UUID。"""
     import re
     from datetime import datetime
 
     fixed_now = datetime(2026, 6, 26, 17, 58, 42)  # second=42
     ts = _paths.make_run_ts(now=fixed_now)
-    # 格式：YYYY-MM-DD-HHMM-SSppppcc
-    # SS=42 -> "42", pid=low16 hex (4 chars), cnt=hex (2 chars)
+    # 格式：YYYY-MM-DD-HHMM-SS<pid_hex><cnt_hex>
+    # SS=42 -> "42"（前两字符），pid=完整 PID hex（变长），cnt=hex（1+）
     assert ts.startswith("2026-06-26-1758-")
     suffix = ts.split("-", 4)[4]
-    # suffix 格式：SS(2) + pid(4) + cnt(1+)，最短 7 位
-    assert len(suffix) >= 7, f"suffix 过短: {suffix}"
-    assert re.match(r"^[0-9a-f]{7,}$", suffix), f"suffix 含非法字符: {suffix}"
+    # suffix 格式：SS(2) + pid_full_hex(1+) + cnt(1+)，最短 4 位（理论最小）
+    assert len(suffix) >= 3, f"suffix 过短: {suffix}"
+    assert re.match(r"^[0-9a-f]+$", suffix), f"suffix 含非法字符: {suffix}"
     # SS 部分（前 2 字符）必须是 "42"（十进制，秒数）
     assert suffix[:2] == "42", f"期望 SS=42，实际 suffix={suffix}"
-    # PID 部分（中间 4 字符）= os.getpid() & 0xFFFF 的十六进制
+    # PID 部分：完整 PID hex，验证 suffix 中间段包含 os.getpid() 的 hex 表示
     import os
 
-    expected_pid_hex = f"{os.getpid() & 0xFFFF:04x}"
-    assert suffix[2:6] == expected_pid_hex, (
-        f"期望 PID hex={expected_pid_hex}，实际 suffix={suffix}"
+    expected_pid_hex = f"{os.getpid():x}"
+    # suffix = "42" + pid_hex + cnt_hex
+    # pid_hex 紧跟 SS 之后
+    pid_start = 2
+    pid_end = pid_start + len(expected_pid_hex)
+    assert suffix[pid_start:pid_end] == expected_pid_hex, (
+        f"期望完整 PID hex={expected_pid_hex}，实际 suffix={suffix}"
     )
 
 
@@ -361,6 +366,53 @@ def test_make_run_ts_no_wraparound_beyond_256():
         f"发现碰撞！unique={len(set(results))}，total={n_calls}，"
         f"重复值（前 5）: {[ts for ts in results if results.count(ts) > 1][:5]}"
     )
+
+
+def test_make_run_ts_identical_low16_pids_no_collision(monkeypatch):
+    """回归测试（F1 根因修复验证）：两个低 16 位相同但完整 PID 不同的进程
+    在同一秒以 cnt=0 起步时，产出不同的 run_ts。
+
+    场景：PID=100 与 PID=65636（= 100 + 65536）低 16 位均为 0x0064，
+    使用旧实现（os.getpid() & 0xFFFF）会产出相同 pid_hex="0064"，
+    在同秒同 cnt 下碰撞。本测试通过 monkeypatch 模拟两个 PID，
+    验证完整 PID 修复后不再碰撞。
+
+    触发真实代码路径：make_run_ts → os.getpid()（monkeypatched） + _run_ts_lock。
+    """
+    import npc.paths as _p
+    from datetime import datetime
+
+    fixed_now = datetime(2026, 6, 26, 17, 58, 0)
+
+    # 保存并重置计数器，确保两次模拟都从 cnt=0 起步
+    original_counter = _p._run_ts_counter
+
+    # --- 模拟 PID=100，cnt 从 0 起步 ---
+    monkeypatch.setattr(os, "getpid", lambda: 100)
+    with _p._run_ts_lock:
+        _p._run_ts_counter = 0
+    ts_pid100 = _p.make_run_ts(now=fixed_now)
+
+    # --- 模拟 PID=65636（= 100 + 65536），cnt 从 0 起步 ---
+    monkeypatch.setattr(os, "getpid", lambda: 65636)
+    with _p._run_ts_lock:
+        _p._run_ts_counter = 0
+    ts_pid65636 = _p.make_run_ts(now=fixed_now)
+
+    # 恢复计数器（monkeypatch 会自动还原 os.getpid）
+    with _p._run_ts_lock:
+        _p._run_ts_counter = original_counter
+
+    # 两者低 16 位相同（0x0064），在旧实现下必然碰撞；修复后应不同
+    assert ts_pid100 != ts_pid65636, (
+        f"PID=100 与 PID=65636（低 16 位均为 0x0064）在同秒 cnt=0 时发生碰撞！\n"
+        f"  ts_pid100={ts_pid100}\n  ts_pid65636={ts_pid65636}"
+    )
+    # 验证 suffix 中 PID 段确实包含完整 PID hex
+    suffix100 = ts_pid100.split("-", 4)[4]
+    suffix65636 = ts_pid65636.split("-", 4)[4]
+    assert "0064" in suffix100, f"PID=100 的 hex(0x64) 应在 suffix 中: {suffix100}"
+    assert "10064" in suffix65636, f"PID=65636 的 hex(0x10064) 应在 suffix 中: {suffix65636}"
 
 
 def test_make_run_ts_cross_process_suffix_differs():
