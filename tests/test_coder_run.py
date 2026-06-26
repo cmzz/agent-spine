@@ -22,11 +22,20 @@ from npc.config import Config, CoderConfig
 # ============================================================
 
 
-def _bootstrap_run(make_args, capsys, *change_ids: str) -> None:
-    _state.init_run(make_args(plan_order=json.dumps(list(change_ids))))
+def _bootstrap_run(make_args, capsys, *change_ids: str, p=None) -> None:
+    """初始化 run state，使用 p（Paths）的 task_log_dir 强制定位到 tmp 目录。
+
+    若传入 p，则把 task_log_dir 加入 args。这样 load_paths step 3 会在 tmp 目录里
+    找不到 active.json，继而回退到 step 4 NPC_* env 变量（由 env_setup 注入），
+    避免 load_paths 经真实 active.json 解析到真实 state_json。
+    """
+    extra = {}
+    if p is not None:
+        extra = {"task_log_dir": str(p.task_log_dir)}
+    _state.init_run(make_args(plan_order=json.dumps(list(change_ids)), **extra))
     capsys.readouterr()
     for i, cid in enumerate(change_ids, start=1):
-        _state.add_change(make_args(seq=i, change_id=cid, base=None))
+        _state.add_change(make_args(seq=i, change_id=cid, base=None, **extra))
         capsys.readouterr()
 
 
@@ -134,8 +143,8 @@ def test_parse_env_file_strips_quotes_and_ignores_junk():
 
 
 def test_run_implement_success(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     commit = _real_commit(fake_repo)
@@ -150,7 +159,7 @@ def test_run_implement_success(env_setup, make_args, capsys, fake_repo: Path):
     )
     runner = _fake_runner(stdout, exit_code=0)
 
-    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", runner=runner)
+    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", dispatch="headless", runner=runner)
 
     assert result["ok"] is True
     assert result["commit"] == commit
@@ -173,14 +182,14 @@ def test_run_implement_success(env_setup, make_args, capsys, fake_repo: Path):
 
 
 def test_run_implement_no_result_line_fails(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     # coder 输出里完全没有 RESULT 行 → 合成失败 RESULT → record failed
     runner = _fake_runner("blah blah no result here\n", exit_code=0)
 
-    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", runner=runner)
+    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", dispatch="headless", runner=runner)
 
     assert result["ok"] is False
     assert result["backend"] == "claude"
@@ -190,8 +199,8 @@ def test_run_implement_no_result_line_fails(env_setup, make_args, capsys, fake_r
 
 
 def test_run_implement_mimo_injects_env(env_setup, make_args, capsys, fake_repo: Path, tmp_path: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     commit = _real_commit(fake_repo)
@@ -233,8 +242,8 @@ def test_run_implement_mimo_injects_env(env_setup, make_args, capsys, fake_repo:
 
 
 def test_run_fix_success(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     # 先安排 implement_commit
@@ -257,7 +266,7 @@ def test_run_fix_success(env_setup, make_args, capsys, fake_repo: Path):
     )
     runner = _fake_runner(stdout, exit_code=0)
 
-    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", runner=runner)
+    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", dispatch="headless", runner=runner)
 
     assert result["ok"] is True
     assert result["commit"] == fix_commit
@@ -279,14 +288,15 @@ def test_run_fix_success(env_setup, make_args, capsys, fake_repo: Path):
 def test_cli_implement_run_missing_claude_bin(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     # which('claude') → None；并把 load_paths 锚到 fake_repo
     monkeypatch.setattr(_coder.shutil, "which", lambda name: None)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
-    args = make_args(seq=1, change_id="add-foo", backend="claude", timeout=None, config=None)
+    # dispatch=headless 强制走子进程路径，触发 claude 二进制查找
+    args = make_args(seq=1, change_id="add-foo", backend="claude", dispatch="headless", timeout=None, config=None)
     with pytest.raises(SystemExit) as ei:
         _coder.cli_implement_run(args)
     assert ei.value.code == 4
@@ -298,8 +308,8 @@ def test_cli_implement_run_missing_claude_bin(
 def test_cli_implement_run_success_emits_backend(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     commit = _real_commit(fake_repo)
     base = p.run_dir / "001-add-foo"
@@ -327,8 +337,8 @@ def test_cli_implement_run_success_emits_backend(
 
 
 def test_run_implement_codex_not_implemented(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
     runner = _fake_runner("", exit_code=0)
     with pytest.raises(NotImplementedError, match="codex"):
@@ -348,13 +358,13 @@ def _raising_runner(exc: Exception):
 
 
 def test_run_implement_timeout_lands_failed(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     runner = _raising_runner(subprocess.TimeoutExpired(cmd="claude", timeout=1))
-    # 绝不裸抛——返回错误 dict，phase 落 failed
-    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", runner=runner)
+    # 绝不裸抛——返回错误 dict，phase 落 failed；dispatch=headless 强制走子进程路径
+    result = _coder.run_implement(pr, 1, "add-foo", backend="claude", dispatch="headless", runner=runner)
     assert result["ok"] is False
     assert result["reason"] == "coder-timeout"
     assert result["backend"] == "claude"
@@ -366,8 +376,8 @@ def test_run_implement_timeout_lands_failed(env_setup, make_args, capsys, fake_r
 
 
 def test_run_fix_timeout_lands_failed(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     impl_commit = _real_commit(fake_repo, "impl.txt", "i")
@@ -378,7 +388,8 @@ def test_run_fix_timeout_lands_failed(env_setup, make_args, capsys, fake_repo: P
     _state.update_state(p.state_json, p.state_md, mutate)
 
     runner = _raising_runner(subprocess.TimeoutExpired(cmd="claude", timeout=1))
-    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", runner=runner)
+    # dispatch=headless 强制走子进程路径，确保 timeout 真正触发
+    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", dispatch="headless", runner=runner)
     assert result["ok"] is False
     assert result["reason"] == "coder-timeout"
 
@@ -390,8 +401,8 @@ def test_run_fix_timeout_lands_failed(env_setup, make_args, capsys, fake_repo: P
 def test_cli_implement_run_timeout_emits_json_exit_1(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
     monkeypatch.setattr(
@@ -415,8 +426,8 @@ def test_cli_implement_run_timeout_emits_json_exit_1(
 
 
 def test_run_fix_no_result_line_fails(env_setup, make_args, capsys, fake_repo: Path):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
 
     impl_commit = _real_commit(fake_repo, "impl.txt", "i")
@@ -427,7 +438,7 @@ def test_run_fix_no_result_line_fails(env_setup, make_args, capsys, fake_repo: P
     _state.update_state(p.state_json, p.state_md, mutate)
 
     runner = _fake_runner("fixer chatter, no result line\n", exit_code=0)
-    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", runner=runner)
+    result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", dispatch="headless", runner=runner)
 
     assert result["ok"] is False
     s = json.loads(p.state_json.read_text())
@@ -440,8 +451,8 @@ def test_run_fix_no_result_line_fails(env_setup, make_args, capsys, fake_repo: P
 
 
 def test_cli_fix_run_success(env_setup, make_args, capsys, fake_repo: Path, monkeypatch):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
     monkeypatch.setattr(
@@ -460,8 +471,8 @@ def test_cli_fix_run_success(env_setup, make_args, capsys, fake_repo: Path, monk
 def test_cli_fix_run_missing_claude_bin(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     impl_commit = _real_commit(fake_repo, "impl.txt", "i")
 
@@ -473,7 +484,8 @@ def test_cli_fix_run_missing_claude_bin(
     monkeypatch.setattr(_coder.shutil, "which", lambda name: None)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
-    args = make_args(seq=1, change_id="add-foo", round_n=1, backend="claude", timeout=None, config=None)
+    # dispatch=headless 强制走子进程路径，触发 claude 二进制查找
+    args = make_args(seq=1, change_id="add-foo", round_n=1, backend="claude", dispatch="headless", timeout=None, config=None)
     with pytest.raises(SystemExit) as ei:
         _coder.cli_fix_run(args)
     assert ei.value.code == 4
@@ -485,8 +497,8 @@ def test_cli_fix_run_missing_claude_bin(
 def test_cli_fix_run_change_id_mismatch(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
     # state 里 seq=1 是 add-foo，传入 change_id=wrong → 不一致 → exit 3
@@ -502,8 +514,8 @@ def test_cli_fix_run_change_id_mismatch(
 def test_cli_fix_run_codex_not_implemented_exit_2(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
     args = make_args(seq=1, change_id="add-foo", round_n=1, backend="codex", timeout=None, config=None)
@@ -523,8 +535,8 @@ def test_cli_fix_run_codex_not_implemented_exit_2(
 def test_cli_implement_run_bad_config_exit_2(
     env_setup, make_args, capsys, fake_repo: Path, tmp_path: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
     bad_cfg = tmp_path / "bad.toml"
@@ -565,11 +577,142 @@ def test_mimo_env_permission_error_clean(tmp_path: Path, monkeypatch):
         _coder._mimo_env(cfg)
 
 
+# ============================================================
+# scrub-coder-subprocess-api-key: 子进程 env 剔除 Anthropic 计费凭据
+# ============================================================
+
+
+def test_scrubbed_base_env_removes_billing_keys(monkeypatch):
+    """_scrubbed_base_env() 剔除 Anthropic 计费凭据，其余键保留。"""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-scrubbed")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "auth-should-be-scrubbed")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setenv("HOME", "/home/user")
+
+    result = _coder._scrubbed_base_env()
+
+    assert "ANTHROPIC_API_KEY" not in result, "billing key must be scrubbed"
+    assert "ANTHROPIC_AUTH_TOKEN" not in result, "auth token must be scrubbed"
+    assert result.get("PATH") == "/usr/bin:/bin", "PATH must be preserved"
+    assert result.get("HOME") == "/home/user", "HOME must be preserved"
+
+
+def test_claude_backend_scrubs_api_key_from_env(monkeypatch, tmp_path: Path):
+    """Scenario: claude 后端在环境含 API key 时仍不付费。
+
+    WHEN claude 后端启动 coder 子进程，且 npc 进程环境里设置了 ANTHROPIC_API_KEY
+    THEN 传给子进程的环境不含 ANTHROPIC_API_KEY 与 ANTHROPIC_AUTH_TOKEN
+    AND 其余环境变量（PATH、HOME 等）原样保留
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-scrubbed")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "auth-should-be-scrubbed")
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    from npc.config import Config
+
+    cfg = Config()
+    runner = _fake_runner("RESULT: ok\n", exit_code=0)
+    monkeypatch.setattr(_coder.shutil, "which", lambda name: "/usr/bin/claude")
+
+    _coder._run_backend(
+        cfg, "claude",
+        spawn_text="test prompt",
+        repo_root=tmp_path,
+        backend_override_bin=None,
+        runner=runner,
+        timeout=None,
+    )
+
+    injected = runner.calls[0]["env"]
+    assert "ANTHROPIC_API_KEY" not in injected, "billing key must be scrubbed"
+    assert "ANTHROPIC_AUTH_TOKEN" not in injected, "auth token must be scrubbed"
+    assert "PATH" in injected, "PATH must be preserved"
+
+
+def test_claude_backend_no_key_env_equivalent_to_current(monkeypatch, tmp_path: Path):
+    """Scenario: 无 Anthropic key 时行为与现状一致。
+
+    WHEN 环境里未设置任何 Anthropic 计费凭据
+    THEN scrubbed baseline 等价于继承当前环境（除两键外无差异）
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
+    monkeypatch.setenv("MY_CUSTOM_VAR", "preserved")
+
+    from npc.config import Config
+
+    cfg = Config()
+    runner = _fake_runner("RESULT: ok\n", exit_code=0)
+    monkeypatch.setattr(_coder.shutil, "which", lambda name: "/usr/bin/claude")
+
+    _coder._run_backend(
+        cfg, "claude",
+        spawn_text="test prompt",
+        repo_root=tmp_path,
+        backend_override_bin=None,
+        runner=runner,
+        timeout=None,
+    )
+
+    injected = runner.calls[0]["env"]
+    # 无 key 时，scrubbed baseline = 当前环境（两键均不存在，无差异）
+    assert "ANTHROPIC_API_KEY" not in injected
+    assert "ANTHROPIC_AUTH_TOKEN" not in injected
+    assert injected.get("PATH") == "/usr/local/bin:/usr/bin"
+    assert injected.get("MY_CUSTOM_VAR") == "preserved"
+
+
+def test_mimo_backend_scrubs_inherited_key_but_keeps_mimo_credentials(
+    monkeypatch, tmp_path: Path
+):
+    """Scenario: mimo 后端在 scrubbed baseline 上叠加自身凭据。
+
+    WHEN mimo 后端启动 coder 子进程
+    THEN 子进程 env = scrubbed baseline + mimo.env 解析键值
+    AND mimo.env 内声明的 ANTHROPIC_API_KEY（指向 MiMo 第三方端点）正常生效，不被误删
+    """
+    # 进程环境里有"真实"Anthropic 计费 key（应被 scrub 掉）
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-real-billing-key-must-be-scrubbed")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "real-auth-token-must-be-scrubbed")
+
+    # mimo.env 里声明的是 MiMo 第三方端点凭据（应保留并覆盖 scrubbed baseline）
+    env_file = tmp_path / "mimo.env"
+    env_file.write_text(
+        "export ANTHROPIC_BASE_URL=https://mimo.example/api\n"
+        "export ANTHROPIC_API_KEY=mimo-api-key-should-survive\n"
+    )
+
+    from npc.config import Config, CoderConfig
+
+    cfg = Config(coder=CoderConfig(backend="mimo", mimo_env_file=str(env_file)))
+    runner = _fake_runner("RESULT: ok\n", exit_code=0)
+    monkeypatch.setattr(_coder.shutil, "which", lambda name: "/usr/bin/claude")
+
+    _coder._run_backend(
+        cfg, "mimo",
+        spawn_text="test prompt",
+        repo_root=tmp_path,
+        backend_override_bin=None,
+        runner=runner,
+        timeout=None,
+    )
+
+    injected = runner.calls[0]["env"]
+    # mimo.env 里的 ANTHROPIC_API_KEY 覆盖后应是 mimo 的值，不是原始 billing key
+    assert injected.get("ANTHROPIC_API_KEY") == "mimo-api-key-should-survive", (
+        "mimo.env 里声明的凭据应覆盖 scrubbed baseline"
+    )
+    assert injected.get("ANTHROPIC_BASE_URL") == "https://mimo.example/api"
+    # 继承的 ANTHROPIC_AUTH_TOKEN 已被 scrub，mimo.env 里没有声明，所以不应存在
+    assert "ANTHROPIC_AUTH_TOKEN" not in injected
+
+
 def test_cli_implement_run_mimo_permission_error_exit_3(
     env_setup, make_args, capsys, fake_repo: Path, tmp_path: Path, monkeypatch
 ):
-    _bootstrap_run(make_args, capsys, "add-foo")
     p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
 
     env_file = tmp_path / "mimo.env"
     env_file.write_text("export ANTHROPIC_AUTH_TOKEN=tok\n")
@@ -599,3 +742,120 @@ def test_cli_implement_run_mimo_permission_error_exit_3(
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False
     assert out["error"] == "env_error"
+
+
+# ============================================================
+# CLI --dispatch override（F1 验证：parser 注册 + 转发）
+# ============================================================
+
+
+def test_cli_implement_run_dispatch_headless_forwarded(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """npc implement run --dispatch headless 把 dispatch='headless' 转发给 run_implement。"""
+    p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
+
+    forwarded: dict = {}
+
+    def capture_run_implement(*a, **k):
+        forwarded.update(k)
+        return {"ok": True, "backend": "claude", "model": None, "coder_exit": 0, "seq": 1}
+
+    monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
+    monkeypatch.setattr(_coder, "run_implement", capture_run_implement)
+
+    args = make_args(
+        seq=1, change_id="add-foo", backend="claude",
+        dispatch="headless", timeout=None, config=None
+    )
+    _coder.cli_implement_run(args)
+    assert forwarded.get("dispatch") == "headless", (
+        "cli_implement_run 必须把 args.dispatch 转发给 run_implement"
+    )
+
+
+def test_cli_implement_run_dispatch_in_session_forwarded(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """npc implement run --dispatch in-session 把 dispatch='in-session' 转发给 run_implement。"""
+    p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
+
+    forwarded: dict = {}
+
+    def capture_run_implement(*a, **k):
+        forwarded.update(k)
+        return {
+            "ok": True, "deferred": True, "dispatch": "in-session",
+            "seq": 1, "change_id": "add-foo", "phase": "implement",
+            "backend": "claude", "spawn_prompt": "...", "prompt_file": "/tmp/p.md",
+        }
+
+    monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
+    monkeypatch.setattr(_coder, "run_implement", capture_run_implement)
+
+    args = make_args(
+        seq=1, change_id="add-foo", backend="claude",
+        dispatch="in-session", timeout=None, config=None
+    )
+    _coder.cli_implement_run(args)
+    assert forwarded.get("dispatch") == "in-session", (
+        "cli_implement_run 必须把 args.dispatch 转发给 run_implement"
+    )
+
+
+def test_cli_fix_run_dispatch_headless_forwarded(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """npc fix run --dispatch headless 把 dispatch='headless' 转发给 run_fix。"""
+    p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
+
+    forwarded: dict = {}
+
+    def capture_run_fix(*a, **k):
+        forwarded.update(k)
+        return {"ok": True, "seq": 1, "round": 1, "backend": "claude", "model": None, "coder_exit": 0}
+
+    monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
+    monkeypatch.setattr(_coder, "run_fix", capture_run_fix)
+
+    args = make_args(
+        seq=1, change_id="add-foo", round_n=1, backend="claude",
+        dispatch="headless", timeout=None, config=None
+    )
+    _coder.cli_fix_run(args)
+    assert forwarded.get("dispatch") == "headless", (
+        "cli_fix_run 必须把 args.dispatch 转发给 run_fix"
+    )
+
+
+def test_cli_fix_run_dispatch_in_session_forwarded(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """npc fix run --dispatch in-session 把 dispatch='in-session' 转发给 run_fix。"""
+    p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
+
+    forwarded: dict = {}
+
+    def capture_run_fix(*a, **k):
+        forwarded.update(k)
+        return {
+            "ok": True, "deferred": True, "dispatch": "in-session",
+            "seq": 1, "round": 1, "change_id": "add-foo", "phase": "fix-r1",
+            "backend": "claude", "spawn_prompt": "...", "prompt_file": "/tmp/p.md",
+        }
+
+    monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
+    monkeypatch.setattr(_coder, "run_fix", capture_run_fix)
+
+    args = make_args(
+        seq=1, change_id="add-foo", round_n=1, backend="claude",
+        dispatch="in-session", timeout=None, config=None
+    )
+    _coder.cli_fix_run(args)
+    assert forwarded.get("dispatch") == "in-session", (
+        "cli_fix_run 必须把 args.dispatch 转发给 run_fix"
+    )
