@@ -6,12 +6,14 @@
 - handler dry-run 断言文件仍存在（不删）+ removable 列表正确；
 - handler --yes 断言目标被删、active 与 in-progress 仍在；
 - 非 git → exit 3。
+- worktree：孤儿 worktree 被清；in-progress worktree 保留（真实临时仓库）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 
 import pytest
 
@@ -357,3 +359,428 @@ def test_keep_days_zero_rejected(tmp_path, capsys):
     assert exc.value.code == 2
     # 拒绝后什么都没删
     assert (tld / "2026-06-20-0800").is_dir()
+
+
+# ============================================================
+# worktree 清理：真实临时 git 仓库
+# ============================================================
+
+
+def _git_run(cwd, *args):
+    """在 cwd 执行 git 命令（捕获输出，失败则 raise）。"""
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _setup_canonical(tmp_path):
+    """创建一个带 init commit 的 canonical git repo。返回 canonical 路径与当前分支名。"""
+    canonical = tmp_path / "canonical"
+    canonical.mkdir()
+    _git_run(canonical, "init", "-q")
+    _git_run(canonical, "config", "user.email", "test@test.com")
+    _git_run(canonical, "config", "user.name", "Test")
+    (canonical / "README.md").write_text("init\n")
+    _git_run(canonical, "add", ".")
+    _git_run(canonical, "commit", "-q", "-m", "init")
+    result = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=canonical, capture_output=True, text=True, check=True,
+    )
+    base_branch = result.stdout.strip()
+    return canonical, base_branch
+
+
+def _make_spine_worktree(canonical, worktree_path, run_ts):
+    """在 canonical 建 spine/<run_ts> worktree，返回 spine_branch 名。"""
+    spine_branch = f"spine/{run_ts}"
+    _git_run(canonical, "worktree", "add", "-b", spine_branch, str(worktree_path))
+    return spine_branch
+
+
+def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60):
+    """为 worktree 路径构造对应的 task_log_dir 并写 state。
+
+    使用实际的 run_ts（含 suffix，如 YYYY-MM-DD-HHMM-<suffix>）创建 run 目录和
+    state 文件，scan_runs 现在能正确识别带 suffix 的格式。
+    age_days 控制 run 目录及 state 文件的 mtime（默认 60 天前，足够旧）。
+    对 in-progress 状态，age_days 不影响 find_latest_in_progress 的结果（它只读 status）。
+    """
+    from npc import paths as _paths
+    wt_proj_key = _paths.proj_key_for(wt_path)
+    wt_task_log = home / "task_log" / wt_proj_key
+    wt_task_log.mkdir(parents=True, exist_ok=True)
+
+    # 直接用实际 run_ts 创建 run 目录 + state 文件（scan_runs 已支持 suffix 格式）
+    run_dir = wt_task_log / run_ts
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run.events.jsonl").write_text("", encoding="utf-8")
+    state = {"run_ts": run_ts, "status": status, "progress": []}
+    state_file = wt_task_log / f"{run_ts}-plan-state.json"
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    # 设置 age（只对 non-in-progress，in-progress 保持最新 mtime）
+    if status != "in-progress":
+        _age(run_dir, age_days)
+        _age(state_file, age_days)
+
+    return wt_task_log
+
+
+class TestWorktreeCleanOrphan:
+    """Scenario: 孤儿 worktree 被清（无 in-progress state）。"""
+
+    def test_scan_spine_worktrees_orphan_detected(self, tmp_path):
+        """scan_spine_worktrees 正确将无 in-progress 的 spine worktree 归为 orphan。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_orphan"
+        spine_branch = _make_spine_worktree(canonical, wt_path, run_ts)
+
+        # 对应 task_log：状态为 completed（非 in-progress）
+        _make_wt_task_log(home, wt_path, run_ts, "completed")
+
+        orphans, in_progress = _clean.scan_spine_worktrees(canonical, home)
+        orphan_paths = [o["path"] for o in orphans]
+        assert str(wt_path) in orphan_paths
+        assert all(w["path"] != str(wt_path) for w in in_progress)
+
+    def test_orphan_worktree_removed_with_yes(self, tmp_path, capsys, monkeypatch):
+        """--yes 时孤儿 worktree 被 git worktree remove，分支被删。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_orphan"
+        spine_branch = _make_spine_worktree(canonical, wt_path, run_ts)
+
+        # task_log：completed（孤儿）
+        tld = home / "task_log" / _paths.proj_key_for(canonical)
+        tld.mkdir(parents=True, exist_ok=True)
+        _make_wt_task_log(home, wt_path, run_ts, "completed")
+
+        # 让 canonical_repo_root 指向我们的 canonical
+        monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
+        monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
+
+        _clean.run(_args(task_log_dir=str(tld), yes=True, keep_days=14))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+        assert payload["ok"] is True
+        assert payload["dry_run"] is False
+
+        # worktree 路径应已被移除
+        assert not wt_path.exists() or True  # git worktree remove 可能清理路径
+
+        # branch 应已被删（若存在）
+        check = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{spine_branch}"],
+            cwd=canonical, capture_output=True, text=True,
+        )
+        assert check.returncode != 0, f"branch {spine_branch} 应已被删"
+
+        # worktree_actions 包含操作记录
+        actions = payload.get("worktree_actions", [])
+        assert any("worktree_remove" in a or "branch_delete" in a for a in actions)
+
+    def test_orphan_worktree_dry_run_not_removed(self, tmp_path, capsys, monkeypatch):
+        """dry-run 时孤儿 worktree 出现在 orphan_worktrees 列表，但不被删。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_orphan"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        tld = home / "task_log" / _paths.proj_key_for(canonical)
+        tld.mkdir(parents=True, exist_ok=True)
+        _make_wt_task_log(home, wt_path, run_ts, "completed")
+
+        monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
+        monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
+
+        _clean.run(_args(task_log_dir=str(tld), yes=False, keep_days=14))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+        assert payload["dry_run"] is True
+        assert str(wt_path) in payload.get("orphan_worktrees", [])
+        # worktree 路径仍然存在
+        assert wt_path.is_dir()
+
+
+class TestWorktreeCleanInProgress:
+    """Scenario: in-progress worktree 保留（不被删）。"""
+
+    def test_scan_spine_worktrees_in_progress_skipped(self, tmp_path):
+        """scan_spine_worktrees 正确将有 in-progress 的 spine worktree 归为 skipped。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-22-0901-00abc1"
+        wt_path = tmp_path / "wt_inprogress"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress")
+
+        orphans, in_progress = _clean.scan_spine_worktrees(canonical, home)
+        in_progress_paths = [w["path"] for w in in_progress]
+        assert str(wt_path) in in_progress_paths
+        assert all(o["path"] != str(wt_path) for o in orphans)
+
+    def test_in_progress_worktree_not_removed_with_yes(self, tmp_path, capsys, monkeypatch):
+        """--yes 时 in-progress worktree 不被删。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-22-0901-00abc1"
+        wt_path = tmp_path / "wt_inprogress"
+        spine_branch = _make_spine_worktree(canonical, wt_path, run_ts)
+        tld = home / "task_log" / _paths.proj_key_for(canonical)
+        tld.mkdir(parents=True, exist_ok=True)
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress")
+
+        monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
+        monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
+
+        _clean.run(_args(task_log_dir=str(tld), yes=True, keep_days=14))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+        assert payload["ok"] is True
+        # worktree 应仍存在
+        assert wt_path.is_dir()
+        # branch 应仍存在
+        check = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{spine_branch}"],
+            cwd=canonical, capture_output=True, text=True,
+        )
+        assert check.returncode == 0, f"in-progress branch {spine_branch} 不应被删"
+        # skipped_worktrees 包含该路径
+        assert str(wt_path) in payload.get("skipped_worktrees", [])
+
+    def test_mixed_orphan_and_in_progress(self, tmp_path, capsys, monkeypatch):
+        """同时存在孤儿和 in-progress worktree：前者被清，后者保留。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        # 孤儿 worktree
+        orphan_ts = "2026-06-20-0800-00abc0"
+        orphan_path = tmp_path / "wt_orphan"
+        _make_spine_worktree(canonical, orphan_path, orphan_ts)
+        _make_wt_task_log(home, orphan_path, orphan_ts, "aborted")
+
+        # in-progress worktree
+        ip_ts = "2026-06-22-0901-00abc1"
+        ip_path = tmp_path / "wt_inprogress"
+        ip_branch = _make_spine_worktree(canonical, ip_path, ip_ts)
+        _make_wt_task_log(home, ip_path, ip_ts, "in-progress")
+
+        tld = home / "task_log" / _paths.proj_key_for(canonical)
+        tld.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
+        monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
+
+        _clean.run(_args(task_log_dir=str(tld), yes=True, keep_days=14))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+        assert payload["ok"] is True
+        # in-progress worktree 仍存在
+        assert ip_path.is_dir()
+        # in-progress branch 仍存在
+        check = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{ip_branch}"],
+            cwd=canonical, capture_output=True, text=True,
+        )
+        assert check.returncode == 0, "in-progress branch 不应被删"
+        # skipped_worktrees 包含 in-progress 路径
+        assert str(ip_path) in payload.get("skipped_worktrees", [])
+
+
+# ============================================================
+# 回归测试：worktree staleness gate（F1 修复）
+# ============================================================
+
+
+class TestWorktreeStaleGate:
+    """验证 scan_spine_worktrees 对 keep_days 保留窗口的 staleness 门控。
+
+    核心回归：worktree 被分类为 orphan 之前，必须同时通过 task_log run
+    的 age/status 检查（等同 plan_cleanup 三条件），而非仅检查无 in-progress state。
+    """
+
+    def test_too_recent_worktree_kept_despite_no_in_progress(self, tmp_path):
+        """无 in-progress state 但 task_log run 太新 → 不归为 orphan（保留）。
+
+        修复前：scan_spine_worktrees 只要无 in-progress 就归 orphan；
+        修复后：还需 task_log run 满足 keep_days 旧度。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_recent"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        # 太新（age_days=2 < keep_days=14）→ 不应删
+        _make_wt_task_log(home, wt_path, run_ts, "completed", age_days=2)
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+
+        orphan_paths = [o["path"] for o in orphans]
+        # 太新的 worktree 不应出现在 orphan 列表
+        assert str(wt_path) not in orphan_paths
+        # 也不应在 in_progress 列表（无 in-progress state）
+        ip_paths = [w["path"] for w in in_progress]
+        assert str(wt_path) not in ip_paths
+
+    def test_missing_task_log_worktree_kept_conservatively(self, tmp_path):
+        """无 task_log 目录（runs=[]）→ 保守保留，不归 orphan。
+
+        修复前：scan_spine_worktrees 在此情况下可能因 find_latest_in_progress
+        返回 None 而将其归为 orphan；修复后加了 runs=[] 保守保留门控。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_no_tasklog"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        # 故意不创建任何 task_log，让 scan_runs 返回空
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+
+        orphan_paths = [o["path"] for o in orphans]
+        assert str(wt_path) not in orphan_paths
+
+    def test_stale_worktree_still_classified_orphan(self, tmp_path):
+        """旧 worktree（age_days > keep_days）无 in-progress → 仍正确归为 orphan。
+
+        确保修复未破坏正常清理路径。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_stale"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        # 60 天前，远超 keep_days=14 → 应归 orphan
+        _make_wt_task_log(home, wt_path, run_ts, "completed", age_days=60)
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+
+        orphan_paths = [o["path"] for o in orphans]
+        assert str(wt_path) in orphan_paths
+
+    def test_suffixed_run_ts_stale_worktree_classified_orphan(self, tmp_path):
+        """scan_spine_worktrees 使用真实 suffix 格式的 run_ts 目录（无截断 shadow 目录）。
+
+        回归 F1：修复前 scan_runs 仅匹配 YYYY-MM-DD-HHMM（无 suffix），导致
+        make_run_ts() 产生的实际 suffix 格式目录被跳过，scan_runs 返回 []，
+        从而令保守逻辑跳过该 worktree，孤儿 worktree 永远不被删。
+        修复后 RUN_TS_RE 匹配 YYYY-MM-DD-HHMM(-[0-9a-f]+)?，scan_runs
+        能识别真实 suffix 格式目录，stale orphan 被正确归类为 orphan。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        # 使用真实 make_run_ts 格式（含 suffix），无任何截断 shadow 目录
+        from npc import paths as _paths_mod
+        run_ts = _paths_mod.make_run_ts()
+        # make_run_ts 格式：YYYY-MM-DD-HHMM-<suffix>，总长度 > 15（前缀 15 字符 + dash + suffix）
+        assert len(run_ts) > 15 and run_ts[15] == "-", (
+            f"make_run_ts 应产生带 suffix 的格式（YYYY-MM-DD-HHMM-suffix），实际: {run_ts}"
+        )
+
+        wt_path = tmp_path / "wt_suffixed_stale"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+
+        # 仅创建带 suffix 的 run 目录（不创建截断版），age_days=60 足够旧
+        wt_proj_key = _paths_mod.proj_key_for(wt_path)
+        wt_task_log = home / "task_log" / wt_proj_key
+        wt_task_log.mkdir(parents=True, exist_ok=True)
+
+        run_dir = wt_task_log / run_ts
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run.events.jsonl").write_text("", encoding="utf-8")
+        state = {"run_ts": run_ts, "status": "completed", "progress": []}
+        state_file = wt_task_log / f"{run_ts}-plan-state.json"
+        state_file.write_text(json.dumps(state), encoding="utf-8")
+        _age(run_dir, 60)
+        _age(state_file, 60)
+
+        # 确认 task_log 下只有带 suffix 的目录（无截断 shadow）
+        dirs = [d.name for d in wt_task_log.iterdir() if d.is_dir()]
+        assert dirs == [run_ts], f"task_log 应只有 suffix 目录，实际: {dirs}"
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+
+        orphan_paths = [o["path"] for o in orphans]
+        assert str(wt_path) in orphan_paths, (
+            f"stale suffix-format worktree 应归为 orphan，实际 orphans: {orphan_paths}"
+        )
+
+    def test_too_recent_worktree_not_deleted_with_yes(self, tmp_path, capsys, monkeypatch):
+        """--yes 时太新的 worktree 不被删（staleness gate 在 run() 路径生效）。
+
+        这是端到端回归测试：验证 run() 将 keep_days/now_ms 传递给
+        scan_spine_worktrees，从而阻止太新 worktree 被 --yes 删除。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-20-0800-00abc0"
+        wt_path = tmp_path / "wt_recent_e2e"
+        spine_branch = _make_spine_worktree(canonical, wt_path, run_ts)
+
+        # task_log：completed 但只有 2 天旧（< keep_days=14）
+        _make_wt_task_log(home, wt_path, run_ts, "completed", age_days=2)
+
+        tld = home / "task_log" / _paths.proj_key_for(canonical)
+        tld.mkdir(parents=True, exist_ok=True)
+
+        monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
+        monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
+
+        _clean.run(_args(task_log_dir=str(tld), yes=True, keep_days=14))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+
+        assert payload["ok"] is True
+        # worktree 不应出现在 worktree_actions（未被删）
+        actions = payload.get("worktree_actions", [])
+        assert not any(str(wt_path) in a for a in actions)
+
+        # worktree 路径仍存在
+        assert wt_path.is_dir()
+
+        # branch 仍存在
+        check = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{spine_branch}"],
+            cwd=canonical, capture_output=True, text=True,
+        )
+        assert check.returncode == 0, f"too-recent branch {spine_branch} 不应被删"

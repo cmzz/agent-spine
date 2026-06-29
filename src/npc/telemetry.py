@@ -161,6 +161,7 @@ def emit_event(record: dict, *, home: Path | None = None) -> bool:
 
     失败时 swallow 异常，写 stderr warning，返回 False；调用方不必处理。
     record 中缺失的字段会用默认值补齐：schema_version=1 / ts=now / kind 必填。
+    canonical_proj_key 缺失时，自动回退到 proj_key（保证每条记录均携带该字段）。
     """
     if not isinstance(record, dict):
         return False
@@ -170,6 +171,9 @@ def emit_event(record: dict, *, home: Path | None = None) -> bool:
     payload = dict(record)
     payload.setdefault("schema_version", SCHEMA_VERSION)
     payload.setdefault("ts", _now_iso())
+    # canonical_proj_key 规范化：缺失时回退到 proj_key，确保聚合字段始终存在
+    if "canonical_proj_key" not in payload and payload.get("proj_key"):
+        payload["canonical_proj_key"] = payload["proj_key"]
 
     try:
         _ensure_dirs(home)
@@ -400,6 +404,13 @@ def _top_n_dict(d: dict, n: int) -> list[tuple[str, int]]:
 # ============================================================
 
 
+def _paths_loader():
+    """从 run.json / active.json / env 加载 Paths；测试可通过 monkeypatch 替换此函数。"""
+    from . import paths as _paths
+
+    return _paths.load_paths(None)
+
+
 def cli_emit(args: argparse.Namespace) -> None:
     """``npc telemetry emit --kind <K> [--seq N] [--phase X] [--status S] [--extra JSON]``。
 
@@ -430,15 +441,30 @@ def cli_emit(args: argparse.Namespace) -> None:
             _io.emit_error("invalid_extra", f"--extra 解析失败：{e}", exit_code=2)
             return
         record.update(extra)
-    # proj_key 兜底：从 cwd 推
-    if "proj_key" not in record:
-        try:
-            from . import paths as _paths
+    # proj_key + canonical_proj_key 兜底：从 run.json / cwd 推
+    if "proj_key" not in record or "canonical_proj_key" not in record:
+        from . import paths as _paths
 
-            repo = _paths.detect_repo_root()
-            record["proj_key"] = _paths.proj_key_for(repo)
+        # 优先尝试读取 run.json（含 worktree 模式下的 canonical_proj_key）
+        try:
+            p = _paths_loader()
+            if "proj_key" not in record:
+                record["proj_key"] = p.proj_key
+            if "canonical_proj_key" not in record:
+                # worktree 模式：p.canonical_proj_key != None；非 worktree：回退 proj_key
+                record["canonical_proj_key"] = p.canonical_proj_key or p.proj_key
         except _paths.PathsError:
-            record["proj_key"] = "<unknown>"
+            # 无活跃 run：仅从 cwd 推 proj_key
+            if "proj_key" not in record:
+                try:
+                    repo = _paths.detect_repo_root()
+                    record["proj_key"] = _paths.proj_key_for(repo)
+                except _paths.PathsError:
+                    record["proj_key"] = "<unknown>"
+            # 无 run.json 时 canonical_proj_key 回退到 proj_key（emit_event 会再次兜底）
+        except Exception:
+            if "proj_key" not in record:
+                record["proj_key"] = "<unknown>"
 
     ok = emit_event(record)
     _io.emit({"ok": ok, "kind": kind, "path": str(events_path())})
@@ -548,6 +574,7 @@ def cli_estimate_tokens(args: argparse.Namespace) -> None:
 def emit_phase_exit(
     *,
     proj_key: str,
+    canonical_proj_key: str | None = None,
     run_ts: str | None,
     change_seq: int | None,
     change_id: str | None,
@@ -568,6 +595,7 @@ def emit_phase_exit(
     record: dict[str, Any] = {
         "kind": "phase.exit",
         "proj_key": proj_key,
+        "canonical_proj_key": canonical_proj_key if canonical_proj_key is not None else proj_key,
         "run_ts": run_ts,
         "change_seq": change_seq,
         "change_id": change_id,
@@ -612,6 +640,7 @@ def emit_phase_exit(
 def emit_review_round(
     *,
     proj_key: str,
+    canonical_proj_key: str | None = None,
     run_ts: str | None,
     change_seq: int,
     change_id: str,
@@ -635,6 +664,7 @@ def emit_review_round(
     record: dict[str, Any] = {
         "kind": "review.round",
         "proj_key": proj_key,
+        "canonical_proj_key": canonical_proj_key if canonical_proj_key is not None else proj_key,
         "run_ts": run_ts,
         "change_seq": change_seq,
         "change_id": change_id,
@@ -663,6 +693,7 @@ def emit_review_round(
 def emit_archive_done(
     *,
     proj_key: str,
+    canonical_proj_key: str | None = None,
     run_ts: str | None,
     change_seq: int,
     change_id: str,
@@ -676,6 +707,7 @@ def emit_archive_done(
     record: dict[str, Any] = {
         "kind": "archive.done",
         "proj_key": proj_key,
+        "canonical_proj_key": canonical_proj_key if canonical_proj_key is not None else proj_key,
         "run_ts": run_ts,
         "change_seq": change_seq,
         "change_id": change_id,
@@ -696,6 +728,7 @@ def emit_archive_done(
 def emit_agent_spawn(
     *,
     proj_key: str,
+    canonical_proj_key: str | None = None,
     run_ts: str | None,
     change_seq: int | None,
     change_id: str,
@@ -710,6 +743,7 @@ def emit_agent_spawn(
     record: dict[str, Any] = {
         "kind": "agent.spawn",
         "proj_key": proj_key,
+        "canonical_proj_key": canonical_proj_key if canonical_proj_key is not None else proj_key,
         "run_ts": run_ts,
         "change_seq": change_seq,
         "change_id": change_id,

@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import _io, paths as _paths, schema, session, resume, git_chain as _git_chain, state as _state
 from . import settings_auth as _settings_auth
+from . import git_ops as _git_ops
 
 
 PORTABLE_TIMEOUT_REL = ".local/bin/portable-timeout"
@@ -109,28 +110,133 @@ def _emit_shell_exports(payload: dict) -> None:
     sys.stdout.write("\n".join(out_lines) + "\n")
 
 
-def run(args: argparse.Namespace) -> None:
+def _get_current_branch(repo_root: Path, runner=subprocess.run) -> str:
+    """获取当前分支名（detached HEAD 时返回空字符串）。"""
+    import os as _os
+    env = dict(_os.environ)
+    env["LC_ALL"] = "C"
+    proc = runner(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    val = (proc.stdout or "").strip()
+    return "" if val == "HEAD" else val
+
+
+def _scan_spine_worktrees_for_resume(
+    canonical_repo_root: Path,
+    home: Path,
+    runner=subprocess.run,
+) -> tuple[bool, Path | None]:
+    """扫描 spine/* worktree，查找有 in-progress state 的悬空 worktree。
+
+    返回 (needs_resume, worktree_root_or_None)。
+    多个命中取 state mtime 最新。
+    """
+    try:
+        worktrees = _git_ops.list_worktrees(canonical_repo_root, runner=runner)
+    except _git_ops.WorktreeError:
+        return False, None
+
+    candidates: list[tuple[float, Path]] = []
+    for wt in worktrees:
+        branch = wt.get("branch", "")
+        # branch 形如 refs/heads/spine/<run_ts>
+        if not branch.startswith("refs/heads/spine/"):
+            continue
+        wt_path = Path(wt["path"])
+        if not wt_path.is_dir():
+            continue
+        # 按 worktree 路径推 task_log_dir
+        try:
+            wt_proj_key = _paths.proj_key_for(wt_path)
+        except _paths.PathsError:
+            continue
+        wt_task_log_dir = home / "task_log" / wt_proj_key
+        state_file = resume.find_latest_in_progress(wt_task_log_dir)
+        if state_file is not None:
+            try:
+                mtime = state_file.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            candidates.append((mtime, wt_path))
+
+    if not candidates:
+        return False, None
+    candidates.sort(reverse=True)
+    return True, candidates[0][1]
+
+
+def run(args: argparse.Namespace, runner=subprocess.run) -> None:
     """init 主入口。"""
     home = Path.home()
+    no_worktree: bool = getattr(args, "no_worktree", False)
 
-    # 1. 探测 git repo
+    # 1. 探测 git repo（canonical repo root，init 从主 checkout 运行）
     try:
-        repo_root = _paths.detect_repo_root()
+        canonical_repo_root = _paths.detect_repo_root()
     except _paths.PathsError as e:
         _io.emit_error("not_git_repo", str(e), exit_code=3)
         return
 
-    # 2. 续跑探测（在生成 run_ts 之前）
-    proj_key = _paths.proj_key_for(repo_root)
-    task_log_dir = home / "task_log" / proj_key
+    canonical_proj_key = _paths.proj_key_for(canonical_repo_root)
+
+    # 2. worktree 模式：建新 worktree 前先续跑扫描
+    worktree_root: Path | None = None
+    spine_branch: str | None = None
+    base_branch: str | None = None
+
+    if not no_worktree and not args.fresh:
+        needs_resume_wt, resume_wt_path = _scan_spine_worktrees_for_resume(
+            canonical_repo_root, home, runner=runner
+        )
+        if needs_resume_wt and resume_wt_path is not None:
+            # 命中悬空 in-progress spine worktree → 续跑，不新建
+            _io.emit({
+                "needs_resume": True,
+                "worktree_root": str(resume_wt_path),
+                "canonical_proj_key": canonical_proj_key,
+            })
+            return
+
+    # 3. 续跑探测：仅 --no-worktree 时检查 canonical task_log。
+    #    worktree 模式下悬空扫描（步骤 2）若未命中，直接建新 worktree + needs_resume=false；
+    #    不能用 canonical task_log 的旧 run_ts 来键入新 worktree，否则 state 路径错位。
+    task_log_dir_for_resume = home / "task_log" / canonical_proj_key
     resume_state_json: Path | None = None
     needs_resume = False
-    if not args.fresh:
-        if task_log_dir.is_dir():
-            resume_state_json = resume.find_latest_in_progress(task_log_dir)
+    if not args.fresh and no_worktree:
+        if task_log_dir_for_resume.is_dir():
+            resume_state_json = resume.find_latest_in_progress(task_log_dir_for_resume)
             needs_resume = resume_state_json is not None
 
-    # 3. 决定本次使用的 run_ts / paths
+    # 4. worktree 模式：创建 worktree + 分支
+    if not no_worktree:
+        run_ts_for_branch = _paths.make_run_ts()
+        spine_branch = f"spine/{run_ts_for_branch}"
+        base_branch = _get_current_branch(canonical_repo_root, runner=runner)
+        worktree_dir = home / ".spine" / "worktrees" / canonical_proj_key / run_ts_for_branch
+        try:
+            _git_ops.add_worktree(
+                canonical_repo_root,
+                path=worktree_dir,
+                branch=spine_branch,
+                base_ref="HEAD",
+                runner=runner,
+            )
+        except _git_ops.WorktreeError as e:
+            _io.emit_error("worktree_create_failed", str(e), exit_code=3)
+            return
+        worktree_root = worktree_dir
+        # 在 worktree 路径重键 Paths
+        repo_root = worktree_root
+    else:
+        repo_root = canonical_repo_root
+
+    # 5. 决定本次使用的 run_ts / paths
     if needs_resume and resume_state_json is not None:
         # 复用旧 run 的 ts
         try:
@@ -140,25 +246,40 @@ def run(args: argparse.Namespace) -> None:
             old_run_ts = resume_state_json.name.replace("-plan-state.json", "")
         p = _paths.compute_paths(repo_root, run_ts=old_run_ts, home=home)
     else:
-        p = _paths.compute_paths(repo_root, home=home)
+        if not no_worktree:
+            # worktree 模式用已生成的 run_ts（与 spine_branch 一致）
+            p = _paths.compute_paths(repo_root, run_ts=run_ts_for_branch, home=home)
+        else:
+            p = _paths.compute_paths(repo_root, home=home)
 
-    # 4. 确保目录
+    # 如有 worktree 回指字段，构造带回指的 Paths
+    if not no_worktree and worktree_root is not None:
+        from dataclasses import replace as _dc_replace
+        p = _dc_replace(
+            p,
+            canonical_repo_root=canonical_repo_root,
+            canonical_proj_key=canonical_proj_key,
+            base_branch=base_branch,
+            spine_branch=spine_branch,
+        )
+
+    # 6. 确保目录
     _paths.ensure_dirs(p)
 
-    # 4b. 落 run.json + active.json（v0.2 起作为子命令默认 resolve 入口）
+    # 6b. 落 run.json + active.json（v0.2 起作为子命令默认 resolve 入口）
     run_json_path = _paths.write_run_json(p)
     _paths.set_active(p.task_log_dir, p.run_ts)
 
-    # 5. 自举 schema
+    # 7. 自举 schema
     schema_created = schema.ensure_schema(p.schema_path)
 
-    # 6. 自举 portable-timeout
+    # 8. 自举 portable-timeout
     pt_path, pt_created = ensure_portable_timeout(home)
 
-    # 7. session 识别
+    # 9. session 识别
     sid, tx, src = session.detect_session(p.proj_key, home=home)
 
-    # 8. sanity check：cc projects 目录
+    # 10. sanity check：cc projects 目录
     if not (home / ".claude" / "projects" / p.proj_key).is_dir():
         _io.warn(
             f"cc projects 目录不存在：{home / '.claude' / 'projects' / p.proj_key}，"
@@ -172,7 +293,7 @@ def run(args: argparse.Namespace) -> None:
 
     mode = "auto" if args.auto else "interactive"
 
-    # 8b. auto 授权：仅 --auto 时给项目 .claude/settings.json 授足够权限（不阻塞 init）
+    # 10b. auto 授权：仅 --auto 时给项目 .claude/settings.json 授足够权限（不阻塞 init）
     auto_auth: dict | None = None
     if args.auto:
         try:
@@ -185,7 +306,7 @@ def run(args: argparse.Namespace) -> None:
             _io.warn(f"auto 授权失败（不阻塞 init）：{e}")
             auto_auth = {"ok": False, "error": str(e)}
 
-    # 9. state_drift 扫描（仅 needs_resume 时执行）
+    # 11. state_drift 扫描（仅 needs_resume 时执行）
     state_drift: dict | None = None
     if needs_resume and resume_state_json is not None:
         try:
@@ -221,6 +342,11 @@ def run(args: argparse.Namespace) -> None:
         "mode": mode,
         "fresh": bool(args.fresh),
         "auto_auth": auto_auth,
+        # worktree 回指字段（--no-worktree 时为 null）
+        "worktree_root": str(worktree_root) if worktree_root else None,
+        "spine_branch": spine_branch,
+        "canonical_proj_key": canonical_proj_key,
+        "canonical_repo_root": str(canonical_repo_root) if not no_worktree else None,
     }
 
     if args.shell_exports:
