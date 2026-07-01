@@ -313,7 +313,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--backend",
         choices=["claude", "mimo", "codex"],
         default=None,
-        help="覆盖 coder 后端（默认从 [coder].backend 读，或 mimo.env 存在时自动 mimo）",
+        help="覆盖 coder 后端（默认 claude；MiMo 需显式 --backend mimo / [coder].backend=\"mimo\"，mimo.env 存在不再自动路由）",
     )
     p_impl_run.add_argument(
         "--dispatch",

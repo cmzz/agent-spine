@@ -18,6 +18,24 @@ from copy import deepcopy
 from pathlib import Path
 
 
+def auto_local_dirs(home: Path | None = None) -> list[str]:
+    """--auto 无人值守所需的 cwd 外受信目录（机器专属绝对路径）。
+
+    这些路径在当前 checkout（cwd）之外，``defaultMode=acceptEdits`` 覆盖不到；
+    必须显式列入 ``permissions.additionalDirectories`` 才不会在 worktree 内
+    读/改文件时弹窗。因含 ``$HOME`` 绝对路径（机器专属），写入 gitignore 的
+    ``settings.local.json`` 而非可共享的 ``settings.json``。
+
+    - ``~/.spine/worktrees``：所有 spine per-run worktree 的根（coder 在此写代码）。
+    - ``~/task_log``：run state / summary.md 等 pointer 落盘处。
+    """
+    h = home or Path.home()
+    return [
+        str(h / ".spine" / "worktrees"),
+        str(h / "task_log"),
+    ]
+
+
 # harness 工具链 Bash 白名单（与用户级 settings 同口径）。acceptEdits 已覆盖
 # 写文件类工具；这里放行 harness 真正会用的 Bash 命令，避免逐次授权弹窗。
 _HARNESS_BINS = (
@@ -55,6 +73,63 @@ def merge_auto_permissions(existing: dict) -> tuple[dict, dict]:
 
     new["permissions"] = perms
     return new, summary
+
+
+def merge_additional_dirs(existing: dict, dirs: list[str]) -> tuple[dict, dict]:
+    """把机器专属受信目录合并进 ``permissions.additionalDirectories``。纯函数。
+
+    幂等：已存在的目录不重复追加。既有 additionalDirectories 与其它键原样保留。
+    返回 ``(new_settings, summary)``，``summary`` 含 ``added_dirs``。
+    """
+    new = deepcopy(existing) if isinstance(existing, dict) else {}
+    perms = dict(new.get("permissions") or {})
+
+    current = list(perms.get("additionalDirectories") or [])
+    added: list[str] = []
+    for d in dirs:
+        if d not in current:
+            current.append(d)
+            added.append(d)
+    perms["additionalDirectories"] = current
+
+    new["permissions"] = perms
+    return new, {"added_dirs": added}
+
+
+def grant_auto_local_dirs(repo_root: Path, home: Path | None = None) -> dict:
+    """把 --auto 所需的 cwd 外受信目录写入 ``<repo>/.claude/settings.local.json``。
+
+    ``settings.local.json`` 是 gitignore 的本地配置——机器专属绝对路径写这里，
+    绝不污染可共享/可提交的 ``settings.json``。合并、幂等、坏 JSON 不覆盖，与
+    ``grant_auto_permissions`` 同纪律。
+
+    返回 ``{ok, path, created, added_dirs, skipped?}``。
+    """
+    settings_path = repo_root / ".claude" / "settings.local.json"
+    existed = settings_path.is_file()
+
+    existing: dict = {}
+    if existed:
+        try:
+            existing = json.loads(settings_path.read_text(encoding="utf-8"))
+            if not isinstance(existing, dict):
+                return {"ok": False, "path": str(settings_path), "skipped": "not-an-object"}
+        except (OSError, json.JSONDecodeError):
+            return {"ok": False, "path": str(settings_path), "skipped": "unparseable"}
+
+    new, summary = merge_additional_dirs(existing, auto_local_dirs(home))
+
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = settings_path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, settings_path)
+
+    return {
+        "ok": True,
+        "path": str(settings_path),
+        "created": not existed,
+        "added_dirs": summary["added_dirs"],
+    }
 
 
 def grant_auto_permissions(repo_root: Path) -> dict:

@@ -249,7 +249,7 @@ SPINE_BRANCH=$(echo "$FINAL" | jq -r '.spine_branch // empty')
 - **auto 档绝不调用 AskUserQuestion**——范围、计划、执行决策一律用确定性默认或 `npc auto-decide` 自主解决；只有硬依赖缺失（exit 4）或缺人类凭据这类**客观阻塞**才停。交互档绝不在未确认时执行破坏性动作（archive / abort）。
 - **worktree 隔离**：`npc init` 返回 `worktree_root` 后，整个 run 期间所有 npc 子命令与 coder spawn 均在该 worktree 内执行。主 checkout 在 run 期间不受任何写操作影响。续跑必须 cd 进悬空 worktree，不新建。
 - **ff-only，不自作主张推远端**：finalize 仅在顶层 status=`completed` 且 fast-forward 干净时才合回 `base_branch`；合回失败（分叉）则保留 `spine_branch` 留人决策——不执行 `git push`、不强制 merge、不删分支。
-- **Claude Code 的工具权限提示（Write/Edit/Bash 授权弹窗）不归本 skill 管**——那是运行时 permission 层。要无人值守跑 auto，请在受信工程里用 acceptEdits / bypassPermissions 权限模式，或在 settings 里给本工程加 scoped allowlist（见 docs/usage.md）。
+- **auto 档的工具权限由 `npc init --auto` 自我预备**：init 会把授权写到**主 checkout**（live session 真正加载 settings 的位置，非 worktree）——`settings.json` 置 `defaultMode=acceptEdits` + harness Bash 白名单（可共享），`settings.local.json` 置 `additionalDirectories`（worktree 根 / task_log 等 cwd 外受信目录，机器专属绝对路径，gitignore，不污染可提交的 settings.json）。这消除了 worktree 内读/改文件的弹窗。合并、幂等、坏 JSON 不覆盖，失败不阻塞 init。极端无人值守可再叠加 `bypassPermissions`，但通常无需。
 - **续跑优先**：`npc init` 报 `needs_resume` 时永远先 `resume detect` 接断点，cd 进悬空 worktree，不要新建覆盖。
 - **change 粒度单一**：拆解目标时，一个 change 只做一件可独立交付的事；过大就再拆。
 - 全程用 **TodoWrite** 反映真实进度，让用户可实时观察这个长时 run。

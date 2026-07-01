@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -122,3 +123,90 @@ def test_grant_skips_non_object(tmp_path):
     res = sa.grant_auto_permissions(repo)
     assert res["ok"] is False
     assert res["skipped"] == "not-an-object"
+
+
+# ============================================================
+# additionalDirectories：merge 纯函数
+# ============================================================
+
+
+def test_merge_dirs_empty_adds_all():
+    new, summary = sa.merge_additional_dirs({}, ["/a", "/b"])
+    assert new["permissions"]["additionalDirectories"] == ["/a", "/b"]
+    assert summary["added_dirs"] == ["/a", "/b"]
+
+
+def test_merge_dirs_idempotent_and_preserves():
+    existing = {"permissions": {"additionalDirectories": ["/a"], "deny": ["Read(.env)"]}}
+    new, summary = sa.merge_additional_dirs(existing, ["/a", "/b"])
+    # 已存在的不重复；deny 原样保留
+    assert new["permissions"]["additionalDirectories"] == ["/a", "/b"]
+    assert summary["added_dirs"] == ["/b"]
+    assert new["permissions"]["deny"] == ["Read(.env)"]
+
+
+def test_merge_dirs_does_not_mutate_input():
+    existing = {"permissions": {"additionalDirectories": ["/a"]}}
+    sa.merge_additional_dirs(existing, ["/b"])
+    assert existing == {"permissions": {"additionalDirectories": ["/a"]}}
+
+
+def test_auto_local_dirs_uses_home():
+    dirs = sa.auto_local_dirs(home=Path("/home/x"))
+    assert "/home/x/.spine/worktrees" in dirs
+    assert "/home/x/task_log" in dirs
+
+
+# ============================================================
+# grant_auto_local_dirs：落 settings.local.json
+# ============================================================
+
+
+def test_grant_local_dirs_creates_local_file(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is True
+    assert res["created"] is True
+    # 只写 settings.local.json，绝不碰 settings.json
+    lp = repo / ".claude" / "settings.local.json"
+    assert lp.is_file()
+    assert not (repo / ".claude" / "settings.json").exists()
+    data = json.loads(lp.read_text())
+    assert "/home/x/.spine/worktrees" in data["permissions"]["additionalDirectories"]
+
+
+def test_grant_local_dirs_idempotent(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    res2 = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res2["ok"] is True
+    assert res2["added_dirs"] == []
+    data = json.loads((repo / ".claude" / "settings.local.json").read_text())
+    # 不重复累加
+    assert data["permissions"]["additionalDirectories"].count("/home/x/task_log") == 1
+
+
+def test_grant_local_dirs_merges_existing_allow(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    lp = repo / ".claude" / "settings.local.json"
+    lp.write_text(json.dumps({"permissions": {"allow": ["Bash(ls *)"]}}))
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is True
+    data = json.loads(lp.read_text())
+    # 既有 allow 保留 + additionalDirectories 追加
+    assert data["permissions"]["allow"] == ["Bash(ls *)"]
+    assert "/home/x/.spine/worktrees" in data["permissions"]["additionalDirectories"]
+
+
+def test_grant_local_dirs_skips_unparseable(tmp_path):
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    lp = repo / ".claude" / "settings.local.json"
+    lp.write_text("{ not json")
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is False
+    assert res["skipped"] == "unparseable"
+    assert lp.read_text() == "{ not json"

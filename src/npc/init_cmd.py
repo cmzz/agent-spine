@@ -293,11 +293,18 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
 
     mode = "auto" if args.auto else "interactive"
 
-    # 10b. auto 授权：仅 --auto 时给项目 .claude/settings.json 授足够权限（不阻塞 init）
+    # 10b. auto 授权：仅 --auto 时把项目授权写到主 checkout（live session 真正读取
+    #      settings 的位置），而非 worktree（其 settings.json 不被 cwd 会话加载）。
+    #      两处落盘：
+    #      - settings.json：defaultMode=acceptEdits + harness Bash 白名单（可共享）。
+    #      - settings.local.json：worktree 根 / task_log 等 cwd 外受信目录（机器专属
+    #        绝对路径，gitignore，绝不污染可提交的 settings.json）。
+    #      不阻塞 init。
     auto_auth: dict | None = None
+    auto_local: dict | None = None
     if args.auto:
         try:
-            auto_auth = _settings_auth.grant_auto_permissions(p.repo_root)
+            auto_auth = _settings_auth.grant_auto_permissions(canonical_repo_root)
             if auto_auth.get("ok"):
                 _io.info(f"已为 auto 模式授权：{auto_auth['path']}")
             else:
@@ -305,6 +312,17 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         except OSError as e:
             _io.warn(f"auto 授权失败（不阻塞 init）：{e}")
             auto_auth = {"ok": False, "error": str(e)}
+        try:
+            auto_local = _settings_auth.grant_auto_local_dirs(canonical_repo_root, home=home)
+            if auto_local.get("ok"):
+                _io.info(f"已授信 cwd 外目录（本地）：{auto_local['path']}")
+            else:
+                _io.warn(
+                    f"cwd 外目录授信跳过（{auto_local.get('skipped')}）：{auto_local.get('path')}"
+                )
+        except OSError as e:
+            _io.warn(f"cwd 外目录授信失败（不阻塞 init）：{e}")
+            auto_local = {"ok": False, "error": str(e)}
 
     # 11. state_drift 扫描（仅 needs_resume 时执行）
     state_drift: dict | None = None
@@ -342,6 +360,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         "mode": mode,
         "fresh": bool(args.fresh),
         "auto_auth": auto_auth,
+        "auto_local_dirs": auto_local,
         # worktree 回指字段（--no-worktree 时为 null）
         "worktree_root": str(worktree_root) if worktree_root else None,
         "spine_branch": spine_branch,
