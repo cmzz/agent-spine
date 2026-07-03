@@ -43,7 +43,14 @@ def computed_paths(fake_repo: Path, fake_home: Path) -> _paths.Paths:
 
 @pytest.fixture
 def env_setup(computed_paths: _paths.Paths, monkeypatch) -> _paths.Paths:
-    """把 NPC_* 环境变量注入，模拟 init --shell-exports 后的状态。"""
+    """把 NPC_* 环境变量注入，模拟 init --shell-exports 后的状态。
+
+    Also patches ``paths.read_active`` to return ``None`` so that
+    ``load_paths()`` skips cwd-based active.json discovery (step 3) and falls
+    through to the NPC_* env-var fallback (step 4).  Without this patch, a
+    real ``active.json`` in the worktree's task-log dir can cause ``load_paths``
+    to resolve the production run instead of the test-local fake paths.
+    """
     for k, v in computed_paths.to_env().items():
         monkeypatch.setenv(k, v)
     # session 字段默认空
@@ -52,6 +59,8 @@ def env_setup(computed_paths: _paths.Paths, monkeypatch) -> _paths.Paths:
     monkeypatch.setenv("NPC_SESSION_SOURCE", "test")
     monkeypatch.setenv("NPC_MODE", "interactive")
     monkeypatch.setenv("NPC_FRESH", "false")
+    # Block cwd-based run discovery so env-var fallback is used instead.
+    monkeypatch.setattr(_paths, "read_active", lambda *_a, **_kw: None)
     return computed_paths
 
 
