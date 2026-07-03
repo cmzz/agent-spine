@@ -729,3 +729,112 @@ def test_run_archive_git_commit_fnf_returns_structured_json(
     parsed = json.loads(serialized)
     assert parsed["ok"] is False
     assert parsed["error"] == "git-missing"
+
+
+# ============================================================
+# archive-structured-errors round-2: openspec 启动失败路径回归
+# ============================================================
+
+
+def test_run_archive_openspec_missing_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: _find_openspec_bin 找不到 openspec（FileNotFoundError），
+    run_archive 必须返回结构化 JSON（ok=false, error=openspec-missing, exit 1），
+    不得逃逸到 cli_archive_run 的通用分支以 dependency_missing / exit 4 退出。
+    这是 F1 round-2 修复的核心回归：覆盖 openspec 缺失路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 模拟 _find_openspec_bin 抛 FileNotFoundError（openspec 不在 PATH）
+    def fake_find_openspec_bin(override=None):
+        raise FileNotFoundError("未在 PATH 中找到 openspec 命令")
+
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", fake_find_openspec_bin)
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：异常被内部捕获并转化为结构化错误，不逃逸
+    assert result["ok"] is False
+    assert result["error"] == "openspec-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化（等价于 CLI 可输出单行 JSON）
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-missing"
+
+
+def test_run_archive_openspec_validate_subprocess_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: openspec validate 的 subprocess.run 因路径无效抛 FileNotFoundError
+    （--openspec-bin 指向不可执行路径），run_archive 必须将其转化为结构化 JSON
+    （ok=false, error=openspec-subprocess-failed），而非逃逸为 dependency_missing exit 4。
+    这是 F1 round-2 修复的回归测试：覆盖 openspec validate 启动失败路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "validate":
+            raise FileNotFoundError(2, "No such file or directory: '/bad/openspec'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # _find_openspec_bin 返回一个路径，但该路径在 subprocess.run 时不可执行
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/bad/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    assert result["ok"] is False
+    assert result["error"] == "openspec-subprocess-failed"
+    assert result["seq"] == 1
+
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-subprocess-failed"
+
+
+def test_run_archive_openspec_archive_subprocess_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: openspec archive 的 subprocess.run 因路径无效抛 OSError（例如 EACCES），
+    run_archive 必须将其转化为结构化 JSON（ok=false, error=openspec-subprocess-failed），
+    而非逃逸为 dependency_missing exit 4。
+    这是 F1 round-2 修复的回归测试：覆盖 openspec archive 启动失败路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "validate":
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "archive":
+            raise OSError(13, "Permission denied: '/bad/openspec'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/bad/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    assert result["ok"] is False
+    assert result["error"] == "openspec-subprocess-failed"
+    assert result["seq"] == 1
+
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-subprocess-failed"

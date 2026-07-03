@@ -807,15 +807,49 @@ def run_archive(
             "missing": chain.get("missing", []),
         }
 
-    osp = _find_openspec_bin(openspec_bin)
+    try:
+        osp = _find_openspec_bin(openspec_bin)
+    except FileNotFoundError as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-missing",
+            "detail": str(exc),
+        }
 
     # 2. openspec validate --strict
-    val = subprocess.run(
-        [osp, "validate", change_id, "--strict"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        val = subprocess.run(
+            [osp, "validate", change_id, "--strict"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-subprocess-failed", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-subprocess-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-subprocess-failed",
+            "detail": str(exc),
+        }
     if val.returncode != 0:
         _do_phase_exit(
             p,
@@ -834,12 +868,29 @@ def run_archive(
         }
 
     # 3. openspec archive --yes
-    arc = subprocess.run(
-        [osp, "archive", change_id, "--yes"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        arc = subprocess.run(
+            [osp, "archive", change_id, "--yes"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-subprocess-failed", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-subprocess-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-subprocess-failed",
+            "detail": str(exc),
+        }
     if arc.returncode != 0:
         _do_phase_exit(
             p,
@@ -1289,7 +1340,9 @@ def cli_archive_run(args: argparse.Namespace) -> None:
     try:
         result = run_archive(p, args.seq, openspec_bin=args.openspec_bin)
     except FileNotFoundError as e:
-        _io.emit_error("dependency_missing", str(e), exit_code=4)
+        # run_archive 内部已处理 openspec-missing 路径；此处捕获其他意外缺失依赖。
+        # 按 archive-error-contract：任何失败均以 exit 1 退出。
+        _io.emit_error("openspec-missing", str(e), exit_code=1)
         return
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr or "").strip()[:500]
