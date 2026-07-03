@@ -313,12 +313,20 @@ def init_run(args: argparse.Namespace) -> None:
         return
 
     if p.state_json.exists():
-        _io.emit_error(
-            "state_already_exists",
-            f"STATE_JSON 已存在：{p.state_json}（如需新建请用 --fresh 重新 init）",
-            exit_code=1,
-        )
-        return
+        # 允许从 initializing 骨架升级：骨架由 npc init 在建 worktree 前写入，
+        # init-run 时将其升级为正式 in-progress 状态（幂等，不破坏既有语义）。
+        try:
+            _existing = json.loads(p.state_json.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            _existing = {}
+        if _existing.get("status") != "initializing":
+            _io.emit_error(
+                "state_already_exists",
+                f"STATE_JSON 已存在：{p.state_json}（如需新建请用 --fresh 重新 init）",
+                exit_code=1,
+            )
+            return
+        # 否则继续：将骨架升级为正式 plan state（下方代码覆盖写入）
 
     p.task_log_dir.mkdir(parents=True, exist_ok=True)
     p.run_dir.mkdir(parents=True, exist_ok=True)

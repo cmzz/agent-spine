@@ -46,6 +46,31 @@ def find_latest_in_progress(task_log_dir: Path) -> Path | None:
     return candidates[0][1]
 
 
+def find_latest_initializing(task_log_dir: Path) -> Path | None:
+    """扫 *-plan-state.json，按 mtime 返回 status=initializing 的最新一份。
+
+    initializing 为 npc init 在建 worktree 前落盘的意向骨架，
+    表示「worktree 可能已建好但 init-run 尚未执行」的中间态。
+    """
+    if not task_log_dir.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    for p in task_log_dir.glob("*-plan-state.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if data.get("status") == "initializing":
+            try:
+                candidates.append((p.stat().st_mtime, p))
+            except OSError:
+                continue
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
 def _next_phase_for_entry(entry: dict) -> str:
     """根据 progress 条目的 phases 字典推断下一个 phase。"""
     phases = entry.get("phases") or {}
