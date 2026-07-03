@@ -14,6 +14,8 @@ import pytest
 
 from npc import pipeline as _pipeline
 from npc import state as _state
+from npc import verify as _verify
+from npc import config as _config
 
 
 # ============================================================
@@ -1026,3 +1028,192 @@ def test_run_review_round_allows_engine_name_cli_override_different_source(
     result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path, engine_name="claude")
     assert result["ok"] is True
     assert result.get("error") != "routing-violation"
+
+
+# ============================================================
+# wire-verify-tests：record 阶段对 coder 自报 tests=pass 做真实复跑
+# ============================================================
+
+def _make_commit_and_summary(fake_repo: Path, p) -> tuple[str, Path]:
+    """辅助：在 fake_repo 创建一个 commit + summary 文件，返回 (commit_hash, summary_path)。"""
+    (fake_repo / "wire_test.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "wire: test"], cwd=fake_repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+    summary = p.run_dir / "001-add-foo" / "implement.summary.md"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text("# summary\n")
+    return commit, summary
+
+
+def test_record_implement_rerun_fail_overrides_self_report(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.1：复跑失败覆盖 coder 自报 → ok=False, tests_verified=False。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    # 注入 run_tests_result：复跑失败
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "1 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    # 配置 rerun_tests=true（显式开启，不依赖 NPC_MODE）
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert result["tests_verified"] is False
+    assert "failed" in result.get("rerun_tail", "")
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "failed"
+
+
+def test_record_implement_rerun_pass_sets_verified_true(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.2：复跑通过 → ok=True, tests_verified=True。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": True, "cmd": "pytest", "tail": "1 passed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is True
+    assert result["tests_verified"] is True
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "reviewing"
+
+
+def test_record_implement_rerun_disabled_skips_verify(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.3：rerun_tests=false → 不复跑，行为与现状一致，tests_verified=None。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    call_count = {"n": 0}
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        call_count["n"] += 1
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "fail"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=False)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    # 没有复跑：call_count 仍为 0
+    assert call_count["n"] == 0
+    # record 成功（采信自报）
+    assert result["ok"] is True
+    assert result.get("tests_verified") is None
+
+
+def test_record_implement_rerun_no_command_degrades_gracefully(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.4：探测不到测试命令 → tests_verified=None，record 不失败。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": True}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is True
+    assert result["tests_verified"] is None
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "reviewing"
+
+
+def test_record_fix_rerun_fail_overrides_self_report(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """record_fix 同样支持复跑失败覆盖自报。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    (fake_repo / "fix_wire.txt").write_text("fix")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fix: wire"], cwd=fake_repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+    base = p.run_dir / "001-add-foo"
+    base.mkdir(parents=True, exist_ok=True)
+    summary = base / "round-1.fix.summary.md"
+    summary.write_text("# fix summary\n")
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "2 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = (
+        f"RESULT: commit={commit} fixed=1 tests=pass summary={summary} "
+        f"categories_scanned=validation regressions_added=- notes=-"
+    )
+    result = _pipeline.record_fix(p_with_repo, 1, 1, result_line)
+
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert result["tests_verified"] is False
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "needs-user-decision"

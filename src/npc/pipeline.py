@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -42,6 +43,19 @@ from .engines import (
     get_engine,
 )
 from .trend import STALE_THRESHOLD
+
+
+def _should_rerun_tests(cfg: Config) -> bool:
+    """判断 record 阶段是否应对 coder 自报 tests=pass 做真实复跑。
+
+    优先级：
+    1. ``cfg.verify.rerun_tests`` 显式配置 → 直接用。
+    2. 否则：``NPC_MODE=auto`` 时默认开启，其余模式默认关闭。
+    """
+    explicit = cfg.verify.rerun_tests
+    if explicit is not None:
+        return explicit
+    return os.environ.get("NPC_MODE", "interactive") == "auto"
 
 
 def _iso_to_ms(iso_str: str | None) -> int | None:
@@ -1175,10 +1189,50 @@ def record_implement(
         )
         return {"ok": False, "seq": seq, "error": "commit-not-found", "commit": commit}
 
+    # 真实复跑验证（tests=pass 自报硬轨）
+    tests_verified: bool | None = None
+    rerun_tail: str | None = None
+    try:
+        cfg = load_config(p.repo_root)
+    except ConfigError:
+        cfg = Config()
+    if _should_rerun_tests(cfg):
+        rerun = _verify.run_tests_result(p.repo_root, cfg)
+        if rerun.get("no_command"):
+            tests_verified = None  # 探测不到命令：降级，不阻塞
+        elif rerun["passed"]:
+            tests_verified = True
+        else:
+            tests_verified = False
+            rerun_tail = rerun.get("tail", "")
+            _do_phase_exit(
+                p, seq, "implement",
+                status="failed",
+                extra={
+                    "reason": "rerun-tests-failed",
+                    "tests_verified": False,
+                    "rerun_tail": rerun_tail,
+                },
+                progress_updates={"status": "failed", "reason": "rerun-tests-failed"},
+            )
+            return {
+                "ok": False,
+                "seq": seq,
+                "error": "rerun-tests-failed",
+                "tests_verified": False,
+                "rerun_tail": rerun_tail,
+            }
+
     _do_phase_exit(
         p, seq, "implement",
         status="done",
-        extra={"commit": commit, "tasks": tasks, "tests": tests, "summary": summary_path},
+        extra={
+            "commit": commit,
+            "tasks": tasks,
+            "tests": tests,
+            "summary": summary_path,
+            "tests_verified": tests_verified,
+        },
         progress_updates={"status": "reviewing", "implement_commit": commit},
     )
     return {
@@ -1189,6 +1243,7 @@ def record_implement(
         "tasks": tasks,
         "tests": tests,
         "summary": summary_path,
+        "tests_verified": tests_verified,
     }
 
 
@@ -1281,6 +1336,41 @@ def record_fix(
         )
         return {"ok": False, "seq": seq, "round": round_n, "error": "commit-not-found"}
 
+    # 真实复跑验证（tests=pass 自报硬轨）
+    tests_verified: bool | None = None
+    rerun_tail: str | None = None
+    try:
+        cfg = load_config(p.repo_root)
+    except ConfigError:
+        cfg = Config()
+    if _should_rerun_tests(cfg):
+        rerun = _verify.run_tests_result(p.repo_root, cfg)
+        if rerun.get("no_command"):
+            tests_verified = None  # 探测不到命令：降级，不阻塞
+        elif rerun["passed"]:
+            tests_verified = True
+        else:
+            tests_verified = False
+            rerun_tail = rerun.get("tail", "")
+            _do_phase_exit(
+                p, seq, phase,
+                status="failed",
+                extra={
+                    "reason": "rerun-tests-failed",
+                    "tests_verified": False,
+                    "rerun_tail": rerun_tail,
+                },
+                progress_updates={"status": "needs-user-decision", "reason": f"rerun-tests-failed-r{round_n}"},
+            )
+            return {
+                "ok": False,
+                "seq": seq,
+                "round": round_n,
+                "error": "rerun-tests-failed",
+                "tests_verified": False,
+                "rerun_tail": rerun_tail,
+            }
+
     _do_phase_exit(
         p, seq, phase,
         status="done",
@@ -1291,6 +1381,7 @@ def record_fix(
             "summary": summary_path,
             "categories_scanned": parsed.get("categories_scanned", ""),
             "regressions_added": parsed.get("regressions_added", ""),
+            "tests_verified": tests_verified,
         },
         progress_updates={"status": "in-fix-loop"},
     )
@@ -1303,6 +1394,7 @@ def record_fix(
         "fixed": fixed,
         "tests": tests,
         "summary": summary_path,
+        "tests_verified": tests_verified,
     }
 
 

@@ -120,6 +120,37 @@ def _tail(stdout: str, stderr: str, lines: int = TAIL_LINES) -> str:
     return "\n".join(rows[-lines:])
 
 
+def run_tests_result(
+    repo_root: Path, cfg: _config.Config, runner=subprocess.run
+) -> dict:
+    """record 阶段内部调用：对 coder 自报 tests=pass 做真实复跑。
+
+    返回 dict（不 emit、不 SystemExit）：
+    - ``{"no_command": True}``：探测不到测试命令，降级不阻塞。
+    - ``{"passed": True, "cmd": str, "tail": str}``：复跑通过。
+    - ``{"passed": False, "cmd": str, "tail": str}``：复跑失败。
+    """
+    cmd = resolve_test_cmd(repo_root, cfg)
+    if cmd is None:
+        return {"no_command": True}
+
+    argv = shlex.split(cmd)
+    proc = runner(
+        argv,
+        shell=False,
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+    )
+    passed = proc.returncode == 0
+    return {
+        "no_command": False,
+        "passed": passed,
+        "cmd": cmd,
+        "tail": _tail(proc.stdout or "", proc.stderr or ""),
+    }
+
+
 def run_tests(args: argparse.Namespace, runner=subprocess.run) -> None:
     """``npc verify tests``：在 repo_root 真实复跑测试命令。
 
