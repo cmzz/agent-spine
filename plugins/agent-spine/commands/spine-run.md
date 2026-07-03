@@ -127,12 +127,35 @@ IMPL=$(npc implement run --seq $SEQ)
 - **`deferred=true`（in-session，claude 后端默认）**：npc 已 render prompt，等编排者 spawn subagent：
   ```bash
   SPAWN_PROMPT=$(echo "$IMPL" | jq -r '.spawn_prompt')
-  # 调 Task 工具，由主 session 原地 spawn spine-coder subagent：
-  RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT")
-  # 抽末尾 RESULT: 行，装订：
-  npc implement record --seq $SEQ --result "$RESULT_LINE"
+  # spawn 前取超时预算（必须；绝不无限等待）：
+  BUDGET=$(npc agent timeout-budget --seq $SEQ --phase implement)
+  TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
+  if [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
+    # 预算耗尽，直接转决策点（不再 spawn）
+    DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')   # 通常 skip
+    # 按 ACTION 执行（skip → 继续下一 change；abort → 进 Step 4）
+  else
+    # 调 Task 工具，由主 session 原地 spawn spine-coder subagent（带 timeout=TIMEOUT_SEC）：
+    RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
+    if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
+      # 超时或失败：记账后决定是否重派
+      RT=$(npc agent record-timeout --seq $SEQ --phase implement)
+      if [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+        DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')   # skip
+        # 按 ACTION 执行
+      else
+        # 预算未耗尽 → 回到 3a 重派（continue-retry 语义）
+        { 回到 3a 重派; }
+      fi
+    else
+      # 抽末尾 RESULT: 行，装订：
+      npc implement record --seq $SEQ --result "$RESULT_LINE"
+    fi
+  fi
   ```
-  > `spawn_prompt` 已含 prompt 文件绝对路径（`prompt_file` 字段亦可直接取）；RESULT 行格式见 spine-coder 契约。
+  > `spawn_prompt` 已含 prompt 文件绝对路径（`prompt_file` 字段亦可直接取）；RESULT 行格式见 spine-coder 契约。超时预算由 `npc agent timeout-budget` 给出（渐进退避：base 1800s / mult 1.2 / max 3600s / 最多 5 次超时后 exhausted）。
 
 - **`deferred=false`（headless，mimo 后端或显式配置）**：npc 内部已完成 spawn→record，一行跑完，无需额外操作：
   ```bash
@@ -154,9 +177,29 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
 
   # 同 3a：按 deferred 字段分发
   if [ "$(echo "$FIX" | jq -r '.deferred')" = "true" ]; then
-    # in-session（claude 后端默认）：spawn spine-coder subagent，装订结果
+    # in-session（claude 后端默认）：spawn 前取超时预算（必须）
     SPAWN_PROMPT=$(echo "$FIX" | jq -r '.spawn_prompt')
-    RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT")
+    FIX_PHASE="fix-r${N}"
+    BUDGET=$(npc agent timeout-budget --seq $SEQ --phase $FIX_PHASE)
+    TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
+    if [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
+      # 预算耗尽，不再 spawn，转决策点
+      DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+      ACTION=$(echo "$DEC" | jq -r '.action')
+      break
+    fi
+    RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
+    if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
+      # 超时：记账后决定是否继续
+      RT=$(npc agent record-timeout --seq $SEQ --phase $FIX_PHASE)
+      if [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+        DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        break
+      fi
+      # 未耗尽 → 跳过本轮记录，重新 review（不算作 fix 完成，继续循环）
+      continue
+    fi
     npc fix record --seq $SEQ --round $N --result "$RESULT_LINE"
   fi
   # headless（mimo/显式）：npc 内部已 record，无需额外步骤
@@ -188,6 +231,7 @@ echo "$ARCH" | jq -r '{ok, archive_commit, total_rounds, error}'
 | 3b review 卡死（`stale=true`） | `stale` |
 | 3b review 卡死（轮次越上限） | `max-rounds` |
 | 3c archive 失败 | `archive-failed` |
+| 3a/3b in-session coder 超时且预算耗尽 | `agent-timeout-exhausted` |
 
 ```bash
 DEC=$(npc auto-decide --trigger <上表对应值> --seq $SEQ --apply)
@@ -278,6 +322,7 @@ SPINE_BRANCH=$(echo "$FINAL" | jq -r '.spine_branch // empty')
 - **你不读 prompt 模板 / review.json / summary.md 原文**。只读 npc 子命令返回的一行 JSON 的关键字段。需要细节时引用 npc 给的 `pointer` 路径，不要把原文拉进 context。
 - **每个 npc 命令后检查 `.ok` 与 exit code**：exit 1 业务失败 / 2 用法错 / 3 环境错 / 4 依赖缺失。依赖缺失（4）立即停并提示安装。
 - **review-fix 循环必须有上限**（默认 20 轮）且尊重 `stale` 闸门——绝不无限打磨。
+- **in-session coder spawn 必须带 timeout 预算**：deferred=true 路径（3a implement、3b fix）spawn spine-coder 前 **MUST** 先调 `npc agent timeout-budget --seq N --phase <phase>` 获取当次预算，以该预算监督 Task 执行；超时 **MUST** 调 `npc agent record-timeout` 记账；预算耗尽 **MUST** 以 `--trigger agent-timeout-exhausted` 调用 `npc auto-decide`。**in-session 路径绝不无限等待 coder。**
 - **auto 档绝不调用 AskUserQuestion**——范围、计划、执行决策一律用确定性默认或 `npc auto-decide` 自主解决；只有硬依赖缺失（exit 4）或缺人类凭据这类**客观阻塞**才停。交互档绝不在未确认时执行破坏性动作（archive / abort）。
 - **worktree 隔离**：`npc init` 返回 `worktree_root` 后，整个 run 期间所有 npc 子命令与 coder spawn 均在该 worktree 内执行。主 checkout 在 run 期间不受任何写操作影响。续跑必须 cd 进悬空 worktree，不新建。
 - **ff-only，不自作主张推远端**：finalize 仅在顶层 status=`completed` 且 fast-forward 干净时才合回 `base_branch`；合回失败（分叉）则保留 `spine_branch` 留人决策——不执行 `git push`、不强制 merge、不删分支。
