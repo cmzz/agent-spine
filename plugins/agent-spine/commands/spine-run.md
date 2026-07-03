@@ -118,6 +118,7 @@ npc state add-change $SEQ "$CID"
 ### 3a. Implement
 
 ```bash
+IMPL_FAILED=false   # 每个 SEQ 开始时重置；deferred=true record 失败时置 true，通知 3b 跳过 review
 IMPL=$(npc implement run --seq $SEQ)
 [ "$(echo "$IMPL" | jq -r '.ok')" = "true" ] || { 进入 Step 3d 决策点; }
 ```
@@ -126,7 +127,6 @@ IMPL=$(npc implement run --seq $SEQ)
 
 - **`deferred=true`（in-session，claude 后端默认）**：npc 已 render prompt，等编排者 spawn subagent：
   ```bash
-  IMPL_FAILED=false   # 标记 implement 阶段是否因 record 失败而需跳过 3b
   SPAWN_PROMPT=$(echo "$IMPL" | jq -r '.spawn_prompt')
   # spawn 前取超时预算（必须；绝不无限等待）：
   BUDGET=$(npc agent timeout-budget --seq $SEQ --phase implement)
