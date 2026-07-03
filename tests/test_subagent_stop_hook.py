@@ -435,3 +435,92 @@ def test_failure_schema_summary_dash_passes(fake_repo: Path) -> None:
 
     proc = _run_hook(payload)
     assert proc.returncode == 0, f"Expected exit 0 (failure with summary=-)\nstderr: {proc.stderr}"
+
+
+# ── Regression Round-2 F2: commit=- blocked for success schemas ──────────────
+
+def test_implement_success_commit_dash_blocked(fake_repo: Path) -> None:
+    """Round-2 F2: implement schema (tests=pass) with commit=- must be rejected.
+
+    The contract reserves commit=- exclusively for the failure schema
+    (tests=fail).  A success claim without a verifiable commit hash must not
+    pass the gate even if all other required keys are present.
+    """
+    # tests=pass + no fixed= → implement schema detection path
+    result_line = "RESULT: commit=- tasks=3 tests=pass summary=/tmp/s.md notes=-"
+    payload = _spine_payload(f"Done.\n{result_line}", cwd=str(fake_repo))
+
+    proc = _run_hook(payload)
+    assert proc.returncode == 2, (
+        f"Expected exit 2 (implement success with commit=-)\nstderr: {proc.stderr}"
+    )
+    assert "commit=-" in proc.stderr or "commit" in proc.stderr.lower()
+
+
+def test_fix_success_commit_dash_blocked(fake_repo: Path) -> None:
+    """Round-2 F2: fix schema (tests=pass) with commit=- must be rejected.
+
+    The contract reserves commit=- exclusively for the failure schema.
+    A fix success that claims no commit must not pass the gate.
+    """
+    # fixed= present + tests=pass → fix schema detection path
+    result_line = (
+        "RESULT: commit=- fixed=2 tests=pass summary=/tmp/s.md"
+        " categories_scanned=validation regressions_added=- notes=-"
+    )
+    payload = _spine_payload(f"Fix done.\n{result_line}", cwd=str(fake_repo))
+
+    proc = _run_hook(payload)
+    assert proc.returncode == 2, (
+        f"Expected exit 2 (fix success with commit=-)\nstderr: {proc.stderr}"
+    )
+    assert "commit=-" in proc.stderr or "commit" in proc.stderr.lower()
+
+
+# ── Regression Round-2 F1: hooks.json matcher documented fixture ─────────────
+
+def test_hooks_json_matcher_is_spine_coder() -> None:
+    """Round-2 F1: hooks.json SubagentStop matcher must be 'spine-coder' (not 'Agent').
+
+    The SubagentStop hook event evaluates the matcher against the subagent's
+    agent_type field.  Using matcher='Agent' would target the tool name rather
+    than the agent type, leaving the verification gate inert for spine-coder
+    subagents.  This fixture asserts the config file has the correct value.
+    """
+    import json as _json
+
+    hooks_path = REPO_ROOT / "plugins" / "agent-spine" / "hooks" / "hooks.json"
+    config = _json.loads(hooks_path.read_text())
+
+    subagent_stop_hooks = config.get("hooks", {}).get("SubagentStop", [])
+    assert subagent_stop_hooks, "SubagentStop section must exist in hooks.json"
+
+    # The first (and only) hook group must target spine-coder, not the tool name
+    first_group = subagent_stop_hooks[0]
+    assert first_group.get("matcher") == "spine-coder", (
+        f"SubagentStop matcher must be 'spine-coder', got {first_group.get('matcher')!r}. "
+        "Using 'Agent' or any tool-level name leaves the gate inert."
+    )
+
+
+def test_spine_coder_agent_type_payload_triggers_validation(fake_repo: Path) -> None:
+    """Round-2 F1: realistic SubagentStop payload with agent_type=spine-coder triggers validation.
+
+    This mirrors the payload Claude Code would send when a spine-coder subagent
+    stops: the agent_type field contains 'spine-coder', which must match the
+    hooks.json matcher and cause the hook to run RESULT validation.
+    """
+    # Realistic SubagentStop payload — spine-coder missing RESULT → must block
+    payload = {
+        "agent_type": "spine-coder",
+        "last_assistant_message": "I have completed the implementation successfully.",
+        "cwd": str(fake_repo),
+        "session_id": "realistic-test-session",
+        "stop_reason": "end_turn",
+    }
+    proc = _run_hook(payload)
+    # spine-coder without RESULT line → must exit 2 (gate fires)
+    assert proc.returncode == 2, (
+        f"Expected exit 2: realistic spine-coder payload without RESULT must be blocked"
+        f"\nstderr: {proc.stderr}"
+    )

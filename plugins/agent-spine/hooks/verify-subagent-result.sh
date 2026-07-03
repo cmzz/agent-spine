@@ -138,6 +138,13 @@ case "$SCHEMA_VARIANT" in
             echo "RESULT line: $RESULT_LINE" >&2
             exit 2
         fi
+        # commit=- is reserved for the failure schema; success must have a real hash
+        if [ "$COMMIT_RAW" = "-" ]; then
+            echo "ERROR: implement success RESULT requires a real commit hash, not commit=-" >&2
+            echo "       Use commit=- only with tests=fail (failure schema)" >&2
+            echo "RESULT line: $RESULT_LINE" >&2
+            exit 2
+        fi
         ;;
     fix)
         # fix success: commit= fixed= tests= summary= categories_scanned= regressions_added= notes=
@@ -149,6 +156,13 @@ case "$SCHEMA_VARIANT" in
         # tests= must be "pass" for fix success
         if [ "$TESTS_RAW" != "pass" ] && [ -n "$TESTS_RAW" ]; then
             echo "ERROR: fix RESULT schema requires tests=pass, got tests=${TESTS_RAW}" >&2
+            echo "RESULT line: $RESULT_LINE" >&2
+            exit 2
+        fi
+        # commit=- is reserved for the failure schema; fix success must have a real hash
+        if [ "$COMMIT_RAW" = "-" ]; then
+            echo "ERROR: fix success RESULT requires a real commit hash, not commit=-" >&2
+            echo "       Use commit=- only with tests=fail (failure schema)" >&2
             echo "RESULT line: $RESULT_LINE" >&2
             exit 2
         fi

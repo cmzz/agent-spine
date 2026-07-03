@@ -2,7 +2,7 @@
   "hooks": {
     "SubagentStop": [
       {
-        "matcher": "Agent",
+        "matcher": "spine-coder",
         "hooks": [
           {
             "type": "command",
