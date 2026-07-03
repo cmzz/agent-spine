@@ -418,3 +418,242 @@ def test_auto_decide_merge_evicted_trigger(tmp_path):
     assert decision["action"] == "skip"
     assert decision["set_status"] == "skipped-auto"
     assert decision.get("skipped_reason") == "merge-evicted"
+
+
+# ============================================================
+# Regression F1: state write failure stops subsequent git actions
+# ============================================================
+
+
+def test_state_write_failure_queued_stops_processing(tmp_path):
+    """F1 回归：set_parallel_fields 在 queued 时抛出异常 → process_entry 返回
+    MergeResult(success=False) 且不执行任何 git rebase / ff-merge。
+
+    真实路径：state_json 不存在（FileNotFoundError），触发实际 set_parallel_fields 代码路径。
+    """
+    from npc.merge_queue import MergeQueue, MergeQueueEntry, MergeResult
+
+    worktree = tmp_path / "wt" / "change-x"
+    worktree.mkdir(parents=True)
+
+    # 使 state_json 不存在 → set_parallel_fields → update_state → read_state 抛 FileNotFoundError
+    state_json = tmp_path / "nonexistent-state.json"
+    state_md = tmp_path / "nonexistent-state.md"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    git_calls: list[str] = []
+
+    def tracking_runner(cmd, **kwargs):
+        git_calls.append(" ".join(str(c) for c in cmd))
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    def verify_fn(wt):
+        return True, ""
+
+    def archive_fn(seq, run_root):
+        return True, "", "abc"
+
+    queue = MergeQueue(
+        run_root=tmp_path / "run_wt",
+        repo_root=tmp_path / "repo",
+        run_branch="spine/test",
+        state_json=state_json,
+        state_md=state_md,
+        run_dir=run_dir,
+        max_evictions=2,
+        verify_fn=verify_fn,
+        archive_fn=archive_fn,
+        runner=tracking_runner,
+    )
+
+    entry = MergeQueueEntry(
+        change_id="change-x",
+        seq=1,
+        dag_layer=0,
+        change_branch="spine/test/change-x",
+        exec_worktree=worktree,
+        run_branch="spine/test",
+    )
+
+    result = queue.process_entry(entry)
+
+    # 必须返回失败
+    assert result.success is False, "state write failure must propagate as MergeResult(success=False)"
+    assert "state write failed" in result.error, f"unexpected error: {result.error}"
+    # 不得执行 rebase 或 ff-merge
+    rebase_calls = [c for c in git_calls if "rebase" in c]
+    ff_calls = [c for c in git_calls if "merge" in c]
+    assert not rebase_calls, f"rebase should not be called when state write fails: {rebase_calls}"
+    assert not ff_calls, f"ff-merge should not be called when state write fails: {ff_calls}"
+
+
+def test_state_write_failure_merged_stops_archive(tmp_path):
+    """F1 回归：set_parallel_fields 在 merged 时抛出异常 → process_entry 返回
+    MergeResult(success=False) 且不执行 archive/worktree_remove。
+
+    真实路径：rebase & ff-merge 成功后，state_json 被删除使写 merged 失败。
+    """
+    from npc import state as _state
+    from npc.merge_queue import MergeQueue, MergeQueueEntry
+
+    worktree = tmp_path / "wt" / "change-y"
+    worktree.mkdir(parents=True)
+
+    state_json, state_md = _make_state(tmp_path, ["change-y"])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    archive_calls: list[int] = []
+    write_merged_called = False
+
+    original_set_parallel_fields = _state.set_parallel_fields
+
+    def patched_set_parallel_fields(sj, sm, seq, *, merge_status=None, **kw):
+        nonlocal write_merged_called
+        if merge_status == "merged":
+            write_merged_called = True
+            raise _state.StateLockError("simulated lock timeout on merged write")
+        return original_set_parallel_fields(sj, sm, seq, merge_status=merge_status, **kw)
+
+    import npc.merge_queue as _mq
+    orig_fn = _mq._state.set_parallel_fields
+    _mq._state.set_parallel_fields = patched_set_parallel_fields
+
+    try:
+        def archive_fn(seq, run_root):
+            archive_calls.append(seq)
+            return True, "", "commit-abc"
+
+        def verify_fn(wt):
+            return True, ""
+
+        queue = MergeQueue(
+            run_root=tmp_path / "run_wt",
+            repo_root=tmp_path / "repo",
+            run_branch="spine/test",
+            state_json=state_json,
+            state_md=state_md,
+            run_dir=run_dir,
+            max_evictions=2,
+            verify_fn=verify_fn,
+            archive_fn=archive_fn,
+            runner=_always_ok_runner,
+        )
+
+        entry = MergeQueueEntry(
+            change_id="change-y",
+            seq=1,
+            dag_layer=0,
+            change_branch="spine/test/change-y",
+            exec_worktree=worktree,
+            run_branch="spine/test",
+        )
+
+        result = queue.process_entry(entry)
+    finally:
+        _mq._state.set_parallel_fields = orig_fn
+
+    assert result.success is False, "StateLockError on merged write must propagate as failure"
+    assert "state write failed (merged)" in result.error
+    # archive must NOT be called when state write for 'merged' fails
+    assert archive_calls == [], f"archive should not be called: {archive_calls}"
+
+
+# ============================================================
+# Regression F2: auto-decide failure keeps worktree, writes fallback state
+# ============================================================
+
+
+def test_eviction_limit_auto_decide_failure_preserves_worktree(tmp_path):
+    """F2 回归：auto-decide 子进程失败（返回 applied=False）→ worktree 不拆除，
+    返回结构化错误，state 写 skipped_reason=merge-evicted。
+
+    真实路径：auto_decide_fn 返回 (False, 'skip') 触发实际 fallback 逻辑。
+    """
+    from npc.merge_queue import MergeQueue, MergeQueueEntry
+
+    worktree = tmp_path / "wt" / "change-z"
+    worktree.mkdir(parents=True)
+
+    state_json, state_md = _make_state(tmp_path, ["change-z"])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    def verify_fn(wt):
+        return False, "test failed"
+
+    # auto_decide_fn 返回 (applied=False, action='skip') — 模拟子进程失败
+    def failing_auto_decide(seq):
+        return (False, "skip")
+
+    queue = MergeQueue(
+        run_root=tmp_path / "run_wt",
+        repo_root=tmp_path / "repo",
+        run_branch="spine/test",
+        state_json=state_json,
+        state_md=state_md,
+        run_dir=run_dir,
+        max_evictions=1,
+        verify_fn=verify_fn,
+        auto_decide_fn=failing_auto_decide,
+        runner=_always_ok_runner,
+    )
+
+    entry = MergeQueueEntry(
+        change_id="change-z",
+        seq=1,
+        dag_layer=0,
+        change_branch="spine/test/change-z",
+        exec_worktree=worktree,
+        run_branch="spine/test",
+        eviction_count=0,
+    )
+
+    result = queue.process_entry(entry)
+
+    # auto-decide 失败 → 不拆 worktree
+    assert worktree.exists(), "worktree must be preserved when auto-decide fails"
+    # 返回结构化错误
+    assert result.success is False
+    assert "auto-decide-failed" in result.error, f"unexpected error msg: {result.error}"
+    assert result.evicted is True
+
+
+def test_default_auto_decide_returns_applied_false_on_subprocess_failure(tmp_path):
+    """F2 回归：_default_auto_decide 子进程返回 rc!=0 → (False, 'skip')，不静默吞掉。
+
+    真实路径：构造一个 MergeQueue 并直接调用 _default_auto_decide，
+    通过注入 runner 模拟 npc 不存在（FileNotFoundError）。
+    """
+    from npc.merge_queue import MergeQueue
+
+    state_json, state_md = _make_state(tmp_path, ["change-a"])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    queue = MergeQueue(
+        run_root=tmp_path / "run_wt",
+        repo_root=tmp_path / "repo",
+        run_branch="spine/test",
+        state_json=state_json,
+        state_md=state_md,
+        run_dir=run_dir,
+    )
+
+    # Monkey-patch subprocess.run inside _default_auto_decide to simulate failure
+    import npc.merge_queue as _mq
+    original_subprocess_run = _mq.subprocess.run
+
+    def failing_run(cmd, **kwargs):
+        # Simulate `npc` not found: FileNotFoundError
+        raise FileNotFoundError("npc not found")
+
+    _mq.subprocess.run = failing_run
+    try:
+        applied, action = queue._default_auto_decide(seq=1)
+    finally:
+        _mq.subprocess.run = original_subprocess_run
+
+    assert applied is False, "subprocess failure must return applied=False"
+    assert action == "skip"

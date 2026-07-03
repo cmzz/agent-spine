@@ -280,8 +280,13 @@ class MergeQueue:
         except Exception as e:
             return False, str(e), None
 
-    def _default_auto_decide(self, seq: int) -> str:
-        """默认 auto-decide：调 npc auto-decide --seq N --trigger merge-evicted --apply。"""
+    def _default_auto_decide(self, seq: int) -> tuple[bool, str]:
+        """默认 auto-decide：调 npc auto-decide --seq N --trigger merge-evicted --apply。
+
+        返回 (applied: bool, action: str)。
+        - applied=True 表示子进程成功且返回 ok=true/applied=true；
+        - applied=False 表示子进程失败、JSON 无效或 applied 字段为 false——调用方不得拆 worktree。
+        """
         try:
             proc = subprocess.run(
                 ["npc", "auto-decide", "--seq", str(seq), "--trigger", "merge-evicted", "--apply"],
@@ -290,10 +295,18 @@ class MergeQueue:
                 text=True,
                 timeout=30,
             )
-            out = json.loads(proc.stdout or "{}")
-            return out.get("action", "skip")
+            if proc.returncode != 0:
+                return False, "skip"
+            try:
+                out = json.loads(proc.stdout or "{}")
+            except json.JSONDecodeError:
+                return False, "skip"
+            # auto-decide 必须明确表示已 apply，否则视为失败
+            if not (out.get("ok") or out.get("applied")):
+                return False, out.get("action", "skip")
+            return True, out.get("action", "skip")
         except Exception:
-            return "skip"
+            return False, "skip"
 
     def _emit_telemetry(self, kind: str, entry: MergeQueueEntry, **extra: object) -> None:
         """best-effort telemetry emit。"""
@@ -318,14 +331,21 @@ class MergeQueue:
         """
         self._emit_telemetry("merge_enqueued", entry)
 
-        # 更新 merge_status = queued
+        # 更新 merge_status = queued（锁/写入失败视为结构化错误，停止后续动作）
         try:
             _state.set_parallel_fields(
                 self.state_json, self.state_md,
                 entry.seq, merge_status="queued",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            err_msg = f"state write failed (queued): {exc}"
+            self._emit_telemetry("merge_state_error", entry, error=err_msg)
+            return MergeResult(
+                change_id=entry.change_id,
+                success=False,
+                error=err_msg,
+                eviction_count=entry.eviction_count,
+            )
 
         # 1. rebase 到 run 分支 HEAD
         ok, err = _rebase_onto(entry.exec_worktree, self.run_branch, runner=self.runner)
@@ -345,14 +365,21 @@ class MergeQueue:
             _rebase_abort(entry.exec_worktree, runner=self.runner)
             return self._evict(entry, "conflict", conflict_err=f"ff-merge failed: {ff_err}")
 
-        # 4. 更新 merge_status = merged
+        # 4. 更新 merge_status = merged（锁/写入失败视为结构化错误，停止后续动作）
         try:
             _state.set_parallel_fields(
                 self.state_json, self.state_md,
                 entry.seq, merge_status="merged",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            err_msg = f"state write failed (merged): {exc}"
+            self._emit_telemetry("merge_state_error", entry, error=err_msg)
+            return MergeResult(
+                change_id=entry.change_id,
+                success=False,
+                error=err_msg,
+                eviction_count=entry.eviction_count,
+            )
 
         # 5. archive（在 run 分支上串行执行）
         arc_ok, arc_err, arc_commit = self.archive_fn(entry.seq, self.run_root)
@@ -414,7 +441,8 @@ class MergeQueue:
         except Exception:
             pass
 
-        # 更新 state
+        # 更新 state（锁/写入失败：emit error 但继续，不阻断 eviction 逻辑本身）
+        state_write_err: str = ""
         try:
             _state.set_parallel_fields(
                 self.state_json, self.state_md,
@@ -422,8 +450,9 @@ class MergeQueue:
                 merge_status="evicted",
                 eviction_count=new_eviction_count,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            state_write_err = f"state write failed (evicted): {exc}"
+            self._emit_telemetry("merge_state_error", entry, error=state_write_err)
 
         self._emit_telemetry(
             "merge_evicted", entry,
@@ -434,10 +463,42 @@ class MergeQueue:
         # 判断是否超限
         if new_eviction_count >= self.max_evictions:
             self._emit_telemetry("merge_evict_limit", entry, eviction_count=new_eviction_count)
-            # 调 auto-decide
-            action = self.auto_decide_fn(entry.seq)
-            # auto-decide 已 apply（在 _default_auto_decide 中），无需再改 state
-            # 超限后清理：若 worktree 处于 rebase 中间态则先 abort，再拆除 worktree 与分支
+            # 调 auto-decide（_default_auto_decide 返回 (applied, action)；注入的 fn 也应遵守此约定）
+            auto_decide_result = self.auto_decide_fn(entry.seq)
+            # 兼容注入 fn 可能只返回 str（如旧测试）
+            if isinstance(auto_decide_result, tuple):
+                ad_applied, ad_action = auto_decide_result
+            else:
+                ad_applied, ad_action = True, auto_decide_result
+
+            if not ad_applied:
+                # auto-decide 失败：fallback 直接写 skipped-auto/skipped_reason=merge-evicted
+                # 此时不拆 worktree（保留现场，上层可重试）
+                fallback_err: str = ""
+                try:
+                    _state.set_parallel_fields(
+                        self.state_json, self.state_md,
+                        entry.seq,
+                        skipped_reason="merge-evicted",
+                    )
+                except Exception as exc:
+                    fallback_err = f"fallback state write failed: {exc}"
+                    self._emit_telemetry("merge_state_error", entry, error=fallback_err)
+                self._emit_telemetry(
+                    "merge_evict_auto_decide_failed", entry,
+                    eviction_count=new_eviction_count,
+                    fallback_err=fallback_err,
+                )
+                return MergeResult(
+                    change_id=entry.change_id,
+                    success=False,
+                    evicted=True,
+                    eviction_reason=reason,
+                    eviction_count=new_eviction_count,
+                    error=f"eviction-limit-exceeded auto-decide-failed ({reason}){': ' + fallback_err if fallback_err else ''}",
+                )
+
+            # auto-decide 成功 apply：拆除 worktree 与分支
             if reason == "conflict" and entry.exec_worktree.exists():
                 _rebase_abort(entry.exec_worktree, runner=self.runner)
             _worktree_remove(
