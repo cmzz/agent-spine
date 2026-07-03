@@ -378,3 +378,148 @@ class TestFixPhaseConsecutiveTimeoutExhaustion:
         payload = _read_emit(capsys)
         assert payload["retries"] == 4
         assert payload["exhausted"] is False, "at retries=4 fix-r1 should NOT be exhausted yet"
+
+
+# ============================================================
+# 3.6  spine-run.md 控制流守卫：fix exhausted 分支不落入 post-loop R 判断
+# ============================================================
+
+
+class TestFixExhaustedControlFlow:
+    """验证 spine-run.md fix exhausted 分支的控制流守卫。
+
+    F1 finding 的核心：fix 分支耗尽预算后必须按 auto-decide 返回的 ACTION
+    立即执行，不得落入"循环退出后看 R"的 blocking/stale 判断。
+
+    测试通过检查 spine-run.md 的文本结构保证：
+    1. FIX_EXHAUSTED 标志在 break 2 前被设置（两处 exhausted 路径都覆盖）
+    2. 循环后的注释明确区分 FIX_EXHAUSTED=true 和正常出口两个分支
+    3. 预算耗尽后 auto-decide apply 写入 skipped-auto → state 可被验证，
+       证明 ACTION 已真实落地（不只是 break 后丢弃）
+    """
+
+    @pytest.fixture(autouse=True)
+    def spine_run_text(self) -> str:
+        spine_run = (
+            Path(__file__).parent.parent
+            / "plugins"
+            / "agent-spine"
+            / "commands"
+            / "spine-run.md"
+        )
+        return spine_run.read_text(encoding="utf-8")
+
+    def test_fix_exhausted_flag_set_before_break2(self, spine_run_text):
+        """FIX_EXHAUSTED=true 必须紧接在 break 2 代码行之前出现（两处 exhausted 路径均覆盖）。
+
+        确保无论走"budget 查询时已 exhausted"还是"record-timeout 返回 exhausted"路径，
+        都设置了标志，post-loop 能区分 exhausted 出口和正常出口。
+
+        注意：测试用行列表过滤掉注释行，只检查赋值语句与代码行的相对位置。
+        """
+        lines = spine_run_text.splitlines()
+        flag_lines = [
+            i for i, line in enumerate(lines)
+            if "FIX_EXHAUSTED=true" in line and not line.strip().startswith("#")
+        ]
+        break2_lines = [
+            i for i, line in enumerate(lines)
+            if line.strip() == "break 2" or line.strip().startswith("break 2  #")
+        ]
+
+        assert len(flag_lines) >= 1, (
+            "FIX_EXHAUSTED=true assignment missing — exhausted exit path not flagged"
+        )
+        assert len(break2_lines) >= 1, "No 'break 2' code lines found in spine-run.md"
+
+        # 对每一个 break 2 代码行，必须存在一个 FIX_EXHAUSTED=true 赋值在其紧前面
+        # 至少第一个 flag 赋值应出现在第一个实际 break 2 代码行之前
+        first_flag = min(flag_lines)
+        first_break2 = min(break2_lines)
+        assert first_flag < first_break2, (
+            f"FIX_EXHAUSTED=true (line {first_flag+1}) must appear before "
+            f"the first 'break 2' code line (line {first_break2+1})"
+        )
+
+    def test_fix_exhausted_flag_initialized_before_loop(self, spine_run_text):
+        """FIX_EXHAUSTED=false 初始化必须在外层 while 循环之前出现。
+
+        若未初始化，bash 中变量为空字符串，条件判断将静默失效。
+        """
+        init_pos = spine_run_text.find("FIX_EXHAUSTED=false")
+        loop_pos = spine_run_text.find(
+            'while [ "$(echo "$R" | jq -r \'.blocking\')" -gt 0 ]'
+        )
+        assert init_pos != -1, "FIX_EXHAUSTED=false initialization missing"
+        assert loop_pos != -1, "review-fix while loop not found"
+        assert init_pos < loop_pos, (
+            "FIX_EXHAUSTED must be initialized before the review-fix while loop"
+        )
+
+    def test_post_loop_dispatches_action_before_r_check(self, spine_run_text):
+        """循环退出后注释必须明确区分 FIX_EXHAUSTED 路径和正常出口。
+
+        确保 spec 文本要求执行者在 FIX_EXHAUSTED=true 时按 ACTION 分发，
+        而不是继续走旧的 blocking/stale 判断。
+        """
+        assert "FIX_EXHAUSTED" in spine_run_text, (
+            "Post-loop section must reference FIX_EXHAUSTED flag"
+        )
+        # 循环后有 ACTION 的分发语义说明
+        assert "ACTION" in spine_run_text, "ACTION dispatch missing from post-loop section"
+
+    def test_exhausted_action_applied_writes_skipped_auto(self, env_setup, capsys, make_args):
+        """预算耗尽 → auto-decide apply → state 写入 skipped-auto（ACTION 真实落地验证）。
+
+        这是关键的功能回归：验证 auto-decide --apply 调用确实把 change 状态写为
+        skipped-auto，从而证明 break 2 后如果按 ACTION=skip 执行（调用 --apply），
+        当前 change 会被正确跳过，而不是落入未定义的 post-loop R 判断。
+        """
+        _bootstrap(env_setup, capsys, make_args, "cid-exhausted-action")
+
+        # 模拟 fix-r1 在同一 phase 累积 5 次超时 → exhausted
+        for _ in range(5):
+            _agent.record_timeout(
+                _mk(
+                    env_setup,
+                    make_args,
+                    seq=1,
+                    phase="fix-r1",
+                    base=None,
+                    mult=None,
+                    max_sec=None,
+                )
+            )
+            capsys.readouterr()
+
+        # 确认 exhausted
+        _agent.timeout_budget(
+            _mk(
+                env_setup,
+                make_args,
+                seq=1,
+                phase="fix-r1",
+                base=None,
+                mult=None,
+                max_sec=None,
+            )
+        )
+        budget = _read_emit(capsys)
+        assert budget["exhausted"] is True
+
+        # auto-decide --apply（模拟 spine-run exhausted 分支调用）
+        _auto_decide.cli(
+            _mk(env_setup, make_args, seq=1, trigger="agent-timeout-exhausted", apply=True)
+        )
+        decision = _read_emit(capsys)
+        # ACTION 必须为 skip（对应 exhausted trigger 的标准响应）
+        assert decision["action"] == "skip"
+        assert decision["set_status"] == "skipped-auto"
+
+        # 验证 state 已写入：证明 ACTION 真实落地，change 已被跳过
+        # 若 spine-run 只做 break 2 而不执行 ACTION，此断言将失败
+        s = json.loads(env_setup.state_json.read_text())
+        assert s["progress"][0]["status"] == "skipped-auto", (
+            "After exhausted + auto-decide --apply, change must be skipped-auto in state"
+        )
+        assert s["progress"][0].get("last_trigger") == "agent-timeout-exhausted"

@@ -167,6 +167,7 @@ IMPL=$(npc implement run --seq $SEQ)
 ```bash
 R=$(npc review run --seq $SEQ --round 0)
 N=0
+FIX_EXHAUSTED=false   # 标记 fix 分支是否因预算耗尽而 break 2
 while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
    && [ "$(echo "$R" | jq -r '.stale')" = "false" ] \
    && [ $N -lt 20 ]; do
@@ -190,6 +191,7 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
         # 预算耗尽，不再 spawn，转决策点
         DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
         ACTION=$(echo "$DEC" | jq -r '.action')
+        FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发
         break 2  # 同时跳出内层循环和外层 while
       fi
       RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
@@ -199,6 +201,7 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
         if [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
           DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
           ACTION=$(echo "$DEC" | jq -r '.action')
+          FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发
           break 2  # 同时跳出内层循环和外层 while
         fi
         # 未耗尽 → 在同一 FIX_PHASE 内重派，不推进 N
@@ -217,9 +220,12 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
 done
 ```
 
-循环退出后看 `R`：
-- `blocking == 0` → 干净，进 3c archive。
-- `stale == true` 或越上限 → 卡死，进 3d 决策点。
+循环退出后优先检查 `FIX_EXHAUSTED` 标志——预算耗尽路径 `ACTION` 已由 `npc auto-decide --apply` 写入，
+必须按 3d 语义立即执行，不得用旧的 `R` 做 blocking/stale 判断：
+- `FIX_EXHAUSTED=true` → 按 `ACTION` 执行（skip：继续下一 change；abort：进 Step 4；其余同 3d）。
+- `FIX_EXHAUSTED=false` → 正常出口：
+  - `blocking == 0` → 干净，进 3c archive。
+  - `stale == true` 或越上限 → 卡死，进 3d 决策点。
 
 ### 3c. Archive
 
