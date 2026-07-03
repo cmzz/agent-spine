@@ -776,3 +776,64 @@ def set_parallel_fields(
             entry["skipped_reason"] = skipped_reason
 
     update_state(state_json, state_md, mutate)
+
+
+# ----------------------------- CLI handler: set_parallel_fields_cmd -----------------------------
+
+
+def set_parallel_fields_cmd(args: argparse.Namespace) -> None:
+    """state set-parallel-fields <seq> [--dag-layer N] [--change-branch B] [--exec-worktree P]。
+
+    将并行字段（dag_layer / change_branch / exec_worktree）写入 progress[seq-1]，
+    使 spine-run 编排可以通过 CLI 原子更新这些字段；resume detect 亦可读取。
+    """
+    try:
+        p = _paths.load_paths(args)
+    except _paths.PathsError as e:
+        _io.emit_error("env_missing", str(e), exit_code=3)
+        return
+
+    dag_layer = args.dag_layer
+    change_branch = args.change_branch
+    exec_worktree = args.exec_worktree
+    merge_status = args.merge_status
+    skipped_reason = args.skipped_reason
+
+    # 至少要设置一个字段
+    if all(v is None for v in [dag_layer, change_branch, exec_worktree, merge_status, skipped_reason]):
+        _io.emit_error(
+            "no_fields",
+            "set-parallel-fields 至少需要一个字段（--dag-layer / --change-branch / --exec-worktree / --merge-status / --skipped-reason）",
+            exit_code=2,
+        )
+        return
+
+    try:
+        set_parallel_fields(
+            p.state_json,
+            p.state_md,
+            args.seq,
+            dag_layer=dag_layer,
+            change_branch=change_branch,
+            exec_worktree=exec_worktree,
+            merge_status=merge_status,
+            skipped_reason=skipped_reason,
+        )
+    except ValueError as e:
+        _io.emit_error("invalid_args", str(e), exit_code=1)
+        return
+    except FileNotFoundError:
+        _io.emit_error(
+            "state_not_found", f"STATE_JSON 不存在：{p.state_json}", exit_code=3
+        )
+        return
+
+    _io.emit({
+        "ok": True,
+        "seq": args.seq,
+        "dag_layer": dag_layer,
+        "change_branch": change_branch,
+        "exec_worktree": exec_worktree,
+        "merge_status": merge_status,
+        "skipped_reason": skipped_reason,
+    })

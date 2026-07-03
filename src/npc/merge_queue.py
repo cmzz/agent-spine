@@ -437,6 +437,15 @@ class MergeQueue:
             # 调 auto-decide
             action = self.auto_decide_fn(entry.seq)
             # auto-decide 已 apply（在 _default_auto_decide 中），无需再改 state
+            # 超限后清理：若 worktree 处于 rebase 中间态则先 abort，再拆除 worktree 与分支
+            if reason == "conflict" and entry.exec_worktree.exists():
+                _rebase_abort(entry.exec_worktree, runner=self.runner)
+            _worktree_remove(
+                self.repo_root,
+                entry.exec_worktree,
+                entry.change_branch,
+                runner=self.runner,
+            )
             return MergeResult(
                 change_id=entry.change_id,
                 success=False,

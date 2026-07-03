@@ -637,11 +637,18 @@ def create_per_change_worktree(
     run_ts: str,
     home: Path | None = None,
     runner=subprocess.run,
+    *,
+    parent_task_log_dir: Path | None = None,
+    parent_state_json: Path | None = None,
 ) -> tuple[Path, str]:
     """从 run 分支 HEAD 建 per-change worktree 与分支。
 
     分支名：``spine/<run_ts>/<change_id>``
     worktree 路径：``~/.spine/worktrees/<run_ts>/<change_id>``
+
+    若提供 ``parent_task_log_dir`` 与 ``parent_state_json``，则在 worktree 根目录
+    写入 per-change pointer 文件（``.npc-run-pointer.json``），使 worktree 内的
+    npc 命令无需显式参数即可找到父 run。
 
     返回 ``(worktree_path, branch_name)``。
     失败抛 :class:`WorktreeError`。
@@ -661,6 +668,17 @@ def create_per_change_worktree(
         raise WorktreeError(
             f"per-change worktree 创建失败（{change_id}）: {(proc.stderr or '').strip()}"
         )
+    # 写入 per-change pointer（让 worktree 内的 npc 命令能定位父 run）
+    if parent_task_log_dir is not None and parent_state_json is not None:
+        try:
+            _paths_mod.write_per_change_pointer(
+                worktree_path,
+                parent_run_ts=run_ts,
+                parent_task_log_dir=parent_task_log_dir,
+                parent_state_json=parent_state_json,
+            )
+        except Exception:
+            pass  # pointer 写入失败不阻断 worktree 创建
     return worktree_path, branch_name
 
 

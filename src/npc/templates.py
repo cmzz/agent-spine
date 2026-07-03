@@ -101,16 +101,20 @@ def render_fixer(
     blocking_findings_md: str,
     categories_seen: list[str],
     blocking_trend: list[int],
+    eviction_md: str = "",
 ) -> str:
     """渲染 Fixer prompt（对应历史 skill 的 §B 段）。
 
     blocking_findings_md 由 fixer.render_findings 生成（直接嵌入正文）；
     categories_seen / blocking_trend 由主 session 通过 state 取，npc render 时
     自动注入到"修复历史"段。
+    eviction_md：驱逐上下文 Markdown 段（非空时注入 prompt），包含冲突文件、
+    diff 摘要及"解冲突 → git add → git rebase --continue"指令。
     """
     summary_path = f"{base}/round-{round_n}.fix.summary.md"
     cats = ", ".join(categories_seen) if categories_seen else "（首轮，暂无）"
     trend = " → ".join(str(x) for x in blocking_trend) if blocking_trend else "（首轮，暂无）"
+    eviction_section = f"\n{eviction_md}\n" if eviction_md else ""
 
     return f"""你是代码修复专家。请修复 Codex review 指出的以下 blocking 问题。
 
@@ -126,7 +130,7 @@ def render_fixer(
 ## Review Findings（仅 in_scope=true 且 severity ∈ {{critical, high}}）
 
 {blocking_findings_md}
-
+{eviction_section}
 ## 修复历史
 
 - categories_seen: {cats}

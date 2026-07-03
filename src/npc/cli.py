@@ -130,6 +130,23 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_make_handler("state", "set_progress"), _cmd_path="state set-progress"
     )
 
+    p_state_pf = sub_state.add_parser(
+        "set-parallel-fields",
+        help="设置 progress 条目的并行字段（dag_layer / change_branch / exec_worktree 等）",
+    )
+    p_state_pf.add_argument("seq", type=int, help="progress 条目的 seq（1-based）")
+    p_state_pf.add_argument("--dag-layer", type=int, default=None, dest="dag_layer", help="DAG 层编号（0-based）")
+    p_state_pf.add_argument("--change-branch", default=None, dest="change_branch", help="per-change 分支名")
+    p_state_pf.add_argument("--exec-worktree", default=None, dest="exec_worktree", help="per-change worktree 路径")
+    p_state_pf.add_argument("--merge-status", default=None, dest="merge_status",
+                             choices=["pending", "queued", "evicted", "merged"],
+                             help="merge queue 状态")
+    p_state_pf.add_argument("--skipped-reason", default=None, dest="skipped_reason", help="skipped 原因")
+    p_state_pf.set_defaults(
+        handler=_make_handler("state", "set_parallel_fields_cmd"),
+        _cmd_path="state set-parallel-fields",
+    )
+
     p_state_fin = sub_state.add_parser("finalize", help="收尾：判定顶层 status")
     p_state_fin.set_defaults(
         handler=_make_handler("state", "finalize"), _cmd_path="state finalize"

@@ -84,6 +84,38 @@ def _default_review_path(base: Path, round_n: int) -> Path:
     return base / f"round-{round_n - 1}.review.json"
 
 
+def _render_eviction_md(ev_data: dict) -> str:
+    """将 eviction context dict 渲染为注入 fixer prompt 的 Markdown 段。"""
+    reason = ev_data.get("reason", "unknown")
+    eviction_count = ev_data.get("eviction_count", 1)
+    conflict_files = ev_data.get("conflict_files") or []
+    conflict_diff = ev_data.get("conflict_diff") or ""
+    test_output = ev_data.get("test_output") or ""
+    instructions = ev_data.get("instructions") or ""
+
+    lines = [
+        "## Merge Queue Eviction Context",
+        "",
+        f"**reason**: {reason}  **eviction_count**: {eviction_count}",
+        "",
+    ]
+    if instructions:
+        lines += ["**指令**：", "", instructions, ""]
+    if conflict_files:
+        lines += ["**冲突文件**：", ""]
+        for f in conflict_files:
+            lines.append(f"- {f}")
+        lines.append("")
+    if conflict_diff:
+        # 截断 diff 至 3000 字符防止 prompt 过大
+        diff_text = conflict_diff[:3000]
+        lines += ["**冲突 diff（摘要）**：", "", "```diff", diff_text, "```", ""]
+    if test_output:
+        output_text = test_output[:2000]
+        lines += ["**测试输出（摘要）**：", "", "```", output_text, "```", ""]
+    return "\n".join(lines)
+
+
 # ----------------------------- CLI handlers -----------------------------
 
 
@@ -177,6 +209,21 @@ def prompt_render(args: argparse.Namespace) -> None:
 
         findings_md = render_findings(parsed["blocking_findings"])
 
+        # 检测 eviction 文件：<base>/<change_id>.eviction.json 或 run_dir/<change_id>.eviction.json
+        eviction_md = ""
+        eviction_candidates = [
+            base / f"{args.change_id}.eviction.json",
+            p.run_dir / f"{args.change_id}.eviction.json",
+        ]
+        for ev_path in eviction_candidates:
+            if ev_path.is_file():
+                try:
+                    ev_data = json.loads(ev_path.read_text(encoding="utf-8"))
+                    eviction_md = _render_eviction_md(ev_data)
+                except Exception:
+                    pass
+                break
+
         text = templates.render_fixer(
             change_id=args.change_id,
             round_n=round_n,
@@ -186,12 +233,14 @@ def prompt_render(args: argparse.Namespace) -> None:
             blocking_findings_md=findings_md,
             categories_seen=entry.get("categories_seen") or [],
             blocking_trend=entry.get("blocking_trend") or [],
+            eviction_md=eviction_md,
         )
         meta_extra = {
             "round": round_n,
             "blocking_count": len(parsed["blocking_findings"]),
             "review_json": str(review_path),
             "implement_commit": implement_commit,
+            "eviction_injected": bool(eviction_md),
         }
 
     output.write_text(text, encoding="utf-8")

@@ -420,20 +420,25 @@ def _build_dag_layers(
     deps: dict[str, set[str]],
     paths_map: dict[str, set[str]],
     max_parallel: int,
+    topo_order: list[str] | None = None,
 ) -> tuple[list[list[str]], dict[str, list[str]]]:
     """构建 DAG 分层。
 
     返回 (layers, serialization_reasons)。
     layers 是分好的层（每层是 change_id 列表）。
     serialization_reasons 是每个被串行化的 change 的原因列表。
+
+    topo_order：拓扑排序结果（依赖先于被依赖者），用于保证 layer_of 计算时
+    所有依赖已处理完毕。若未传入则退化到 plan_order 顺序（保持向后兼容）。
     """
     serialization_reasons: dict[str, list[str]] = {cid: [] for cid in plan_order}
     layers: list[list[str]] = []
 
-    # 用拓扑排序确定 plan_order 约束的层分配
-    # 每个 change 的层 = max(依赖层) + 1
+    # 按拓扑序（依赖先处理）计算每个节点的层深
+    # 保证：对任意 dep -> cid，layer_of[dep] 已确定，layer_of[cid] = max(dep 层) + 1
+    process_order = topo_order if topo_order is not None else plan_order
     layer_of: dict[str, int] = {}
-    for cid in plan_order:
+    for cid in process_order:
         dep_layers = [layer_of[d] for d in deps.get(cid, set()) if d in layer_of]
         layer_of[cid] = (max(dep_layers) + 1) if dep_layers else 0
 
@@ -627,9 +632,9 @@ def run_dag(args: argparse.Namespace) -> None:
         })
         return
 
-    # 6. 构建 DAG 层
+    # 6. 构建 DAG 层（传入拓扑序以保证依赖深度计算正确）
     layers, serialization_reasons = _build_dag_layers(
-        plan_order, deps_map, paths_map, max_parallel
+        plan_order, deps_map, paths_map, max_parallel, topo_order=sorted_order
     )
 
     # 7. 计算 parallelizable_fraction

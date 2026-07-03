@@ -414,6 +414,8 @@ def load_paths(args: argparse.Namespace | None = None) -> Paths:
 
     1. 若 ``args.task_log_dir`` 与 ``args.run_ts`` 都给定：直接定位 run.json。
     2. 若 ``args.run_ts`` 给定：cwd → repo_root → task_log_dir，定位 run.json。
+    2.5. 若 cwd 的 repo root 下存在 per-change pointer 文件（``.npc-run-pointer.json``）：
+         按 pointer 中的 parent_run_ts + parent_task_log_dir 加载父 run（显式参数优先）。
     3. cwd → repo_root → task_log_dir → active.json → run.json。
     4. NPC_* 环境变量（v0.1 兼容）。
     5. 全部失败 → ``PathsError``。
@@ -441,6 +443,22 @@ def load_paths(args: argparse.Namespace | None = None) -> Paths:
             raise PathsError(
                 f"未找到指定 run 的 run.json：{rj}（请检查 --run-ts/--task-log-dir）"
             )
+
+    # 2.5: per-change worktree pointer（显式参数优先级更高，已在 1/2 处理）
+    if paths is None and not explicit_task_log and not explicit_run_ts:
+        try:
+            cwd_repo_root = detect_repo_root()
+            pointer = read_per_change_pointer(cwd_repo_root)
+            if pointer is not None:
+                parent_run_ts = pointer.get("parent_run_ts")
+                parent_task_log_dir = pointer.get("parent_task_log_dir")
+                if parent_run_ts and parent_task_log_dir:
+                    rj = run_json_path_for(Path(parent_task_log_dir), parent_run_ts)
+                    if rj.is_file():
+                        paths = read_run_json(rj)
+                        source = "per_change_pointer"
+        except (PathsError, Exception):
+            pass
 
     # 3: cwd + active.json
     if paths is None:
