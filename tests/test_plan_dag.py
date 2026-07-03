@@ -727,6 +727,88 @@ def test_paths_overlap_two_globs_different_dir():
     assert _paths_overlap({"src/npc/*.py"}, {"src/other/*.py"}) is False
 
 
+# ============================================================
+# F1 回归（round-6）：applyRequires 括号语法解析
+# ============================================================
+
+def test_dag_apply_requires_bracket_syntax_later_layer(monkeypatch, tmp_path):
+    """change-b 使用 'applyRequires: [change-a]' 括号语法声明依赖 →
+    _extract_deps_for_change 应正确捕获 change-a，
+    change-b 应被放入 change-a 之后的层。
+
+    这是 F1 finding 的回归：旧 regex 字符类不含 '['/']'，
+    导致括号语法无法被解析，dependent change 可能与 prerequisite 并行。
+    """
+    _make_change_dir(tmp_path, "change-a", tasks_content="修改 `src/a.py`")
+    _make_change_dir(tmp_path, "change-b",
+                     tasks_content="修改 `src/b.py`",
+                     proposal_content="applyRequires: [change-a]\n")
+
+    result = _run_dag(monkeypatch, tmp_path, ["change-a", "change-b"])
+    assert result["ok"] is True
+    # 验证 deps_map 包含显式依赖
+    deps_map = result.get("deps_map", {})
+    assert "change-b" in deps_map, (
+        f"applyRequires: [change-a] 应被解析为显式依赖，但 deps_map={deps_map}"
+    )
+    assert "change-a" in deps_map["change-b"], (
+        f"change-b 应依赖 change-a，但 deps_map={deps_map}"
+    )
+    # 验证 change-b 排在 change-a 之后的层
+    layers = result["layers"]
+    layer_of = {}
+    for i, layer in enumerate(layers):
+        for cid in layer:
+            layer_of[cid] = i
+    assert layer_of["change-b"] > layer_of["change-a"], (
+        f"applyRequires: [change-a] 应迫使 change-b 在 change-a 之后执行，layer_of={layer_of}"
+    )
+
+
+def test_dag_apply_requires_multi_bracket_syntax(monkeypatch, tmp_path):
+    """change-c 使用 'applyRequires: [change-a, change-b]' 多依赖括号语法 →
+    change-c 应在 change-a 和 change-b 之后的层。
+    """
+    _make_change_dir(tmp_path, "change-a", tasks_content="修改 `src/a.py`")
+    _make_change_dir(tmp_path, "change-b", tasks_content="修改 `src/b.py`")
+    _make_change_dir(tmp_path, "change-c",
+                     tasks_content="修改 `src/c.py`",
+                     proposal_content="applyRequires: [change-a, change-b]\n")
+
+    result = _run_dag(monkeypatch, tmp_path, ["change-a", "change-b", "change-c"])
+    assert result["ok"] is True
+    deps_map = result.get("deps_map", {})
+    assert "change-c" in deps_map, f"多依赖括号语法应被解析，deps_map={deps_map}"
+    assert "change-a" in deps_map["change-c"], f"change-c 应依赖 change-a，deps_map={deps_map}"
+    assert "change-b" in deps_map["change-c"], f"change-c 应依赖 change-b，deps_map={deps_map}"
+    layers = result["layers"]
+    layer_of = {}
+    for i, layer in enumerate(layers):
+        for cid in layer:
+            layer_of[cid] = i
+    assert layer_of["change-c"] > layer_of["change-a"], (
+        f"change-c 应在 change-a 之后，layer_of={layer_of}"
+    )
+    assert layer_of["change-c"] > layer_of["change-b"], (
+        f"change-c 应在 change-b 之后，layer_of={layer_of}"
+    )
+
+
+def test_extract_deps_bracket_syntax_unit(tmp_path):
+    """单元测试 _extract_deps_for_change：applyRequires: [change-a] 语法应被正确解析。"""
+    from npc.plan import _extract_deps_for_change
+    change_dir = tmp_path / "openspec" / "changes" / "change-b"
+    change_dir.mkdir(parents=True)
+    (change_dir / "proposal.md").write_text(
+        "applyRequires: [change-a]\n", encoding="utf-8"
+    )
+    known_ids = {"change-a", "change-b", "change-c"}
+    deps = _extract_deps_for_change(change_dir, known_ids)
+    assert "change-a" in deps, (
+        f"applyRequires: [change-a] 括号语法未被解析，deps={deps}"
+    )
+
+
 def test_propagate_dep_failed_invalid_deps_map(monkeypatch, tmp_path):
     """非法 deps_map JSON → emit_error 而非崩溃。"""
     import argparse as _argparse

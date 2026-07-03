@@ -508,7 +508,7 @@ _DEP_EXPLICIT_RE = re.compile(
     r"""
     (?:依赖前置|依赖|前置|applyRequires|depends?[ _]on|prerequisite)
     [：:\s]+
-    ([A-Za-z0-9,、，\s_\-]+)
+    (\[?[A-Za-z0-9,、，\s_\-\[\]]+\]?)
     """,
     re.VERBOSE | re.IGNORECASE,
 )
