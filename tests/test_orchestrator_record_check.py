@@ -201,3 +201,75 @@ class TestGuardrailsRecordCheck:
         assert "fixer-failed" in guardrails_text, (
             "Guardrails 未引用 fixer-failed trigger"
         )
+
+
+# ============================================================
+# F1 回归测试：implement record 失败后 3b review 必须被跳过
+# ============================================================
+
+
+class TestImplementRecordFailureSkips3b:
+    """回归测试：verify that implement record failure path blocks 3b review.
+
+    F1 finding: 3a 的 record 失败分支没有阻止继续进入 3b review。
+    修复：引入 IMPL_FAILED 标志 + 3b 入口守卫。
+    """
+
+    def test_impl_failed_flag_initialized(self, spine_run_text: str):
+        """IMPL_FAILED=false 必须在 deferred=true 块内、record 调用之前初始化。
+
+        确保每次 change 开始时标志处于干净状态。
+        """
+        assert "IMPL_FAILED=false" in spine_run_text, (
+            "deferred=true 块缺少 IMPL_FAILED=false 初始化"
+        )
+
+    def test_impl_failed_set_on_record_failure(self, spine_run_text: str):
+        """implement record 失败分支必须设置 IMPL_FAILED=true。"""
+        assert "IMPL_FAILED=true" in spine_run_text, (
+            "implement record 失败分支缺少 IMPL_FAILED=true 标记"
+        )
+
+    def test_impl_failed_flag_set_before_3b(self, spine_run_text: str):
+        """IMPL_FAILED=true 赋值必须出现在 3b review-fix 循环之前。
+
+        顺序要求确保标志在进入 3b 之前已被设置。
+        """
+        flag_pos = spine_run_text.find("IMPL_FAILED=true")
+        review_3b_pos = spine_run_text.find("### 3b.")
+        assert flag_pos != -1, "IMPL_FAILED=true 未找到"
+        assert review_3b_pos != -1, "### 3b. 节未找到"
+        assert flag_pos < review_3b_pos, (
+            "IMPL_FAILED=true 赋值必须出现在 ### 3b. 之前，"
+            "否则标志无法在 3b 入口守卫处生效"
+        )
+
+    def test_3b_has_impl_failed_guard(self, spine_run_text: str):
+        """3b 节必须包含 IMPL_FAILED 守卫，防止 review 在 implement 失败后执行。"""
+        section_3b_pos = spine_run_text.find("### 3b.")
+        assert section_3b_pos != -1, "### 3b. 节未找到"
+        # 找到 3b 节之后的内容，到 3c 之前
+        section_3c_pos = spine_run_text.find("### 3c.")
+        assert section_3c_pos != -1, "### 3c. 节未找到"
+        section_3b_text = spine_run_text[section_3b_pos:section_3c_pos]
+        assert "IMPL_FAILED" in section_3b_text, (
+            "3b 节缺少 IMPL_FAILED 守卫检查，"
+            "implement record 失败后仍会进入 review"
+        )
+
+    def test_3b_guard_appears_before_review_run(self, spine_run_text: str):
+        """3b 的 IMPL_FAILED 守卫检查必须出现在 npc review run --round 0 之前。
+
+        守卫必须在发起 review 之前拦截，不能在 review 之后再判断。
+        """
+        section_3b_pos = spine_run_text.find("### 3b.")
+        assert section_3b_pos != -1
+        text_from_3b = spine_run_text[section_3b_pos:]
+        # 在 3b 节内，IMPL_FAILED 守卫应出现在 review run round 0 之前
+        guard_pos = text_from_3b.find("IMPL_FAILED")
+        review_pos = text_from_3b.find("npc review run --seq $SEQ --round 0")
+        assert guard_pos != -1, "3b 节内未找到 IMPL_FAILED 守卫"
+        assert review_pos != -1, "3b 节内未找到 npc review run round 0"
+        assert guard_pos < review_pos, (
+            "3b 节内 IMPL_FAILED 守卫必须出现在 npc review run --round 0 之前"
+        )

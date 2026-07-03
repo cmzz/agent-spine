@@ -126,6 +126,7 @@ IMPL=$(npc implement run --seq $SEQ)
 
 - **`deferred=true`（in-session，claude 后端默认）**：npc 已 render prompt，等编排者 spawn subagent：
   ```bash
+  IMPL_FAILED=false   # 标记 implement 阶段是否因 record 失败而需跳过 3b
   SPAWN_PROMPT=$(echo "$IMPL" | jq -r '.spawn_prompt')
   # spawn 前取超时预算（必须；绝不无限等待）：
   BUDGET=$(npc agent timeout-budget --seq $SEQ --phase implement)
@@ -171,7 +172,10 @@ IMPL=$(npc implement run --seq $SEQ)
         # record 失败或状态为 needs-user-decision → 立即进 3d，不继续 review
         DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
         ACTION=$(echo "$DEC" | jq -r '.action')
-        # 按 ACTION 执行（同 3d）
+        IMPL_FAILED=true   # 通知 3b 跳过 review
+        # 按 ACTION 立即执行（同 3d）：
+        # continue-retry → 回到 3a 重试；skip → 继续下一 change；abort → 进 Step 4
+        { 按 3d ACTION 执行控制流，见下方 3d 节; }
       fi
     fi
   fi
@@ -187,7 +191,16 @@ IMPL=$(npc implement run --seq $SEQ)
 
 ### 3b. Review-Fix 循环（反复打磨，直到干净或卡死）
 
+**3b 入口守卫**：仅当 implement 阶段成功（`IMPL_FAILED=false`）时才执行 review-fix 循环；
+`IMPL_FAILED=true` 意味着已在 3a 内进入 3d 决策点，此处直接跳过。
+
 ```bash
+# 3b 入口守卫：implement record 失败时跳过 review
+if [ "$IMPL_FAILED" = "true" ]; then
+  # 已在 3a 执行 3d ACTION，直接跳到下一 change 或 Step 4
+  { 按已设定的 ACTION 继续（skip / abort / continue-retry）; }
+fi
+
 R=$(npc review run --seq $SEQ --round 0)
 # 不变量 2：先检查 .ok，再读业务字段（review 自身失败时返回体无 blocking/stale）
 if [ "$(echo "$R" | jq -r '.ok')" != "true" ]; then
