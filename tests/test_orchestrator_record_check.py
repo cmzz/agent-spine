@@ -273,3 +273,89 @@ class TestImplementRecordFailureSkips3b:
         assert guard_pos < review_pos, (
             "3b 节内 IMPL_FAILED 守卫必须出现在 npc review run --round 0 之前"
         )
+
+
+# ============================================================
+# Round-3 F1 回归测试：fix headless 路径 record 失败必须进入 3d fixer-failed
+# ============================================================
+
+
+class TestFixHeadlessRecordFailure:
+    """Round-3 F1 回归：npc fix run deferred=false 时 .ok=false 不得裸 break。
+
+    Finding: 原 `[ "$(echo "$FIX" | jq -r '.ok')" = "true" ] || break` 在 headless
+    路径下 record 失败时仅 break，未调用 npc auto-decide --trigger fixer-failed，
+    FIX_EXHAUSTED 保持 false，post-loop 落入旧 R 的 blocking 判断，错误跳过 3d。
+    修复：将裸 break 替换为设置 FIX_EXHAUSTED=true + auto-decide fixer-failed + break。
+    """
+
+    def test_fix_run_ok_false_must_not_bare_break(self, spine_run_text: str):
+        """npc fix run .ok 失败路径不得只有裸 break，必须有 fixer-failed 决策调用。
+
+        检测：FIX.ok 检查块内必须同时出现 fixer-failed trigger 和 FIX_EXHAUSTED=true。
+        """
+        # 找到 npc fix run 调用后的 .ok 检查区域
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        assert fix_run_pos != -1, "npc fix run 调用未找到"
+        # 在调用后的合理范围内（500字符）应该找到 fixer-failed 和 FIX_EXHAUSTED
+        nearby = spine_run_text[fix_run_pos : fix_run_pos + 500]
+        assert "fixer-failed" in nearby, (
+            "npc fix run .ok 检查后缺少 fixer-failed trigger（F1：headless 路径 record 失败未进 3d）"
+        )
+        assert "FIX_EXHAUSTED=true" in nearby, (
+            "npc fix run .ok 检查后缺少 FIX_EXHAUSTED=true（F1：post-loop 无法按 ACTION 分发）"
+        )
+
+    def test_fix_run_ok_check_is_if_block_not_bare_break(self, spine_run_text: str):
+        """FIX.ok 检查必须是 if 块形式（含 npc auto-decide），不得是单行 || break 形式。
+
+        原 buggy 形式：`[ ... ] || break`（无 auto-decide，无 FIX_EXHAUSTED 设置）。
+        修复后形式：`if [ ... != true ]; then ... fixer-failed ... FIX_EXHAUSTED=true ... fi`。
+        """
+        # 原来的 buggy 单行形式不应存在于 fix run 附近
+        buggy_pattern = "'.ok')" + ' = "true" ] || break'
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        assert fix_run_pos != -1
+        # 在 fix run 后的 200 字符内不应出现裸 break 模式
+        nearby_short = spine_run_text[fix_run_pos : fix_run_pos + 200]
+        assert buggy_pattern not in nearby_short, (
+            "FIX.ok 检查仍使用裸 || break 形式（F1 未修复：headless record 失败不进 3d）"
+        )
+
+    def test_fix_headless_needs_user_decision_enters_3d(self, spine_run_text: str):
+        """headless fix 路径（deferred=false）的 needs-user-decision 必须进入 3d。
+
+        检测：在 3b 循环的 deferred=false 分支内，存在对 needs-user-decision 的检查
+        并触发 fixer-failed。
+        """
+        # 在 FIX.deferred != true 附近必须有 needs-user-decision 检查
+        headless_check = 'FIX" | jq -r \'.deferred\'")'
+        # 更宽泛：检测 deferred != true 的判断与 needs-user-decision 在 3b 节中共存
+        section_3b_pos = spine_run_text.find("### 3b.")
+        section_3c_pos = spine_run_text.find("### 3c.")
+        assert section_3b_pos != -1 and section_3c_pos != -1
+        section_3b_text = spine_run_text[section_3b_pos:section_3c_pos]
+        # 必须在 3b 节内同时存在 deferred 检查与 needs-user-decision
+        assert "deferred" in section_3b_text, "3b 节未引用 deferred 字段"
+        assert "needs-user-decision" in section_3b_text, (
+            "3b 节缺少 needs-user-decision 检查（headless fix 的 needs-user-decision 未处理）"
+        )
+
+    def test_fix_ok_false_fix_exhausted_before_next_review(self, spine_run_text: str):
+        """FIX.ok=false 处理（含 FIX_EXHAUSTED=true）必须出现在下一轮 review run 之前。
+
+        确保 headless record 失败时不会落入 `R=$(npc review run ...)` 继续轮转。
+        """
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        next_review_pos = spine_run_text.find(
+            "R=$(npc review run --seq $SEQ --round $N)", fix_run_pos
+        )
+        # FIX_EXHAUSTED=true 第一次出现在 fix run 调用后
+        fix_exhausted_pos = spine_run_text.find("FIX_EXHAUSTED=true", fix_run_pos)
+        assert fix_run_pos != -1, "npc fix run 调用未找到"
+        assert next_review_pos != -1, "下一轮 review run 未找到"
+        assert fix_exhausted_pos != -1, "FIX_EXHAUSTED=true 在 fix run 后未找到"
+        assert fix_exhausted_pos < next_review_pos, (
+            "FIX_EXHAUSTED=true 必须出现在下一轮 review run 之前，"
+            "确保 headless record 失败不继续 review"
+        )

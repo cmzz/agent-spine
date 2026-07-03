@@ -182,9 +182,15 @@ IMPL=$(npc implement run --seq $SEQ)
   ```
   > `spawn_prompt` 已含 prompt 文件绝对路径（`prompt_file` 字段亦可直接取）；RESULT 行格式见 spine-coder 契约。超时预算由 `npc agent timeout-budget` 给出（渐进退避：base 1800s / mult 1.2 / max 3600s / 最多 5 次超时后 exhausted）。
 
-- **`deferred=false`（headless，mimo 后端或显式配置）**：npc 内部已完成 spawn→record，一行跑完，无需额外操作：
+- **`deferred=false`（headless，mimo 后端或显式配置）**：npc 内部已完成 spawn→record，一行跑完；仍需检查 `.status`：
   ```bash
-  # IMPL.ok=true 即代表 coder 已跑完并 record，直接进 review
+  # IMPL.ok=true 代表 record 成功，但仍需排除 needs-user-decision（不变量 2）
+  if [ "$(echo "$IMPL" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+    DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    IMPL_FAILED=true
+    { 按 3d ACTION 执行控制流，见下方 3d 节; }
+  fi
   ```
 
 > **注意（deferred=true 时）**：`npc implement run` 返回的 `.ok=true` 仅代表 prompt 渲染成功，**不代表 coder 执行成功**。coder 成败的唯一真相是 `npc implement record` 的返回值（`.ok` 与 `.status`）。`IMPL.ok` 用于检查 run 命令自身是否失败，不得当作 coder 执行成功的依据。
@@ -218,7 +224,15 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
   N=$((N+1))
   # npc 内部 render fix prompt（注入上轮 blocking findings + 修复历史），按 deferred 分发：
   FIX=$(npc fix run --seq $SEQ --round $N)
-  [ "$(echo "$FIX" | jq -r '.ok')" = "true" ] || break
+  # 先检查 .ok（不变量 2）：deferred=false 时 npc 内部已 spawn→record，.ok 反映 record 结果；
+  # deferred=true 时 .ok 仅代表 prompt 渲染成功，record 失败留给后续内层循环处理。
+  # 无论哪种模式，.ok=false 均必须进 3d fixer-failed，不得只 break。
+  if [ "$(echo "$FIX" | jq -r '.ok')" != "true" ]; then
+    DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    FIX_EXHAUSTED=true
+    break
+  fi
 
   # 同 3a：按 deferred 字段分发
   if [ "$(echo "$FIX" | jq -r '.deferred')" = "true" ]; then
@@ -282,7 +296,16 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
     done
     [ "$FIX_DONE" = "true" ] || continue  # 若内层因 break 2 退出则 continue 无效（已 break 外层）
   fi
-  # headless（mimo/显式）：npc 内部已 record，无需额外步骤
+  # headless（mimo/显式）：npc 内部已 record；仍需检查 needs-user-decision（不变量 2）
+  if [ "$(echo "$FIX" | jq -r '.deferred')" != "true" ]; then
+    if [ "$(echo "$FIX" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+      # headless record 返回 needs-user-decision → 立即进 3d，不继续 review
+      DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+      ACTION=$(echo "$DEC" | jq -r '.action')
+      FIX_EXHAUSTED=true
+      break
+    fi
+  fi
 
   R=$(npc review run --seq $SEQ --round $N)
   # 循环内每次 review run 后同样先检查 .ok（守护不变量 2）
