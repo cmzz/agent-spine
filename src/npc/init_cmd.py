@@ -126,29 +126,65 @@ def _get_current_branch(repo_root: Path, runner=subprocess.run) -> str:
     return "" if val == "HEAD" else val
 
 
+def _mark_initializing_skeleton_orphan(init_file: Path) -> None:
+    """将 initializing 骨架文件的 status 更新为 'orphan'。
+
+    worktree 缺失/残破时调用，使 clean 命令可以发现并回收该记录。
+    写入失败时静默忽略（保守：不因孤儿标记失败而中断 init）。
+    """
+    try:
+        data = json.loads(init_file.read_text(encoding="utf-8"))
+        data["status"] = "orphan"
+        init_file.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
 def _scan_spine_worktrees_for_resume(
     canonical_repo_root: Path,
     home: Path,
     runner=subprocess.run,
-) -> tuple[bool, Path | None]:
-    """扫描 spine/* worktree，查找有 in-progress state 的悬空 worktree。
+) -> tuple[bool, Path | None, bool]:
+    """扫描 spine/* worktree，查找有 in-progress 或 initializing state 的悬空 worktree。
 
-    返回 (needs_resume, worktree_root_or_None)。
-    多个命中取 state mtime 最新。
+    返回 (needs_resume, worktree_root_or_None, is_initializing)。
+    - needs_resume=True + is_initializing=False：in-progress 续跑，worktree_root 已有 plan state。
+    - needs_resume=True + is_initializing=True：initializing 崩溃恢复，worktree 完好但
+      init-run 未执行，调用方应复用该 worktree_root 重新走 init 流程（跳过 worktree 创建）。
+    多个命中取 state mtime 最新（in-progress 优先于 initializing）。
+
+    副作用：发现 worktree 缺失/残破的 initializing 记录时，将骨架文件的 status 更新为
+    'orphan'（记录在案），以便后续 clean 命令可以发现并回收，同时 init 继续新建 worktree。
     """
     try:
         worktrees = _git_ops.list_worktrees(canonical_repo_root, runner=runner)
     except _git_ops.WorktreeError:
-        return False, None
+        return False, None, False
 
-    candidates: list[tuple[float, Path]] = []
+    in_progress_candidates: list[tuple[float, Path]] = []
+    initializing_candidates: list[tuple[float, Path]] = []
+
+    # 构建 git worktree 路径集合，用于反向扫描
+    known_wt_dirs: set[Path] = set()
+
     for wt in worktrees:
         branch = wt.get("branch", "")
         # branch 形如 refs/heads/spine/<run_ts>
         if not branch.startswith("refs/heads/spine/"):
             continue
         wt_path = Path(wt["path"])
+        known_wt_dirs.add(wt_path)
         if not wt_path.is_dir():
+            # Task 2.2: worktree 在 git 列表中但目录已缺失/残破 →
+            # 检查 task_log 里是否有对应 initializing 骨架，标记孤儿
+            try:
+                wt_proj_key = _paths.proj_key_for(wt_path)
+            except _paths.PathsError:
+                continue
+            wt_task_log_dir = home / "task_log" / wt_proj_key
+            init_file = resume.find_latest_initializing(wt_task_log_dir)
+            if init_file is not None:
+                _mark_initializing_skeleton_orphan(init_file)
             continue
         # 按 worktree 路径推 task_log_dir
         try:
@@ -156,18 +192,59 @@ def _scan_spine_worktrees_for_resume(
         except _paths.PathsError:
             continue
         wt_task_log_dir = home / "task_log" / wt_proj_key
+
+        # 先检查 in-progress（优先级高于 initializing）
         state_file = resume.find_latest_in_progress(wt_task_log_dir)
         if state_file is not None:
             try:
                 mtime = state_file.stat().st_mtime
             except OSError:
                 mtime = 0.0
-            candidates.append((mtime, wt_path))
+            in_progress_candidates.append((mtime, wt_path))
+            continue
 
-    if not candidates:
-        return False, None
-    candidates.sort(reverse=True)
-    return True, candidates[0][1]
+        # 再检查 initializing（崩溃窗口中间态）
+        init_file = resume.find_latest_initializing(wt_task_log_dir)
+        if init_file is not None:
+            try:
+                mtime = init_file.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            initializing_candidates.append((mtime, wt_path))
+
+    # Task 2.2 反向扫描：遍历 home/task_log/* 找 initializing 骨架，
+    # 若骨架的 worktree_root 不在 git 列表中（骨架在 worktree add 之前/之后写入
+    # 但 worktree add 从未完成），标记为孤儿。
+    task_log_root = home / "task_log"
+    if task_log_root.is_dir():
+        for tl_dir in task_log_root.iterdir():
+            if not tl_dir.is_dir():
+                continue
+            init_file = resume.find_latest_initializing(tl_dir)
+            if init_file is None:
+                continue
+            try:
+                skel = json.loads(init_file.read_text(encoding="utf-8"))
+                wt_root_str = skel.get("worktree_root")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not wt_root_str:
+                continue
+            wt_root = Path(wt_root_str)
+            # 如果 worktree 不在 git 列表里且目录不存在 → 标记孤儿
+            if wt_root not in known_wt_dirs and not wt_root.is_dir():
+                _mark_initializing_skeleton_orphan(init_file)
+
+    # in-progress 优先
+    if in_progress_candidates:
+        in_progress_candidates.sort(reverse=True)
+        return True, in_progress_candidates[0][1], False
+
+    if initializing_candidates:
+        initializing_candidates.sort(reverse=True)
+        return True, initializing_candidates[0][1], True
+
+    return False, None, False
 
 
 def run(args: argparse.Namespace, runner=subprocess.run) -> None:
@@ -188,19 +265,54 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
     worktree_root: Path | None = None
     spine_branch: str | None = None
     base_branch: str | None = None
+    run_ts_for_branch: str | None = None  # worktree 模式下与 spine_branch 一致
+    repo_root: Path = canonical_repo_root  # 默认值，step 4 可能覆盖
 
     if not no_worktree and not args.fresh:
-        needs_resume_wt, resume_wt_path = _scan_spine_worktrees_for_resume(
+        needs_resume_wt, resume_wt_path, is_initializing = _scan_spine_worktrees_for_resume(
             canonical_repo_root, home, runner=runner
         )
         if needs_resume_wt and resume_wt_path is not None:
-            # 命中悬空 in-progress spine worktree → 续跑，不新建
-            _io.emit({
-                "needs_resume": True,
-                "worktree_root": str(resume_wt_path),
-                "canonical_proj_key": canonical_proj_key,
-            })
-            return
+            if not is_initializing:
+                # 命中悬空 in-progress spine worktree → 续跑，不新建
+                _io.emit({
+                    "needs_resume": True,
+                    "worktree_root": str(resume_wt_path),
+                    "canonical_proj_key": canonical_proj_key,
+                })
+                return
+            else:
+                # 命中 initializing 崩溃中间态 → 复用该 worktree，跳过创建步骤
+                worktree_root = resume_wt_path
+                repo_root = worktree_root
+                # 从骨架文件读回 spine_branch / run_ts_for_branch
+                _recovered = False
+                try:
+                    wt_proj_key_tmp = _paths.proj_key_for(resume_wt_path)
+                    wt_task_log_tmp = home / "task_log" / wt_proj_key_tmp
+                    init_file = resume.find_latest_initializing(wt_task_log_tmp)
+                    if init_file is not None:
+                        skel = json.loads(init_file.read_text(encoding="utf-8"))
+                        run_ts_for_branch = skel.get("run_ts") or ""
+                        spine_branch = skel.get("spine_branch") or (
+                            f"spine/{run_ts_for_branch}" if run_ts_for_branch else None
+                        )
+                        base_branch = skel.get("base_branch")
+                        _recovered = True
+                except (OSError, json.JSONDecodeError, _paths.PathsError):
+                    pass
+                if not _recovered:
+                    # 骨架不可读时回退：从 git worktree list 推断
+                    try:
+                        for wt_entry in _git_ops.list_worktrees(canonical_repo_root, runner=runner):
+                            if Path(wt_entry["path"]) == resume_wt_path:
+                                branch_ref = wt_entry.get("branch", "")
+                                if branch_ref.startswith("refs/heads/spine/"):
+                                    spine_branch = branch_ref[len("refs/heads/"):]
+                                    run_ts_for_branch = spine_branch.split("spine/", 1)[1]
+                                break
+                    except _git_ops.WorktreeError:
+                        pass
 
     # 3. 续跑探测：仅 --no-worktree 时检查 canonical task_log。
     #    worktree 模式下悬空扫描（步骤 2）若未命中，直接建新 worktree + needs_resume=false；
@@ -213,12 +325,34 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             resume_state_json = resume.find_latest_in_progress(task_log_dir_for_resume)
             needs_resume = resume_state_json is not None
 
-    # 4. worktree 模式：创建 worktree + 分支
-    if not no_worktree:
+    # 4. worktree 模式：创建 worktree + 分支（跳过条件：已从 initializing 恢复）
+    if not no_worktree and worktree_root is None:
         run_ts_for_branch = _paths.make_run_ts()
         spine_branch = f"spine/{run_ts_for_branch}"
         base_branch = _get_current_branch(canonical_repo_root, runner=runner)
         worktree_dir = home / ".spine" / "worktrees" / canonical_proj_key / run_ts_for_branch
+
+        # 意向落盘（骨架）：在建 worktree 前写 plan-state skeleton（status=initializing），
+        # 使「worktree 已建但 init-run 未执行」的崩溃窗口有可被续跑扫描发现的记录。
+        _wt_proj_key = _paths.proj_key_for(worktree_dir)
+        _wt_task_log = home / "task_log" / _wt_proj_key
+        _wt_task_log.mkdir(parents=True, exist_ok=True)
+        _skeleton_path = _wt_task_log / f"{run_ts_for_branch}-plan-state.json"
+        _skeleton: dict = {
+            "schema_version": 2,
+            "run_ts": run_ts_for_branch,
+            "status": "initializing",
+            "worktree_root": str(worktree_dir),
+            "spine_branch": spine_branch,
+            "base_branch": base_branch,
+            "plan_order": [],
+            "progress": [],
+        }
+        _skeleton_path.write_text(
+            json.dumps(_skeleton, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
         try:
             _git_ops.add_worktree(
                 canonical_repo_root,
@@ -231,8 +365,10 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             _io.emit_error("worktree_create_failed", str(e), exit_code=3)
             return
         worktree_root = worktree_dir
-        # 在 worktree 路径重键 Paths
         repo_root = worktree_root
+    elif not no_worktree and worktree_root is not None:
+        # initializing 恢复：repo_root 和 worktree_root 已在 step 2 设置
+        pass
     else:
         repo_root = canonical_repo_root
 
@@ -247,14 +383,16 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         p = _paths.compute_paths(repo_root, run_ts=old_run_ts, home=home)
     else:
         if not no_worktree:
-            # worktree 模式用已生成的 run_ts（与 spine_branch 一致）
-            p = _paths.compute_paths(repo_root, run_ts=run_ts_for_branch, home=home)
+            # worktree 模式用已生成的 run_ts（与 spine_branch 一致）；
+            # run_ts_for_branch 在 step 2（initializing 恢复）或 step 4（新建）时赋值。
+            # 若两者均未设置（不应发生），generate_ts 作为保底。
+            p = _paths.compute_paths(repo_root, run_ts=run_ts_for_branch or None, home=home)
         else:
             p = _paths.compute_paths(repo_root, home=home)
 
     # 如有 worktree 回指字段，构造带回指的 Paths
+    from dataclasses import replace as _dc_replace
     if not no_worktree and worktree_root is not None:
-        from dataclasses import replace as _dc_replace
         p = _dc_replace(
             p,
             canonical_repo_root=canonical_repo_root,
@@ -262,6 +400,10 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             base_branch=base_branch,
             spine_branch=spine_branch,
         )
+
+    # 5b. 把 mode 落入 Paths（run.json 持久化后 record 阶段可读，无需 NPC_MODE env）
+    _init_mode = "auto" if args.auto else "interactive"
+    p = _dc_replace(p, mode=_init_mode)
 
     # 6. 确保目录
     _paths.ensure_dirs(p)
@@ -291,7 +433,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
     if pt_created:
         _io.info(f"已写入 portable-timeout wrapper：{pt_path}")
 
-    mode = "auto" if args.auto else "interactive"
+    mode = _init_mode  # 已在步骤 5b 计算并落入 run.json
 
     # 10b. auto 授权：仅 --auto 时把项目授权写到主 checkout（live session 真正读取
     #      settings 的位置），而非 worktree（其 settings.json 不被 cwd 会话加载）。

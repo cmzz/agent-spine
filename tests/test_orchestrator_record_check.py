@@ -1,0 +1,361 @@
+"""守卫测试：spine-run.md 中 implement/fix record 调用后必须紧跟 .ok 检查。
+
+覆盖 change orchestrator-check-record-result 的 spec 契约：
+- implement record 失败 → 立即转 3d 决策点（implementer-failed）
+- fix record 失败 → 立即转 3d 决策点（fixer-failed）
+- record 返回值是 coder 成败唯一真相，不得绕过
+- Guardrails 中明确禁止在 record 失败后继续 review/archive
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(scope="module")
+def spine_run_text() -> str:
+    spine_run = (
+        Path(__file__).parent.parent
+        / "plugins"
+        / "agent-spine"
+        / "commands"
+        / "spine-run.md"
+    )
+    return spine_run.read_text(encoding="utf-8")
+
+
+# ============================================================
+# Task 1.1 / Scenario: implement record 失败转决策点
+# ============================================================
+
+
+class TestImplementRecordCheck:
+    """验证 spine-run.md 在 implement record 后强制检查返回值。"""
+
+    def test_implement_record_result_captured(self, spine_run_text: str):
+        """npc implement record 的返回值必须被捕获（赋给变量），不能丢弃。"""
+        # 必须有 REC=$(npc implement record ...) 形式的赋值
+        assert "REC=$(npc implement record" in spine_run_text, (
+            "implement record 返回值未被捕获：应使用 REC=$(npc implement record ...) 形式"
+        )
+
+    def test_implement_record_ok_checked(self, spine_run_text: str):
+        """捕获 implement record 返回值后必须检查 .ok 字段。"""
+        assert '"$REC"' in spine_run_text or "\"$REC\"" in spine_run_text or "$REC" in spine_run_text, (
+            "REC 变量捕获后未被引用"
+        )
+        # 检查 .ok 读取模式
+        assert "jq -r '.ok'" in spine_run_text, "spine-run.md 未包含 .ok 的 jq 检查模式"
+
+    def test_implement_record_failure_triggers_implementer_failed(self, spine_run_text: str):
+        """implement record 失败路径必须触发 implementer-failed trigger。"""
+        assert "implementer-failed" in spine_run_text, (
+            "spine-run.md 未包含 implementer-failed trigger"
+        )
+
+    def test_implement_record_checks_status_needs_user_decision(self, spine_run_text: str):
+        """implement record 检查必须包含 needs-user-decision 状态判断。"""
+        assert "needs-user-decision" in spine_run_text, (
+            "spine-run.md 未包含 needs-user-decision 状态检查"
+        )
+
+    def test_implement_record_failure_before_review(self, spine_run_text: str):
+        """implement record 的失败检查必须出现在进入 review 循环之前。
+
+        检测顺序：REC=$(npc implement record ...) 出现在 npc review run --round 0 之前。
+        """
+        rec_pos = spine_run_text.find("REC=$(npc implement record")
+        review_pos = spine_run_text.find("npc review run --seq $SEQ --round 0")
+        assert rec_pos != -1, "implement record 赋值语句未找到"
+        assert review_pos != -1, "npc review run round 0 语句未找到"
+        assert rec_pos < review_pos, (
+            "implement record 检查必须出现在 review run 之前（record 结果是进入 review 的前提）"
+        )
+
+
+# ============================================================
+# Task 1.2 / Scenario: fix record 失败不再被静默吞掉
+# ============================================================
+
+
+class TestFixRecordCheck:
+    """验证 spine-run.md 在 fix record 后强制检查返回值。"""
+
+    def test_fix_record_result_captured(self, spine_run_text: str):
+        """npc fix record 的返回值必须被捕获（赋给变量），不能丢弃。"""
+        assert "FREC=$(npc fix record" in spine_run_text, (
+            "fix record 返回值未被捕获：应使用 FREC=$(npc fix record ...) 形式"
+        )
+
+    def test_fix_record_ok_checked(self, spine_run_text: str):
+        """捕获 fix record 返回值后必须检查 .ok 字段。"""
+        assert "$FREC" in spine_run_text, "FREC 变量捕获后未被引用"
+
+    def test_fix_record_failure_triggers_fixer_failed(self, spine_run_text: str):
+        """fix record 失败路径必须触发 fixer-failed trigger。"""
+        assert "fixer-failed" in spine_run_text, (
+            "spine-run.md 未包含 fixer-failed trigger"
+        )
+
+    def test_fix_record_failure_sets_fix_exhausted(self, spine_run_text: str):
+        """fix record 失败路径必须设置 FIX_EXHAUSTED=true 并执行 break 2，
+        确保不会继续进入下一轮 review。"""
+        # FIX_EXHAUSTED=true 与 break 2 必须共存（fix record 失败路径的关键守卫）
+        assert "FIX_EXHAUSTED=true" in spine_run_text, (
+            "fix record 失败路径缺少 FIX_EXHAUSTED=true 标记"
+        )
+        assert "break 2" in spine_run_text, (
+            "fix record 失败路径缺少 break 2（无法退出内外层循环）"
+        )
+
+    def test_fix_record_check_before_next_review(self, spine_run_text: str):
+        """fix record 检查（FREC）必须出现在进入下一轮 npc review run 之前。
+
+        顺序要求：FREC=$(npc fix record ...) 出现在后续 review run 之前。
+        """
+        frec_pos = spine_run_text.find("FREC=$(npc fix record")
+        # 找到 fix record 后下一个 review run 的位置
+        next_review_pos = spine_run_text.find("R=$(npc review run --seq $SEQ --round $N)")
+        assert frec_pos != -1, "FREC 赋值语句未找到"
+        assert next_review_pos != -1, "下一轮 review run 语句未找到"
+        assert frec_pos < next_review_pos, (
+            "fix record 检查必须出现在下一轮 review run 之前"
+        )
+
+
+# ============================================================
+# Task 1.3 / Scenario: deferred=true 时 .ok 语义澄清
+# ============================================================
+
+
+class TestDeferredOkSemantics:
+    """验证 spine-run.md 明确说明 deferred=true 时 .ok 的含义限制。"""
+
+    def test_deferred_true_ok_semantics_documented(self, spine_run_text: str):
+        """spine-run.md 必须说明 deferred=true 时 .ok 仅代表渲染成功。"""
+        # 检测澄清文字的存在（至少包含关键语义）
+        has_render_note = (
+            "仅代表 prompt 渲染成功" in spine_run_text
+            or "只代表渲染成功" in spine_run_text
+            or "仅代表渲染" in spine_run_text
+        )
+        assert has_render_note, (
+            "spine-run.md 缺少 deferred=true 时 .ok 语义说明"
+            "（应明确：.ok 仅代表 prompt 渲染成功，不代表 coder 执行成功）"
+        )
+
+    def test_record_is_sole_truth_documented(self, spine_run_text: str):
+        """spine-run.md 必须说明 record 返回值是 coder 成败的唯一真相。"""
+        has_sole_truth = (
+            "唯一真相" in spine_run_text
+            or "coder 成败" in spine_run_text
+        )
+        assert has_sole_truth, (
+            "spine-run.md 未说明 record 返回值是 coder 成败的唯一真相"
+        )
+
+
+# ============================================================
+# Task 2.1 / Guardrails 增补
+# ============================================================
+
+
+class TestGuardrailsRecordCheck:
+    """验证 Guardrails 一节包含 record 检查的硬约束条目。"""
+
+    def test_guardrails_contains_record_check_constraint(self, spine_run_text: str):
+        """Guardrails 必须包含 record 返回值检查的硬约束说明。"""
+        # 检查 Guardrails 区块的关键词
+        guardrails_start = spine_run_text.find("## Guardrails")
+        assert guardrails_start != -1, "spine-run.md 缺少 Guardrails 一节"
+        guardrails_text = spine_run_text[guardrails_start:]
+        assert "record 返回值" in guardrails_text or "record return" in guardrails_text.lower(), (
+            "Guardrails 未包含 record 返回值约束"
+        )
+
+    def test_guardrails_prohibits_review_after_record_failure(self, spine_run_text: str):
+        """Guardrails 必须明确禁止 record 失败后继续 review/archive。"""
+        guardrails_start = spine_run_text.find("## Guardrails")
+        assert guardrails_start != -1
+        guardrails_text = spine_run_text[guardrails_start:]
+        assert "绝不继续" in guardrails_text or "不继续" in guardrails_text, (
+            "Guardrails 未明确禁止 record 失败后继续 review/archive"
+        )
+
+    def test_guardrails_references_implementer_failed_trigger(self, spine_run_text: str):
+        """Guardrails 必须引用 implementer-failed trigger 名称。"""
+        guardrails_start = spine_run_text.find("## Guardrails")
+        assert guardrails_start != -1
+        guardrails_text = spine_run_text[guardrails_start:]
+        assert "implementer-failed" in guardrails_text, (
+            "Guardrails 未引用 implementer-failed trigger"
+        )
+
+    def test_guardrails_references_fixer_failed_trigger(self, spine_run_text: str):
+        """Guardrails 必须引用 fixer-failed trigger 名称。"""
+        guardrails_start = spine_run_text.find("## Guardrails")
+        assert guardrails_start != -1
+        guardrails_text = spine_run_text[guardrails_start:]
+        assert "fixer-failed" in guardrails_text, (
+            "Guardrails 未引用 fixer-failed trigger"
+        )
+
+
+# ============================================================
+# F1 回归测试：implement record 失败后 3b review 必须被跳过
+# ============================================================
+
+
+class TestImplementRecordFailureSkips3b:
+    """回归测试：verify that implement record failure path blocks 3b review.
+
+    F1 finding: 3a 的 record 失败分支没有阻止继续进入 3b review。
+    修复：引入 IMPL_FAILED 标志 + 3b 入口守卫。
+    """
+
+    def test_impl_failed_flag_initialized(self, spine_run_text: str):
+        """IMPL_FAILED=false 必须在 deferred=true 块内、record 调用之前初始化。
+
+        确保每次 change 开始时标志处于干净状态。
+        """
+        assert "IMPL_FAILED=false" in spine_run_text, (
+            "deferred=true 块缺少 IMPL_FAILED=false 初始化"
+        )
+
+    def test_impl_failed_set_on_record_failure(self, spine_run_text: str):
+        """implement record 失败分支必须设置 IMPL_FAILED=true。"""
+        assert "IMPL_FAILED=true" in spine_run_text, (
+            "implement record 失败分支缺少 IMPL_FAILED=true 标记"
+        )
+
+    def test_impl_failed_flag_set_before_3b(self, spine_run_text: str):
+        """IMPL_FAILED=true 赋值必须出现在 3b review-fix 循环之前。
+
+        顺序要求确保标志在进入 3b 之前已被设置。
+        """
+        flag_pos = spine_run_text.find("IMPL_FAILED=true")
+        review_3b_pos = spine_run_text.find("### 3b.")
+        assert flag_pos != -1, "IMPL_FAILED=true 未找到"
+        assert review_3b_pos != -1, "### 3b. 节未找到"
+        assert flag_pos < review_3b_pos, (
+            "IMPL_FAILED=true 赋值必须出现在 ### 3b. 之前，"
+            "否则标志无法在 3b 入口守卫处生效"
+        )
+
+    def test_3b_has_impl_failed_guard(self, spine_run_text: str):
+        """3b 节必须包含 IMPL_FAILED 守卫，防止 review 在 implement 失败后执行。"""
+        section_3b_pos = spine_run_text.find("### 3b.")
+        assert section_3b_pos != -1, "### 3b. 节未找到"
+        # 找到 3b 节之后的内容，到 3c 之前
+        section_3c_pos = spine_run_text.find("### 3c.")
+        assert section_3c_pos != -1, "### 3c. 节未找到"
+        section_3b_text = spine_run_text[section_3b_pos:section_3c_pos]
+        assert "IMPL_FAILED" in section_3b_text, (
+            "3b 节缺少 IMPL_FAILED 守卫检查，"
+            "implement record 失败后仍会进入 review"
+        )
+
+    def test_3b_guard_appears_before_review_run(self, spine_run_text: str):
+        """3b 的 IMPL_FAILED 守卫检查必须出现在 npc review run --round 0 之前。
+
+        守卫必须在发起 review 之前拦截，不能在 review 之后再判断。
+        """
+        section_3b_pos = spine_run_text.find("### 3b.")
+        assert section_3b_pos != -1
+        text_from_3b = spine_run_text[section_3b_pos:]
+        # 在 3b 节内，IMPL_FAILED 守卫应出现在 review run round 0 之前
+        guard_pos = text_from_3b.find("IMPL_FAILED")
+        review_pos = text_from_3b.find("npc review run --seq $SEQ --round 0")
+        assert guard_pos != -1, "3b 节内未找到 IMPL_FAILED 守卫"
+        assert review_pos != -1, "3b 节内未找到 npc review run round 0"
+        assert guard_pos < review_pos, (
+            "3b 节内 IMPL_FAILED 守卫必须出现在 npc review run --round 0 之前"
+        )
+
+
+# ============================================================
+# Round-3 F1 回归测试：fix headless 路径 record 失败必须进入 3d fixer-failed
+# ============================================================
+
+
+class TestFixHeadlessRecordFailure:
+    """Round-3 F1 回归：npc fix run deferred=false 时 .ok=false 不得裸 break。
+
+    Finding: 原 `[ "$(echo "$FIX" | jq -r '.ok')" = "true" ] || break` 在 headless
+    路径下 record 失败时仅 break，未调用 npc auto-decide --trigger fixer-failed，
+    FIX_EXHAUSTED 保持 false，post-loop 落入旧 R 的 blocking 判断，错误跳过 3d。
+    修复：将裸 break 替换为设置 FIX_EXHAUSTED=true + auto-decide fixer-failed + break。
+    """
+
+    def test_fix_run_ok_false_must_not_bare_break(self, spine_run_text: str):
+        """npc fix run .ok 失败路径不得只有裸 break，必须有 fixer-failed 决策调用。
+
+        检测：FIX.ok 检查块内必须同时出现 fixer-failed trigger 和 FIX_EXHAUSTED=true。
+        """
+        # 找到 npc fix run 调用后的 .ok 检查区域
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        assert fix_run_pos != -1, "npc fix run 调用未找到"
+        # 在调用后的合理范围内（500字符）应该找到 fixer-failed 和 FIX_EXHAUSTED
+        nearby = spine_run_text[fix_run_pos : fix_run_pos + 500]
+        assert "fixer-failed" in nearby, (
+            "npc fix run .ok 检查后缺少 fixer-failed trigger（F1：headless 路径 record 失败未进 3d）"
+        )
+        assert "FIX_EXHAUSTED=true" in nearby, (
+            "npc fix run .ok 检查后缺少 FIX_EXHAUSTED=true（F1：post-loop 无法按 ACTION 分发）"
+        )
+
+    def test_fix_run_ok_check_is_if_block_not_bare_break(self, spine_run_text: str):
+        """FIX.ok 检查必须是 if 块形式（含 npc auto-decide），不得是单行 || break 形式。
+
+        原 buggy 形式：`[ ... ] || break`（无 auto-decide，无 FIX_EXHAUSTED 设置）。
+        修复后形式：`if [ ... != true ]; then ... fixer-failed ... FIX_EXHAUSTED=true ... fi`。
+        """
+        # 原来的 buggy 单行形式不应存在于 fix run 附近
+        buggy_pattern = "'.ok')" + ' = "true" ] || break'
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        assert fix_run_pos != -1
+        # 在 fix run 后的 200 字符内不应出现裸 break 模式
+        nearby_short = spine_run_text[fix_run_pos : fix_run_pos + 200]
+        assert buggy_pattern not in nearby_short, (
+            "FIX.ok 检查仍使用裸 || break 形式（F1 未修复：headless record 失败不进 3d）"
+        )
+
+    def test_fix_headless_needs_user_decision_enters_3d(self, spine_run_text: str):
+        """headless fix 路径（deferred=false）的 needs-user-decision 必须进入 3d。
+
+        检测：在 3b 循环的 deferred=false 分支内，存在对 needs-user-decision 的检查
+        并触发 fixer-failed。
+        """
+        # 在 FIX.deferred != true 附近必须有 needs-user-decision 检查
+        headless_check = 'FIX" | jq -r \'.deferred\'")'
+        # 更宽泛：检测 deferred != true 的判断与 needs-user-decision 在 3b 节中共存
+        section_3b_pos = spine_run_text.find("### 3b.")
+        section_3c_pos = spine_run_text.find("### 3c.")
+        assert section_3b_pos != -1 and section_3c_pos != -1
+        section_3b_text = spine_run_text[section_3b_pos:section_3c_pos]
+        # 必须在 3b 节内同时存在 deferred 检查与 needs-user-decision
+        assert "deferred" in section_3b_text, "3b 节未引用 deferred 字段"
+        assert "needs-user-decision" in section_3b_text, (
+            "3b 节缺少 needs-user-decision 检查（headless fix 的 needs-user-decision 未处理）"
+        )
+
+    def test_fix_ok_false_fix_exhausted_before_next_review(self, spine_run_text: str):
+        """FIX.ok=false 处理（含 FIX_EXHAUSTED=true）必须出现在下一轮 review run 之前。
+
+        确保 headless record 失败时不会落入 `R=$(npc review run ...)` 继续轮转。
+        """
+        fix_run_pos = spine_run_text.find("FIX=$(npc fix run --seq $SEQ --round $N)")
+        next_review_pos = spine_run_text.find(
+            "R=$(npc review run --seq $SEQ --round $N)", fix_run_pos
+        )
+        # FIX_EXHAUSTED=true 第一次出现在 fix run 调用后
+        fix_exhausted_pos = spine_run_text.find("FIX_EXHAUSTED=true", fix_run_pos)
+        assert fix_run_pos != -1, "npc fix run 调用未找到"
+        assert next_review_pos != -1, "下一轮 review run 未找到"
+        assert fix_exhausted_pos != -1, "FIX_EXHAUSTED=true 在 fix run 后未找到"
+        assert fix_exhausted_pos < next_review_pos, (
+            "FIX_EXHAUSTED=true 必须出现在下一轮 review run 之前，"
+            "确保 headless record 失败不继续 review"
+        )

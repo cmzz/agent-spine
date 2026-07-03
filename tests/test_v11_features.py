@@ -25,10 +25,17 @@ from npc import (
 
 
 def _bootstrap(env_setup, capsys, make_args, *change_ids: str):
-    _state.init_run(make_args(plan_order=json.dumps(list(change_ids))))
+    # Override state_json to the fake isolated path so load_paths() reads/writes
+    # the test-local state file instead of the real active run discovered from cwd.
+    sjson = str(env_setup.state_json)
+    _state.init_run(
+        make_args(plan_order=json.dumps(list(change_ids)), state_json=sjson)
+    )
     capsys.readouterr()
     for i, cid in enumerate(change_ids, start=1):
-        _state.add_change(make_args(seq=i, change_id=cid, base=None))
+        _state.add_change(
+            make_args(seq=i, change_id=cid, base=None, state_json=sjson)
+        )
         capsys.readouterr()
 
 
@@ -48,10 +55,13 @@ def _make_commit(repo: Path, msg: str) -> str:
 
 
 class TestPhaseRotate:
+    def _mk(self, env_setup, make_args, **kwargs):
+        return make_args(state_json=str(env_setup.state_json), **kwargs)
+
     def test_rotate_without_prev_inprogress(self, env_setup, capsys, make_args):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
         _events.phase_rotate(
-            make_args(seq=1, to_phase="fix-r1", prev_status="done", prev_extra="{}")
+            self._mk(env_setup, make_args, seq=1, to_phase="fix-r1", prev_status="done", prev_extra="{}")
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["ok"]
@@ -64,10 +74,10 @@ class TestPhaseRotate:
 
     def test_rotate_closes_in_progress_phase(self, env_setup, capsys, make_args):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
-        _events.phase_enter(make_args(seq=1, phase="review-r0"))
+        _events.phase_enter(self._mk(env_setup, make_args, seq=1, phase="review-r0"))
         capsys.readouterr()
         _events.phase_rotate(
-            make_args(seq=1, to_phase="fix-r1", prev_status="done", prev_extra="{}")
+            self._mk(env_setup, make_args, seq=1, to_phase="fix-r1", prev_status="done", prev_extra="{}")
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         closed = payload["prev_phases_closed"]
@@ -82,7 +92,7 @@ class TestPhaseRotate:
     def test_rotate_emits_phase_start_event(self, env_setup, capsys, make_args):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
         _events.phase_rotate(
-            make_args(seq=1, to_phase="fix-r2", prev_status="done", prev_extra="{}")
+            self._mk(env_setup, make_args, seq=1, to_phase="fix-r2", prev_status="done", prev_extra="{}")
         )
         capsys.readouterr()
         per_change = env_setup.run_dir / "001-add-foo" / "events.jsonl"
@@ -97,6 +107,9 @@ class TestPhaseRotate:
 
 
 class TestStateRepair:
+    def _mk(self, env_setup, make_args, **kwargs):
+        return make_args(state_json=str(env_setup.state_json), **kwargs)
+
     def _setup_progress_with_phantom_commits(self, env_setup, capsys, make_args, fake_repo):
         _bootstrap(env_setup, capsys, make_args, "add-foo", "add-bar")
         # 让 seq=1 假装已经 archived 但 commit 都不存在
@@ -139,7 +152,7 @@ class TestStateRepair:
         self, env_setup, capsys, make_args, fake_repo
     ):
         self._setup_progress_with_phantom_commits(env_setup, capsys, make_args, fake_repo)
-        _repair.state_repair(make_args(seqs=None, auto=True))
+        _repair.state_repair(self._mk(env_setup, make_args, seqs=None, auto=True))
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["ok"]
         assert len(payload["repaired"]) == 1
@@ -161,7 +174,7 @@ class TestStateRepair:
 
     def test_repair_writes_run_event(self, env_setup, capsys, make_args, fake_repo):
         self._setup_progress_with_phantom_commits(env_setup, capsys, make_args, fake_repo)
-        _repair.state_repair(make_args(seqs=None, auto=True))
+        _repair.state_repair(self._mk(env_setup, make_args, seqs=None, auto=True))
         capsys.readouterr()
         run_ev_lines = env_setup.run_events.read_text().splitlines()
         repair_events = [json.loads(l) for l in run_ev_lines if "state.repair" in l]
@@ -172,7 +185,7 @@ class TestStateRepair:
         self, env_setup, capsys, make_args, fake_repo
     ):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
-        _repair.state_repair(make_args(seqs=None, auto=True))
+        _repair.state_repair(self._mk(env_setup, make_args, seqs=None, auto=True))
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["ok"] and payload["repaired"] == []
 
@@ -183,10 +196,13 @@ class TestStateRepair:
 
 
 class TestAgentTimeoutBudget:
+    def _mk(self, env_setup, make_args, **kwargs):
+        return make_args(state_json=str(env_setup.state_json), **kwargs)
+
     def test_budget_zero_retries(self, env_setup, capsys, make_args):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
         _agent.timeout_budget(
-            make_args(seq=1, phase="implement", base=None, mult=None, max_sec=None)
+            self._mk(env_setup, make_args, seq=1, phase="implement", base=None, mult=None, max_sec=None)
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["timeout_sec"] == 1800
@@ -196,7 +212,7 @@ class TestAgentTimeoutBudget:
     def test_record_increments_and_returns_new_budget(self, env_setup, capsys, make_args):
         _bootstrap(env_setup, capsys, make_args, "add-foo")
         _agent.record_timeout(
-            make_args(seq=1, phase="implement", base=None, mult=None, max_sec=None)
+            self._mk(env_setup, make_args, seq=1, phase="implement", base=None, mult=None, max_sec=None)
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["retries"] == 1
@@ -210,7 +226,7 @@ class TestAgentTimeoutBudget:
         s["progress"][0]["phases"] = {"implement": {"timeout_retries": 10}}
         env_setup.state_json.write_text(json.dumps(s, indent=2))
         _agent.timeout_budget(
-            make_args(seq=1, phase="implement", base=None, mult=None, max_sec=None)
+            self._mk(env_setup, make_args, seq=1, phase="implement", base=None, mult=None, max_sec=None)
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["timeout_sec"] == 3600  # 1800 * 1.2^10 = 11146 → capped
@@ -222,7 +238,7 @@ class TestAgentTimeoutBudget:
         s["progress"][0]["phases"] = {"implement": {"timeout_retries": 5}}
         env_setup.state_json.write_text(json.dumps(s, indent=2))
         _agent.timeout_budget(
-            make_args(seq=1, phase="implement", base=None, mult=None, max_sec=None)
+            self._mk(env_setup, make_args, seq=1, phase="implement", base=None, mult=None, max_sec=None)
         )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["exhausted"] is True
@@ -240,6 +256,11 @@ class TestAutoDecide:
         s["progress"][0].update(progress_patch)
         env_setup.state_json.write_text(json.dumps(s, indent=2))
 
+    def _mk(self, env_setup, make_args, **kwargs):
+        """Wrap make_args with isolated state_json override so load_paths()
+        reads the test-local state file instead of the real active run."""
+        return make_args(state_json=str(env_setup.state_json), **kwargs)
+
     def test_stale_with_low_blocking_force_archive(self, env_setup, capsys, make_args):
         self._seed(
             env_setup,
@@ -248,7 +269,7 @@ class TestAutoDecide:
             blocking_trend=[3, 2, 2, 2],
             categories_seen=["validation", "edge-case"],
         )
-        _auto_decide.cli(make_args(seq=1, trigger="stale", apply=False))
+        _auto_decide.cli(self._mk(env_setup, make_args, seq=1, trigger="stale", apply=False))
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["action"] == "force-archive"
 
@@ -260,7 +281,7 @@ class TestAutoDecide:
             blocking_trend=[5, 5, 5],
             categories_seen=["race-condition"],
         )
-        _auto_decide.cli(make_args(seq=1, trigger="stale", apply=False))
+        _auto_decide.cli(self._mk(env_setup, make_args, seq=1, trigger="stale", apply=False))
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["action"] == "skip"
         assert payload["set_status"] == "skipped-auto"
@@ -268,7 +289,9 @@ class TestAutoDecide:
 
     def test_implementer_failed_first_retry(self, env_setup, capsys, make_args):
         self._seed(env_setup, capsys, make_args)
-        _auto_decide.cli(make_args(seq=1, trigger="implementer-failed", apply=False))
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="implementer-failed", apply=False)
+        )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["action"] == "continue-retry"
 
@@ -278,17 +301,51 @@ class TestAutoDecide:
         s = json.loads(env_setup.state_json.read_text())
         s["progress"][0]["auto_retry_implementer-failed"] = 1
         env_setup.state_json.write_text(json.dumps(s, indent=2))
-        _auto_decide.cli(make_args(seq=1, trigger="implementer-failed", apply=False))
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="implementer-failed", apply=False)
+        )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["action"] == "skip"
         assert payload["set_status"] == "skipped-auto"
 
     def test_agent_timeout_exhausted_skip(self, env_setup, capsys, make_args):
         self._seed(env_setup, capsys, make_args)
-        _auto_decide.cli(make_args(seq=1, trigger="agent-timeout-exhausted", apply=False))
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="agent-timeout-exhausted", apply=False)
+        )
         payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
         assert payload["action"] == "skip"
         assert "oversized" in payload["reason"]
+
+    def test_archive_failed_first_retry(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="archive-failed", apply=False)
+        )
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["action"] == "continue-retry"
+
+    def test_archive_failed_second_time_skips(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        s = json.loads(env_setup.state_json.read_text())
+        s["progress"][0]["auto_retry_archive-failed"] = 1
+        env_setup.state_json.write_text(json.dumps(s, indent=2))
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="archive-failed", apply=False)
+        )
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["action"] == "skip"
+        assert payload["set_status"] == "skipped-auto"
+
+    def test_archive_failed_apply_mutation(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        _auto_decide.cli(
+            self._mk(env_setup, make_args, seq=1, trigger="archive-failed", apply=True)
+        )
+        capsys.readouterr()
+        s = json.loads(env_setup.state_json.read_text())
+        assert s["progress"][0]["auto_retry_archive-failed"] == 1
+        assert s["progress"][0].get("status") is None or s["progress"][0]["status"] != "skipped-auto"
 
     def test_apply_writes_status(self, env_setup, capsys, make_args):
         self._seed(
@@ -298,7 +355,7 @@ class TestAutoDecide:
             blocking_trend=[5, 5, 5],
             categories_seen=["race-condition"],
         )
-        _auto_decide.cli(make_args(seq=1, trigger="stale", apply=True))
+        _auto_decide.cli(self._mk(env_setup, make_args, seq=1, trigger="stale", apply=True))
         capsys.readouterr()
         s = json.loads(env_setup.state_json.read_text())
         assert s["progress"][0]["status"] == "skipped-auto"

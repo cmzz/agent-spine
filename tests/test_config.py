@@ -168,3 +168,39 @@ def test_coder_unknown_backend_rejected(tmp_path):
     repo = _write_cfg(tmp_path, '[coder]\nbackend="gpt5"\n')
     with pytest.raises(ConfigError):
         load_config(repo)
+
+
+# ============================================================
+# [verify].rerun_tests 配置项（wire-verify-tests task 1.2）
+# ============================================================
+
+
+def test_verify_rerun_tests_default_none(tmp_path):
+    """缺省时 rerun_tests=None（由调用方按运行模式决定）。"""
+    from npc.config import load_config
+    cfg = load_config(tmp_path)
+    assert cfg.verify.rerun_tests is None
+
+
+def test_verify_rerun_tests_true_parsed(tmp_path):
+    """[verify].rerun_tests = true → True。"""
+    from npc.config import load_config
+    repo = _write_cfg(tmp_path, '[verify]\nrerun_tests = true\n')
+    cfg = load_config(repo)
+    assert cfg.verify.rerun_tests is True
+
+
+def test_verify_rerun_tests_false_parsed(tmp_path):
+    """[verify].rerun_tests = false → False。"""
+    from npc.config import load_config
+    repo = _write_cfg(tmp_path, '[verify]\nrerun_tests = false\n')
+    cfg = load_config(repo)
+    assert cfg.verify.rerun_tests is False
+
+
+def test_verify_rerun_tests_non_bool_rejected(tmp_path):
+    """[verify].rerun_tests 必须是 bool，否则 ConfigError。"""
+    from npc.config import load_config, ConfigError
+    repo = _write_cfg(tmp_path, '[verify]\nrerun_tests = "yes"\n')
+    with pytest.raises(ConfigError, match="bool"):
+        load_config(repo)

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import argparse
 
-from . import _io, paths as _paths, state as _state
+from . import _io, paths as _paths, state as _state, telemetry as _telemetry
 
 
 VALID_TRIGGERS = {
@@ -28,6 +28,7 @@ VALID_TRIGGERS = {
     "fixer-failed",
     "summary-missing",
     "commit-not-found",
+    "archive-failed",
 }
 
 # 软阈值；与 skill --auto 默认参数同步。可改但不接 CLI 覆盖（避免主 session 误调）
@@ -39,17 +40,77 @@ RETRY_TRIGGERS = {  # 仅这几类 trigger 走 "continue-retry → 再失败就 
     "fixer-failed",
     "summary-missing",
     "commit-not-found",
+    "archive-failed",
 }
 
+# 系统性阻塞止损阈值（不接 CLI 覆盖）
+SYSTEMIC_TRIGGER_CONSECUTIVE = 3   # 同一 trigger 连续出现 ≥ 该值 → abort
+SYSTEMIC_SKIP_RATIO = 0.5          # skipped-auto 占比 ≥ 该值 → abort（须同时满足最小数量）
+SYSTEMIC_SKIP_MIN = 3              # 触发比例判断的最小 skipped-auto 数量
 
-def _decide(entry: dict, trigger: str) -> dict:
-    """纯函数：基于 entry 与 trigger 计算 action 与 mutation 指令。"""
+
+def _is_systemic_block(progress: list[dict], trigger: str) -> bool:
+    """检测跨 change 维度的系统性阻塞。
+
+    两条规则（任一成立即返回 True）：
+    1. 同一 trigger 在 progress 中**连续**最后 N 项（已完成决策的）≥ SYSTEMIC_TRIGGER_CONSECUTIVE。
+    2. skipped-auto 状态的 change 占总进度 ≥ SYSTEMIC_SKIP_RATIO 且绝对数量 ≥ SYSTEMIC_SKIP_MIN。
+
+    progress 中状态为 pending / implementing / reviewing 的 entry 不计入连续计数，
+    因为它们尚未触发 auto-decide，不代表已确认的阻塞事件。
+    """
+    if not progress:
+        return False
+
+    # 规则 1：同一 trigger 连续出现
+    # 取已触发过 auto-decide 的 entry（有 last_trigger 字段），从末尾往前数。
+    # 当前这次 trigger 本身计为第 1 次，加上之前已记录的连续数。
+    decided = [e for e in progress if e.get("last_trigger")]
+    consecutive = 1  # 当前决策点本身计入
+    for e in reversed(decided):
+        entry_trigger = e.get("last_trigger") or ""
+        if entry_trigger == trigger:
+            consecutive += 1
+        else:
+            break
+    if consecutive >= SYSTEMIC_TRIGGER_CONSECUTIVE:
+        return True
+
+    # 规则 2：skipped-auto 占比
+    skipped = sum(1 for e in progress if e.get("status") == "skipped-auto")
+    total = len(progress)
+    if skipped >= SYSTEMIC_SKIP_MIN and skipped / total >= SYSTEMIC_SKIP_RATIO:
+        return True
+
+    return False
+
+
+def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> dict:
+    """纯函数：基于 entry 与 trigger 计算 action 与 mutation 指令。
+
+    progress 为全量 progress 列表（可选），用于跨 change 系统性阻塞检测。
+    传入时会在前置步骤检测是否应当 abort，优先级高于单 change 判断。
+    """
     blocking_trend = entry.get("blocking_trend") or []
     categories_seen = entry.get("categories_seen") or []
     b_last = int(blocking_trend[-1]) if blocking_trend else 0
     nc = len(categories_seen)
 
     out: dict = {"trigger": trigger}
+
+    # ── 前置：跨 change 系统性阻塞检测 ──────────────────────────────────────
+    # archive-failed 二次决策不参与系统性检测（防止误触 abort）；
+    # 其余 trigger 均检测。
+    if trigger != "archive-failed" and _is_systemic_block(progress or [], trigger):
+        out.update(
+            {
+                "action": "abort",
+                "reason": "systemic-failure",
+                "set_status": "skipped-auto",
+                "set_aborted": True,
+            }
+        )
+        return out
 
     if trigger in ("stale", "max-rounds"):
         if b_last <= B_THRESHOLD_ARCHIVE and len(blocking_trend) >= 3:
@@ -100,6 +161,19 @@ def _decide(entry: dict, trigger: str) -> dict:
         return out
 
     # 软失败 trigger：第一次给一次 retry 机会
+    # 特例：archive-failed 在 force-archive 兜底路径下（上一次 last_trigger 为
+    # stale/max-rounds，说明已经 force-archive --apply 过）必须直接收敛为终态，
+    # 不再给 retry 机会，防止 stale→force-archive→archive-failed→continue-retry 死循环。
+    if trigger == "archive-failed" and entry.get("last_trigger") in ("stale", "max-rounds"):
+        out.update(
+            {
+                "action": "skip",
+                "reason": "archive-failed-after-force-archive",
+                "set_status": "skipped-auto",
+            }
+        )
+        return out
+
     retry_key = f"auto_retry_{trigger}"
     retries = int(entry.get(retry_key) or 0)
     if retries < 1:
@@ -155,7 +229,7 @@ def cli(args: argparse.Namespace) -> None:
         )
         return
     entry = progress[seq - 1]
-    decision = _decide(entry, trigger)
+    decision = _decide(entry, trigger, progress)
     decision["seq"] = seq
     decision["change_id"] = entry.get("change_id")
     decision["blocking_trend"] = entry.get("blocking_trend") or []
@@ -165,16 +239,22 @@ def cli(args: argparse.Namespace) -> None:
         set_status = decision.get("set_status")
         inc_key = decision.get("increment_retry_key")
         reason = decision.get("reason")
+        set_aborted = decision.get("set_aborted", False)
 
         def mutate(state: dict) -> None:
-            progress = state.get("progress") or []
-            entry = progress[seq - 1]
+            prog = state.get("progress") or []
+            e = prog[seq - 1]
             if inc_key:
-                entry[inc_key] = int(entry.get(inc_key) or 0) + 1
+                e[inc_key] = int(e.get(inc_key) or 0) + 1
             if set_status:
-                entry["status"] = set_status
+                e["status"] = set_status
             if reason:
-                entry["reason"] = reason
+                e["reason"] = reason
+            # 记录本次 trigger，供后续系统性检测连续计数使用
+            e["last_trigger"] = trigger
+            # abort 决策：置顶层 aborted 标记，供 finalize 判断语义
+            if set_aborted:
+                state["aborted"] = True
 
         _state.update_state(p.state_json, p.state_md, mutate)
         decision["applied"] = True
@@ -182,4 +262,25 @@ def cli(args: argparse.Namespace) -> None:
         decision["applied"] = False
 
     decision["ok"] = True
+
+    # ── telemetry：best-effort，失败不影响主流程 ──────────────────────────
+    try:
+        _telemetry.emit_event(
+            {
+                "kind": "auto_decide.decision",
+                "proj_key": p.proj_key,
+                "canonical_proj_key": p.canonical_proj_key or p.proj_key,
+                "run_ts": p.run_ts,
+                "change_seq": seq,
+                "change_id": decision.get("change_id"),
+                "trigger": trigger,
+                "action": decision.get("action"),
+                "reason": decision.get("reason"),
+                "seq": seq,
+                "applied": decision.get("applied", False),
+            }
+        )
+    except Exception:
+        pass
+
     _io.emit(decision)

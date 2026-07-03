@@ -118,6 +118,7 @@ npc state add-change $SEQ "$CID"
 ### 3a. Implement
 
 ```bash
+IMPL_FAILED=false   # 每个 SEQ 开始时重置；deferred=true record 失败时置 true，通知 3b 跳过 review
 IMPL=$(npc implement run --seq $SEQ)
 [ "$(echo "$IMPL" | jq -r '.ok')" = "true" ] || { 进入 Step 3d 决策点; }
 ```
@@ -127,47 +128,204 @@ IMPL=$(npc implement run --seq $SEQ)
 - **`deferred=true`（in-session，claude 后端默认）**：npc 已 render prompt，等编排者 spawn subagent：
   ```bash
   SPAWN_PROMPT=$(echo "$IMPL" | jq -r '.spawn_prompt')
-  # 调 Task 工具，由主 session 原地 spawn spine-coder subagent：
-  RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT")
-  # 抽末尾 RESULT: 行，装订：
-  npc implement record --seq $SEQ --result "$RESULT_LINE"
+  # spawn 前取超时预算（必须；绝不无限等待）：
+  BUDGET=$(npc agent timeout-budget --seq $SEQ --phase implement)
+  BUDGET_EXIT=$?
+  # 校验 exit code、.ok 字段及 timeout_sec 正整数（任一失败 → 不 spawn，直接硬停该 change）：
+  if [ $BUDGET_EXIT -ne 0 ] \
+     || [ "$(echo "$BUDGET" | jq -r '.ok // false')" != "true" ] \
+     || ! echo "$BUDGET" | jq -e '.timeout_sec | type == "number" and . > 0' >/dev/null 2>&1; then
+    # timeout-budget 调用失败或返回无效数据，无法安全 spawn；以 implementer-failed 进决策点
+    DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    # 按 ACTION 执行（同 3d）
+  elif [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
+    # 预算耗尽，直接转决策点（不再 spawn）
+    DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')   # 通常 skip
+    # 按 ACTION 执行（skip → 继续下一 change；abort → 进 Step 4）
+  else
+    TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
+    # 调 Task 工具，由主 session 原地 spawn spine-coder subagent（带 timeout=TIMEOUT_SEC）：
+    RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
+    if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
+      # 超时或失败：记账后决定是否重派
+      RT=$(npc agent record-timeout --seq $SEQ --phase implement)
+      RT_EXIT=$?
+      # 校验 record-timeout 结果（exit code + .ok）：失败时保守视为 exhausted，不继续重派
+      if [ $RT_EXIT -ne 0 ] \
+         || [ "$(echo "$RT" | jq -r '.ok // false')" != "true" ] \
+         || [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+        DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')   # skip
+        # 按 ACTION 执行
+      else
+        # 预算未耗尽 → 回到 3a 重派（continue-retry 语义）
+        { 回到 3a 重派; }
+      fi
+    else
+      # 抽末尾 RESULT: 行，装订：
+      REC=$(npc implement record --seq $SEQ --result "$RESULT_LINE")
+      # 必须检查 record 返回值——这是 coder 成败的唯一真相（不变量 2）：
+      if [ "$(echo "$REC" | jq -r '.ok')" != "true" ] \
+         || [ "$(echo "$REC" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+        # record 失败或状态为 needs-user-decision → 立即进 3d，不继续 review
+        DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        IMPL_FAILED=true   # 通知 3b 跳过 review
+        # 按 ACTION 立即执行（同 3d）：
+        # continue-retry → 回到 3a 重试；skip → 继续下一 change；abort → 进 Step 4
+        { 按 3d ACTION 执行控制流，见下方 3d 节; }
+      fi
+    fi
+  fi
   ```
-  > `spawn_prompt` 已含 prompt 文件绝对路径（`prompt_file` 字段亦可直接取）；RESULT 行格式见 spine-coder 契约。
+  > `spawn_prompt` 已含 prompt 文件绝对路径（`prompt_file` 字段亦可直接取）；RESULT 行格式见 spine-coder 契约。超时预算由 `npc agent timeout-budget` 给出（渐进退避：base 1800s / mult 1.2 / max 3600s / 最多 5 次超时后 exhausted）。
 
-- **`deferred=false`（headless，mimo 后端或显式配置）**：npc 内部已完成 spawn→record，一行跑完，无需额外操作：
+- **`deferred=false`（headless，mimo 后端或显式配置）**：npc 内部已完成 spawn→record，一行跑完；仍需检查 `.status`：
   ```bash
-  # IMPL.ok=true 即代表 coder 已跑完并 record，直接进 review
+  # IMPL.ok=true 代表 record 成功，但仍需排除 needs-user-decision（不变量 2）
+  if [ "$(echo "$IMPL" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+    DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    IMPL_FAILED=true
+    { 按 3d ACTION 执行控制流，见下方 3d 节; }
+  fi
   ```
+
+> **注意（deferred=true 时）**：`npc implement run` 返回的 `.ok=true` 仅代表 prompt 渲染成功，**不代表 coder 执行成功**。coder 成败的唯一真相是 `npc implement record` 的返回值（`.ok` 与 `.status`）。`IMPL.ok` 用于检查 run 命令自身是否失败，不得当作 coder 执行成功的依据。
 
 ### 3b. Review-Fix 循环（反复打磨，直到干净或卡死）
 
+**3b 入口守卫**：仅当 implement 阶段成功（`IMPL_FAILED=false`）时才执行 review-fix 循环；
+`IMPL_FAILED=true` 意味着已在 3a 内进入 3d 决策点，此处直接跳过。
+
 ```bash
+# 3b 入口守卫：implement record 失败时跳过 review
+if [ "$IMPL_FAILED" = "true" ]; then
+  # 已在 3a 执行 3d ACTION，直接跳到下一 change 或 Step 4
+  { 按已设定的 ACTION 继续（skip / abort / continue-retry）; }
+fi
+
 R=$(npc review run --seq $SEQ --round 0)
+# 不变量 2：先检查 .ok，再读业务字段（review 自身失败时返回体无 blocking/stale）
+if [ "$(echo "$R" | jq -r '.ok')" != "true" ]; then
+  # review run 自身失败（如 codex-exec-failed）→ 转 3d，不进循环
+  DEC=$(npc auto-decide --trigger codex-failed --seq $SEQ --apply)
+  ACTION=$(echo "$DEC" | jq -r '.action')
+  # 按 3d ACTION 执行（skip / abort / 其余）；跳过下方 review-fix 循环
+else
 N=0
+FIX_EXHAUSTED=false   # 标记 fix 分支是否因预算耗尽而 break 2
+# .ok=true 时才读 blocking/stale，避免 null 参与整数比较
 while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
    && [ "$(echo "$R" | jq -r '.stale')" = "false" ] \
    && [ $N -lt 20 ]; do
   N=$((N+1))
   # npc 内部 render fix prompt（注入上轮 blocking findings + 修复历史），按 deferred 分发：
   FIX=$(npc fix run --seq $SEQ --round $N)
-  [ "$(echo "$FIX" | jq -r '.ok')" = "true" ] || break
+  # 先检查 .ok（不变量 2）：deferred=false 时 npc 内部已 spawn→record，.ok 反映 record 结果；
+  # deferred=true 时 .ok 仅代表 prompt 渲染成功，record 失败留给后续内层循环处理。
+  # 无论哪种模式，.ok=false 均必须进 3d fixer-failed，不得只 break。
+  if [ "$(echo "$FIX" | jq -r '.ok')" != "true" ]; then
+    DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    FIX_EXHAUSTED=true
+    break
+  fi
 
   # 同 3a：按 deferred 字段分发
   if [ "$(echo "$FIX" | jq -r '.deferred')" = "true" ]; then
-    # in-session（claude 后端默认）：spawn spine-coder subagent，装订结果
+    # in-session（claude 后端默认）：spawn 前取超时预算（必须）
     SPAWN_PROMPT=$(echo "$FIX" | jq -r '.spawn_prompt')
-    RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT")
-    npc fix record --seq $SEQ --round $N --result "$RESULT_LINE"
+    FIX_PHASE="fix-r${N}"
+    # 内层循环：在同一 phase 内重试，直到成功或 exhausted
+    # 保证 timeout_retries 在同一 phase 累积，不因 N 递增而散落到不同计数器
+    FIX_DONE=false
+    while true; do
+      BUDGET=$(npc agent timeout-budget --seq $SEQ --phase $FIX_PHASE)
+      BUDGET_EXIT=$?
+      # 校验 exit code、.ok 字段及 timeout_sec 正整数（任一失败 → 不 spawn，硬停该 fix phase）：
+      if [ $BUDGET_EXIT -ne 0 ] \
+         || [ "$(echo "$BUDGET" | jq -r '.ok // false')" != "true" ] \
+         || ! echo "$BUDGET" | jq -e '.timeout_sec | type == "number" and . > 0' >/dev/null 2>&1; then
+        # timeout-budget 调用失败，无法安全 spawn；保守视为 fixer-failed 进决策点
+        DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        FIX_EXHAUSTED=true
+        break 2
+      fi
+      if [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
+        # 预算耗尽，不再 spawn，转决策点
+        DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发
+        break 2  # 同时跳出内层循环和外层 while
+      fi
+      TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
+      RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
+      if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
+        # 超时：记账后在同一 phase 重试（timeout_retries 累积到 exhausted）
+        RT=$(npc agent record-timeout --seq $SEQ --phase $FIX_PHASE)
+        RT_EXIT=$?
+        # 校验 record-timeout 结果（exit code + .ok）：失败时保守视为 exhausted，不继续重派
+        if [ $RT_EXIT -ne 0 ] \
+           || [ "$(echo "$RT" | jq -r '.ok // false')" != "true" ] \
+           || [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+          DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
+          ACTION=$(echo "$DEC" | jq -r '.action')
+          FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发
+          break 2  # 同时跳出内层循环和外层 while
+        fi
+        # 未耗尽 → 在同一 FIX_PHASE 内重派，不推进 N
+        continue
+      fi
+      # spawn 成功：记录结果，检查 record 返回值，退出内层循环
+      FREC=$(npc fix record --seq $SEQ --round $N --result "$RESULT_LINE")
+      # 必须检查 record 返回值——record 失败绝不继续进入下一轮 review（不变量 2）：
+      if [ "$(echo "$FREC" | jq -r '.ok')" != "true" ] \
+         || [ "$(echo "$FREC" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+        # record 失败或状态为 needs-user-decision → 立即进 3d，不继续 review
+        DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        FIX_EXHAUSTED=true
+        break 2
+      fi
+      FIX_DONE=true
+      break
+    done
+    [ "$FIX_DONE" = "true" ] || continue  # 若内层因 break 2 退出则 continue 无效（已 break 外层）
   fi
-  # headless（mimo/显式）：npc 内部已 record，无需额外步骤
+  # headless（mimo/显式）：npc 内部已 record；仍需检查 needs-user-decision（不变量 2）
+  if [ "$(echo "$FIX" | jq -r '.deferred')" != "true" ]; then
+    if [ "$(echo "$FIX" | jq -r '.status // empty')" = "needs-user-decision" ]; then
+      # headless record 返回 needs-user-decision → 立即进 3d，不继续 review
+      DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+      ACTION=$(echo "$DEC" | jq -r '.action')
+      FIX_EXHAUSTED=true
+      break
+    fi
+  fi
 
   R=$(npc review run --seq $SEQ --round $N)
+  # 循环内每次 review run 后同样先检查 .ok（守护不变量 2）
+  if [ "$(echo "$R" | jq -r '.ok')" != "true" ]; then
+    # review run 自身失败 → 退出循环并转 3d（trigger=codex-failed）
+    DEC=$(npc auto-decide --trigger codex-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    FIX_EXHAUSTED=true   # 复用 FIX_EXHAUSTED 标志让 post-loop 按 ACTION 分发
+    break
+  fi
 done
+fi  # end: if R.ok=true (round0 guard)
 ```
 
-循环退出后看 `R`：
-- `blocking == 0` → 干净，进 3c archive。
-- `stale == true` 或越上限 → 卡死，进 3d 决策点。
+循环退出后优先检查 `FIX_EXHAUSTED` 标志——预算耗尽路径或 review 自身失败的 `ACTION` 已由 `npc auto-decide --apply` 写入，
+必须按 3d 语义立即执行，不得用旧的 `R` 做 blocking/stale 判断：
+- `FIX_EXHAUSTED=true` → 按 `ACTION` 执行（skip：继续下一 change；abort：进 Step 4；其余同 3d）。
+- `FIX_EXHAUSTED=false` → 正常出口：
+  - `blocking == 0` → 干净，进 3c archive。
+  - `stale == true` 或越上限 → 卡死，进 3d 决策点。
 
 ### 3c. Archive
 
@@ -179,12 +337,46 @@ echo "$ARCH" | jq -r '{ok, archive_commit, total_rounds, error}'
 
 ### 3d. 决策点（卡死 / implement 失败 / archive 失败时）
 
-**auto 档**：
+**auto 档**：按场景选真实合法的 trigger 值（`npc auto-decide` 只接受 `auto_decide.VALID_TRIGGERS` 中的词，别的值一律 `invalid_trigger` exit 2）：
+
+| 触发场景 | `--trigger` 值 |
+|---|---|
+| 3a implement 失败 | `implementer-failed` |
+| 3b fix 失败 | `fixer-failed` |
+| 3b review 自身失败（如 codex-exec-failed） | `codex-failed` |
+| 3b review 卡死（`stale=true`） | `stale` |
+| 3b review 卡死（轮次越上限） | `max-rounds` |
+| 3c archive 失败 | `archive-failed` |
+| 3a/3b in-session coder 超时且预算耗尽 | `agent-timeout-exhausted` |
+
 ```bash
-DEC=$(npc auto-decide --trigger <implement-failed|review-stale|archive-failed> --seq $SEQ)
+DEC=$(npc auto-decide --trigger <上表对应值> --seq $SEQ --apply)
 ACTION=$(echo "$DEC" | jq -r '.action')   # continue-retry | skip | force-archive | abort
 ```
-按 `ACTION` 执行：`continue-retry` 回到对应阶段重试；`skip` 标记跳过下一个 change；`force-archive` 强行 `npc archive run`；`abort` 终止整个 run。**不打断用户。**
+
+按 `ACTION` 执行：
+
+- **`continue-retry`**：回到对应阶段重试。
+- **`skip`**：已由 `--apply` 将当前 change 状态置为 `skipped-auto`，继续下一个 change。
+- **`force-archive`**：执行 `npc archive run --seq $SEQ`；若该命令失败（`.ok != true`），以 `--trigger archive-failed` 二次调用 `npc auto-decide`，此时 action 只在 `skip` 或 `abort` 中收敛（不再 force-archive，避免死循环）：
+  ```bash
+  ARCH2=$(npc archive run --seq $SEQ)
+  if [ "$(echo "$ARCH2" | jq -r '.ok')" != "true" ]; then
+    DEC2=$(npc auto-decide --trigger archive-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC2" | jq -r '.action')   # skip | abort（不再 force-archive）
+    # 按新 ACTION 执行 skip 或 abort（见下）
+  fi
+  ```
+- **`abort`**：系统性阻塞止损——将剩余所有 `pending` change 批量标记为 `skipped-auto`，直接跳至 Step 4 finalize；worktree 与 spine 分支保留供人工排查，不做 ff-merge。
+  ```bash
+  # 将 progress 中仍为 pending 的 change 标记为 skipped-auto（reason=aborted）
+  for REMAINING_SEQ in $(npc state get ".progress | to_entries[] | select(.value.status==\"pending\") | .key+1"); do
+    npc state set-progress --seq $REMAINING_SEQ --status skipped-auto --reason aborted
+  done
+  # 直接进 Step 4 finalize
+  ```
+
+**不打断用户。**
 
 **交互档**：用 **AskUserQuestion** 把局面（哪个 change、blocking_trend、stale 原因）摆给用户，选项映射到上面四个 action，按用户选择执行。
 
@@ -241,15 +433,17 @@ SPINE_BRANCH=$(echo "$FINAL" | jq -r '.spine_branch // empty')
 ## Guardrails（硬约束）
 
 - **你不写业务代码**。所有实现/修复一律交给 coder：claude 后端默认经 in-session subagent（`deferred=true`）执行，mimo 后端经 headless 子进程执行。你只触发 `npc implement/fix run`，按 `deferred` 分发，收 RESULT 行，调 npc 装订。
+- **record 返回值是 coder 成败的唯一真相**：`npc implement record` / `npc fix record` 返回 `.ok=false` 或 `.status=needs-user-decision` 时，**绝不继续 review/archive**，必须立即进入 3d 决策点（trigger=`implementer-failed` 或 `fixer-failed`）。deferred=true 时 `npc implement/fix run` 的 `.ok` 仅代表 prompt 渲染成功，**不得**当作 coder 执行成功的依据。
 - **生成 ⊥ 验证（不变量 1）**：coder（生成）与 review（验证）永不同源。coder 跑 MiMo 时，`npc review run` 必须仍走 codex/Claude——绝不把 review 路由到 MiMo。
 - **MiMo 只许执行（不变量 4）**：MiMo 仅用于 coder 层。你（主 session 决策）和 `/spine-analyze`（分析）、`npc review run`（验证）一律 premium 层（Claude/codex），绝不路由到 MiMo。
 - **你不读 prompt 模板 / review.json / summary.md 原文**。只读 npc 子命令返回的一行 JSON 的关键字段。需要细节时引用 npc 给的 `pointer` 路径，不要把原文拉进 context。
 - **每个 npc 命令后检查 `.ok` 与 exit code**：exit 1 业务失败 / 2 用法错 / 3 环境错 / 4 依赖缺失。依赖缺失（4）立即停并提示安装。
 - **review-fix 循环必须有上限**（默认 20 轮）且尊重 `stale` 闸门——绝不无限打磨。
+- **in-session coder spawn 必须带 timeout 预算**：deferred=true 路径（3a implement、3b fix）spawn spine-coder 前 **MUST** 先调 `npc agent timeout-budget --seq N --phase <phase>` 获取当次预算，以该预算监督 Task 执行；超时 **MUST** 调 `npc agent record-timeout` 记账；预算耗尽 **MUST** 以 `--trigger agent-timeout-exhausted` 调用 `npc auto-decide`。**in-session 路径绝不无限等待 coder。**
 - **auto 档绝不调用 AskUserQuestion**——范围、计划、执行决策一律用确定性默认或 `npc auto-decide` 自主解决；只有硬依赖缺失（exit 4）或缺人类凭据这类**客观阻塞**才停。交互档绝不在未确认时执行破坏性动作（archive / abort）。
 - **worktree 隔离**：`npc init` 返回 `worktree_root` 后，整个 run 期间所有 npc 子命令与 coder spawn 均在该 worktree 内执行。主 checkout 在 run 期间不受任何写操作影响。续跑必须 cd 进悬空 worktree，不新建。
 - **ff-only，不自作主张推远端**：finalize 仅在顶层 status=`completed` 且 fast-forward 干净时才合回 `base_branch`；合回失败（分叉）则保留 `spine_branch` 留人决策——不执行 `git push`、不强制 merge、不删分支。
-- **auto 档的工具权限由 `npc init --auto` 自我预备**：init 会把授权写到**主 checkout**（live session 真正加载 settings 的位置，非 worktree）——`settings.json` 置 `defaultMode=acceptEdits` + harness Bash 白名单（可共享），`settings.local.json` 置 `additionalDirectories`（worktree 根 / task_log 等 cwd 外受信目录，机器专属绝对路径，gitignore，不污染可提交的 settings.json）。这消除了 worktree 内读/改文件的弹窗。合并、幂等、坏 JSON 不覆盖，失败不阻塞 init。极端无人值守可再叠加 `bypassPermissions`，但通常无需。
+- **auto 档的工具权限由 `npc init --auto` 自我预备**：init 会把授权写到**主 checkout**（live session 真正加载 settings 的位置，非 worktree）——`settings.json` 置 `defaultMode=acceptEdits` + harness Bash 白名单（可共享），`settings.local.json` 置 `additionalDirectories`（worktree 根 / task_log 等 cwd 外受信目录，机器专属绝对路径，gitignore，不污染可提交的 settings.json）+ **破坏性操作 deny 底线**（`Bash(git push --force*)`、`Bash(git reset --hard*)`、`Edit(.git/**)`）。deny 底线以并集追加、不改用户已有 deny，幂等。这消除了 worktree 内读/改文件的弹窗。合并、幂等、坏 JSON 不覆盖，失败不阻塞 init。极端无人值守可再叠加 `bypassPermissions`，但通常无需。**deny 属 settings 层、不进 context，compaction 后仍恒定生效**——这是 prompt 层约束做不到的。
 - **续跑优先**：`npc init` 报 `needs_resume` 时永远先 `resume detect` 接断点，cd 进悬空 worktree，不要新建覆盖。
 - **change 粒度单一**：拆解目标时，一个 change 只做一件可独立交付的事；过大就再拆。
 - 全程用 **TodoWrite** 反映真实进度，让用户可实时观察这个长时 run。

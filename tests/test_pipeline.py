@@ -13,7 +13,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from npc import pipeline as _pipeline
+from npc import paths as _paths
 from npc import state as _state
+from npc import verify as _verify
+from npc import config as _config
 
 
 # ============================================================
@@ -208,10 +211,22 @@ def _stub_claude_writes_review(review_payload: dict):
 
 
 def test_run_review_round_uses_claude_when_engine_name_override(
-    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """显式 engine_name='claude' 应路由到 _claude_exec，不调 _codex_exec。"""
+    """显式 engine_name='claude' 应路由到 _claude_exec，不调 _codex_exec。
+
+    注：需提供 coder model 与 review.claude.model 不同的配置，确保不触发
+    gen_not_orthogonal（coder=claude-sonnet vs review=claude-opus → 不同源）。
+    """
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder 与 review 用不同 model → 不同源，不触发 gen_not_orthogonal
+    cfg_path = tmp_path / "npc-diff-model.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
 
     review_payload = {"verdict": "approve", "findings": []}
 
@@ -235,7 +250,7 @@ def test_run_review_round_uses_claude_when_engine_name_override(
     p = env_setup
     p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
 
-    result = _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="claude")
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="claude", config_path=cfg_path)
     assert result["ok"] is True
     assert result["engine"] == "claude"
     assert result["verdict"] == "approve"
@@ -275,9 +290,17 @@ def test_run_review_round_claude_from_config_toml(
 
 
 def test_run_review_round_claude_fails_then_retry_fails(
-    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder 与 review 用不同 model → 不同源，不触发 gen_not_orthogonal
+    cfg_path = tmp_path / "npc-diff-model.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
 
     calls = []
 
@@ -297,7 +320,7 @@ def test_run_review_round_claude_fails_then_retry_fails(
     p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
 
     result = _pipeline.run_review_round(
-        p_with_repo, 1, 0, retries=1, engine_name="claude"
+        p_with_repo, 1, 0, retries=1, engine_name="claude", config_path=cfg_path
     )
     assert result["ok"] is False
     assert result["error"] == "claude-exec-failed"
@@ -494,3 +517,825 @@ def test_run_archive_precheck_fails(env_setup, make_args, capsys, fake_repo: Pat
     assert result["ok"] is False
     assert result["error"] == "commit-chain-broken"
     assert "deadbeef" in result["missing"][0]
+
+
+# ============================================================
+# archive-structured-errors: git add / _git_head 失败仍输出结构化 JSON
+# ============================================================
+
+
+def _make_archive_ready(env_setup, make_args, capsys, fake_repo: Path):
+    """Bootstrap state so run_archive can reach the git steps."""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 写入一个真实的 implement_commit
+    (fake_repo / "i.txt").write_text("a")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "impl"], cwd=fake_repo, check=True)
+    impl_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    def mutate(s):
+        e = s["progress"][0]
+        e["implement_commit"] = impl_commit
+        e["phases"] = {
+            "implement": {"status": "done", "commit": impl_commit, "started_ms": 0, "started_at": "x"}
+        }
+
+    _state.update_state(p.state_json, p.state_md, mutate)
+    return p_with_repo
+
+
+def _fake_run_openspec_ok(real_run):
+    """返回一个 subprocess.run 替换，openspec 命令总返回 0，其余走真实调用。"""
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        return real_run(cmd, *args, **kwargs)
+
+    return fake_run
+
+
+def test_run_archive_git_add_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: git add 因 index.lock 失败仍返回单行 JSON（ok=false, error=git-add-failed）。"""
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["git", "add"]:
+            exc = subprocess.CalledProcessError(128, cmd, stderr="fatal: Unable to create index.lock")
+            exc.stderr = "fatal: Unable to create index.lock"
+            raise exc
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：返回值是结构化 dict，ok=false，error=git-add-failed
+    assert result["ok"] is False
+    assert result["error"] == "git-add-failed"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化（等价于 stdout 是合法 JSON）
+    serialized = json.dumps(result)
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-add-failed"
+
+
+def test_run_archive_git_add_failed_no_traceback_in_output(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: stdout 不含 traceback 字样（无裸 traceback 泄漏到 stdout）。"""
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["git", "add"]:
+            exc = subprocess.CalledProcessError(128, cmd, stderr="fatal: index.lock exists")
+            exc.stderr = "fatal: index.lock exists"
+            raise exc
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 结果序列化为 JSON 后不含 "Traceback"
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    assert result["ok"] is False
+
+
+def test_run_archive_git_head_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: _git_head 失败 → stdout 单行 JSON ok=false, error=git-head-failed，无裸 traceback。"""
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # openspec/ 目录需存在，让 git add 和 git commit 能成功
+    (fake_repo / "openspec").mkdir(exist_ok=True)
+    (fake_repo / "openspec" / "x.md").write_text("dummy")
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        if isinstance(cmd, list) and cmd[:2] == ["git", "rev-parse"]:
+            exc = subprocess.CalledProcessError(128, cmd, stderr="fatal: not a git repository")
+            exc.stderr = "fatal: not a git repository"
+            raise exc
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    assert result["ok"] is False
+    assert result["error"] == "git-head-failed"
+
+    # 验证 JSON 可序列化且不含 Traceback
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-head-failed"
+
+
+def test_run_archive_check_chain_git_missing_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: check_chain 在 git 二进制缺失时抛 RuntimeError，run_archive 应将其转换为
+    结构化 JSON（ok=false, error=git-missing），而非让裸异常逃逸到 CLI 层被标为 dependency_missing exit 4。
+    这是 F1 修复的回归测试：验证 precheck 阶段的 git-missing 路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 模拟 git_chain.check_chain 因 git 缺失抛 RuntimeError
+    import npc.git_chain as _git_chain_mod
+
+    def fake_check_chain(repo_root, entry):
+        raise RuntimeError("未找到 git 命令")
+
+    monkeypatch.setattr(_git_chain_mod, "check_chain", fake_check_chain)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：异常被转化为结构化错误，而非裸 traceback
+    assert result["ok"] is False
+    assert result["error"] == "git-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-missing"
+
+
+def test_run_archive_git_commit_fnf_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: git commit 的 subprocess.run 因 git 二进制缺失抛 FileNotFoundError，
+    run_archive 应将其转换为结构化 JSON（ok=false, error=git-missing），而非被 CLI 层
+    捕获为 dependency_missing exit 4。
+    这是 F1 修复的回归测试：验证 git commit 阶段的 git-missing 路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 创建 openspec/ 内容让 git add 能在真实 git 上成功
+    (fake_repo / "openspec").mkdir(exist_ok=True)
+    (fake_repo / "openspec" / "x.md").write_text("dummy")
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        if isinstance(cmd, list) and cmd[:2] == ["git", "commit"]:
+            raise FileNotFoundError(2, "No such file or directory: 'git'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：FileNotFoundError 被转化为结构化错误
+    assert result["ok"] is False
+    assert result["error"] == "git-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化且不含 Traceback
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-missing"
+
+
+# ============================================================
+# archive-structured-errors round-2: openspec 启动失败路径回归
+# ============================================================
+
+
+def test_run_archive_openspec_missing_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: _find_openspec_bin 找不到 openspec（FileNotFoundError），
+    run_archive 必须返回结构化 JSON（ok=false, error=openspec-missing, exit 1），
+    不得逃逸到 cli_archive_run 的通用分支以 dependency_missing / exit 4 退出。
+    这是 F1 round-2 修复的核心回归：覆盖 openspec 缺失路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 模拟 _find_openspec_bin 抛 FileNotFoundError（openspec 不在 PATH）
+    def fake_find_openspec_bin(override=None):
+        raise FileNotFoundError("未在 PATH 中找到 openspec 命令")
+
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", fake_find_openspec_bin)
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：异常被内部捕获并转化为结构化错误，不逃逸
+    assert result["ok"] is False
+    assert result["error"] == "openspec-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化（等价于 CLI 可输出单行 JSON）
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-missing"
+
+
+def test_run_archive_openspec_validate_subprocess_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: openspec validate 的 subprocess.run 因路径无效抛 FileNotFoundError
+    （--openspec-bin 指向不可执行路径），run_archive 必须将其转化为结构化 JSON
+    （ok=false, error=openspec-subprocess-failed），而非逃逸为 dependency_missing exit 4。
+    这是 F1 round-2 修复的回归测试：覆盖 openspec validate 启动失败路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "validate":
+            raise FileNotFoundError(2, "No such file or directory: '/bad/openspec'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # _find_openspec_bin 返回一个路径，但该路径在 subprocess.run 时不可执行
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/bad/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    assert result["ok"] is False
+    assert result["error"] == "openspec-subprocess-failed"
+    assert result["seq"] == 1
+
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-subprocess-failed"
+
+
+def test_run_archive_openspec_archive_subprocess_failed_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: openspec archive 的 subprocess.run 因路径无效抛 OSError（例如 EACCES），
+    run_archive 必须将其转化为结构化 JSON（ok=false, error=openspec-subprocess-failed），
+    而非逃逸为 dependency_missing exit 4。
+    这是 F1 round-2 修复的回归测试：覆盖 openspec archive 启动失败路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "validate":
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0] and cmd[1] == "archive":
+            raise OSError(13, "Permission denied: '/bad/openspec'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/bad/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    assert result["ok"] is False
+    assert result["error"] == "openspec-subprocess-failed"
+    assert result["seq"] == 1
+
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "openspec-subprocess-failed"
+
+
+# ============================================================
+# 接线测试：run_review_round routing guard（wire-verify-routing）
+# ============================================================
+
+
+def _make_p_with_repo(env_setup, fake_repo: Path):
+    """把 env_setup Paths 的 repo_root 替换为 fake_repo。"""
+    p = env_setup
+    return type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+
+def test_run_review_round_rejects_mimo_in_review_model(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review claude_model 含 mimo → run_review_round 拒绝执行并返回 routing-violation。
+
+    接线测试：断言不变量 4（review 永不路由 MiMo）在 run_review_round 入口被强制。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 构造含 mimo 的 review 配置（claude_model 含 "mimo"）
+    cfg_path = tmp_path / "npc-mimo.toml"
+    cfg_path.write_text(
+        '[review]\nengine = "claude"\n[review.claude]\nmodel = "mimo-v2.5-pro"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "mimo_exec_only" in rules
+
+
+def test_run_review_round_rejects_review_same_source_as_coder(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: review 与 coder 同源（相同 claude bin+model）→ 拒绝执行 routing-violation。
+
+    接线测试：断言不变量 1（生成⊥验证）在 run_review_round 入口被强制。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder=claude(bin=claude, model=claude-opus-4-8) 与 review=claude(同 bin+model) → 同源
+    cfg_path = tmp_path / "npc-same.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-opus-4-8"\n'
+        '[review]\nengine = "claude"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "gen_not_orthogonal" in rules
+
+
+def test_run_review_round_allows_legal_routing(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 合法路由（coder=claude，review=codex）→ check_routing 无 violation，review 正常进入原逻辑。
+
+    接线测试：断言合法配置不被路由守卫误拦。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 合法：coder=claude, review=codex（不同源、不含 mimo）
+    cfg_path = tmp_path / "npc-legal.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\n[review]\nengine = "codex"\n',
+        encoding="utf-8",
+    )
+
+    review_payload = {"verdict": "approve", "findings": []}
+    monkeypatch.setattr(_pipeline, "_codex_exec", _stub_codex_writes_review(review_payload))
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert result["verdict"] == "approve"
+    assert result.get("error") != "routing-violation"
+
+
+def test_run_review_round_rejects_engine_name_cli_override_same_source(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review.engine=codex（通过校验），但 CLI --engine claude 覆盖后
+    coder 与 review 同源（gen_not_orthogonal）→ 守卫必须用实际执行 engine 校验，拒绝执行。
+
+    回归测试 F1：确保 engine_name CLI 覆盖场景下路由守卫检验的是实际执行的 engine，
+    而非原始 cfg 中的 review.engine（codex），否则违规路由会绕过守卫。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 配置：coder=claude(bin=claude, model=claude-opus-4-8)，review.engine=codex
+    # 若不修复：check_routing 看到 review.engine=codex，与 coder=claude 不同源 → 通过
+    # 修复后：CLI engine_name="claude" 覆盖，check_routing 看到 review.engine=claude，
+    #          与 coder 完全同源（同 bin+model）→ gen_not_orthogonal → 拒绝
+    cfg_path = tmp_path / "npc-codex-base.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-opus-4-8"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path, engine_name="claude")
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "gen_not_orthogonal" in rules
+
+
+def test_run_review_round_allows_engine_name_cli_override_different_source(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review.engine=codex，CLI --engine claude 覆盖，但 coder 与 review
+    使用不同 model → 不同源，路由守卫应放行。
+
+    回归测试 F1 正向场景：确保合法的 CLI engine 覆盖不会被误拒。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder=claude(model=claude-sonnet)，review.claude.model=claude-opus → 不同源，合法
+    cfg_path = tmp_path / "npc-cli-claude-diff.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    review_payload = {"verdict": "approve", "findings": []}
+    monkeypatch.setattr(_pipeline, "_claude_exec", _stub_claude_writes_review(review_payload))
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path, engine_name="claude")
+    assert result["ok"] is True
+    assert result.get("error") != "routing-violation"
+
+
+# ============================================================
+# wire-verify-tests：record 阶段对 coder 自报 tests=pass 做真实复跑
+# ============================================================
+
+def _make_commit_and_summary(fake_repo: Path, p) -> tuple[str, Path]:
+    """辅助：在 fake_repo 创建一个 commit + summary 文件，返回 (commit_hash, summary_path)。"""
+    (fake_repo / "wire_test.txt").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "wire: test"], cwd=fake_repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+    summary = p.run_dir / "001-add-foo" / "implement.summary.md"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text("# summary\n")
+    return commit, summary
+
+
+def test_record_implement_rerun_fail_overrides_self_report(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.1：复跑失败覆盖 coder 自报 → ok=False, tests_verified=False。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    # 注入 run_tests_result：复跑失败
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "1 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    # 配置 rerun_tests=true（显式开启，不依赖 NPC_MODE）
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert result["tests"] == "fail"  # F1 regression: rerun failure must override self-report
+    assert result["tests_verified"] is False
+    assert "failed" in result.get("rerun_tail", "")
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "failed"
+    # phase record must also carry tests="fail" so consumers see the override
+    phase_record = s["progress"][0]["phases"]["implement"]
+    assert phase_record.get("tests") == "fail"
+
+
+def test_record_implement_rerun_pass_sets_verified_true(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.2：复跑通过 → ok=True, tests_verified=True。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": True, "cmd": "pytest", "tail": "1 passed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is True
+    assert result["tests_verified"] is True
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "reviewing"
+
+
+def test_record_implement_rerun_disabled_skips_verify(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.3：rerun_tests=false → 不复跑，行为与现状一致，tests_verified=None。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    call_count = {"n": 0}
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        call_count["n"] += 1
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "fail"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=False)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    # 没有复跑：call_count 仍为 0
+    assert call_count["n"] == 0
+    # record 成功（采信自报）
+    assert result["ok"] is True
+    assert result.get("tests_verified") is None
+
+
+def test_record_implement_rerun_no_command_degrades_gracefully(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario 3.4：探测不到测试命令 → tests_verified=None，record 不失败。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": True}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    assert result["ok"] is True
+    assert result["tests_verified"] is None
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "reviewing"
+
+
+def test_record_fix_rerun_fail_overrides_self_report(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """record_fix 同样支持复跑失败覆盖自报。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    (fake_repo / "fix_wire.txt").write_text("fix")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fix: wire"], cwd=fake_repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+    base = p.run_dir / "001-add-foo"
+    base.mkdir(parents=True, exist_ok=True)
+    summary = base / "round-1.fix.summary.md"
+    summary.write_text("# fix summary\n")
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "2 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+
+    result_line = (
+        f"RESULT: commit={commit} fixed=1 tests=pass summary={summary} "
+        f"categories_scanned=validation regressions_added=- notes=-"
+    )
+    result = _pipeline.record_fix(p_with_repo, 1, 1, result_line)
+
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert result["tests"] == "fail"  # F2 regression: rerun failure must override self-report in fix path
+    assert result["tests_verified"] is False
+
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "needs-user-decision"
+    # phase record must also carry tests="fail" so consumers see the override
+    phase_record = s["progress"][0]["phases"]["fix-r1"]
+    assert phase_record.get("tests") == "fail"
+
+
+# ============================================================
+# F1 回归：p.mode="auto" 时（NPC_MODE 未设置）应触发复跑
+# ============================================================
+
+
+def test_should_rerun_tests_mode_auto_in_paths_no_env(monkeypatch):
+    """_should_rerun_tests：p.mode=auto 且 NPC_MODE 未设置 → 触发复跑。
+
+    回归：auto 档默认编排路径不导出 NPC_MODE 环境变量（--shell-exports deprecated），
+    须从 p.mode（run.json 持久化）读取 mode 决定缺省值。
+    """
+    # 确保 NPC_MODE 不在环境中
+    monkeypatch.delenv("NPC_MODE", raising=False)
+
+    cfg = _config.Config(verify=_config.VerifyConfig(rerun_tests=None))  # 缺省
+
+    # 构造 mode=auto 的 Paths（仅 mode 字段有意义，其余字段置 dummy）
+    import dataclasses
+    dummy_path = Path("/tmp/dummy")
+    p_auto = _paths.Paths(
+        repo_root=dummy_path,
+        proj_key="dummy",
+        task_log_dir=dummy_path,
+        run_ts="2026-01-01-0000-00000",
+        run_dir=dummy_path,
+        state_json=dummy_path / "state.json",
+        state_md=dummy_path / "state.md",
+        index_file=dummy_path / "index.jsonl",
+        schema_path=dummy_path / "schema.json",
+        run_events=dummy_path / "events.jsonl",
+        mode="auto",
+    )
+    p_interactive = dataclasses.replace(p_auto, mode="interactive")
+
+    # auto 档：NPC_MODE 未设置，p.mode=auto → 应复跑
+    assert _pipeline._should_rerun_tests(cfg, p_auto) is True
+
+    # interactive 档：NPC_MODE 未设置，p.mode=interactive → 不复跑
+    assert _pipeline._should_rerun_tests(cfg, p_interactive) is False
+
+    # p=None 时（旧调用路径）→ 不复跑
+    assert _pipeline._should_rerun_tests(cfg, None) is False
+
+
+def test_should_rerun_tests_env_overrides_paths_mode(monkeypatch):
+    """NPC_MODE 环境变量优先于 p.mode（兼容旧 --shell-exports 路径）。"""
+    # NPC_MODE=auto 但 p.mode=interactive → 应复跑（env 优先）
+    monkeypatch.setenv("NPC_MODE", "auto")
+    cfg = _config.Config(verify=_config.VerifyConfig(rerun_tests=None))
+
+    import dataclasses
+    dummy_path = Path("/tmp/dummy")
+    p_interactive = _paths.Paths(
+        repo_root=dummy_path,
+        proj_key="dummy",
+        task_log_dir=dummy_path,
+        run_ts="2026-01-01-0000-00000",
+        run_dir=dummy_path,
+        state_json=dummy_path / "state.json",
+        state_md=dummy_path / "state.md",
+        index_file=dummy_path / "index.jsonl",
+        schema_path=dummy_path / "schema.json",
+        run_events=dummy_path / "events.jsonl",
+        mode="interactive",
+    )
+    assert _pipeline._should_rerun_tests(cfg, p_interactive) is True
+
+    # NPC_MODE=interactive 但 p.mode=auto → 不复跑（env 优先）
+    monkeypatch.setenv("NPC_MODE", "interactive")
+    p_auto = dataclasses.replace(p_interactive, mode="auto")
+    assert _pipeline._should_rerun_tests(cfg, p_auto) is False
+
+
+def test_record_implement_auto_mode_rerun_via_paths(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """F1 回归：record_implement 在 NPC_MODE 未设置、p.mode=auto 时触发真实复跑。
+
+    模拟 npc init --auto 的默认编排路径（不设 NPC_MODE）。
+    """
+    monkeypatch.delenv("NPC_MODE", raising=False)
+
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    # 注入 p.mode=auto（模拟 run.json 里写了 mode=auto）
+    import dataclasses
+    p_auto = dataclasses.replace(p, mode="auto")
+    p_with_repo = dataclasses.replace(p_auto, repo_root=fake_repo)
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    rerun_called = {"n": 0}
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        rerun_called["n"] += 1
+        return {"no_command": False, "passed": True, "cmd": "pytest", "tail": "1 passed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=None)  # 显式缺省 → 由 p.mode 决定
+        ),
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+
+    # p.mode=auto 应触发复跑
+    assert rerun_called["n"] == 1, "auto 档缺省时应触发真实复跑"
+    assert result["ok"] is True
+    assert result["tests_verified"] is True

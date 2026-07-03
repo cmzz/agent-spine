@@ -13,7 +13,9 @@ metrics 解析、phase/state 装订、git commit 等全部下沉到 CLI；LLM �
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -30,6 +32,7 @@ from . import (
     review as _review,
     state as _state,
     telemetry as _telemetry,
+    verify as _verify,
 )
 from .config import Config, ConfigError, load_config
 from .engines import (
@@ -40,6 +43,27 @@ from .engines import (
     get_engine,
 )
 from .trend import STALE_THRESHOLD
+
+
+def _should_rerun_tests(cfg: Config, p: _paths.Paths | None = None) -> bool:
+    """判断 record 阶段是否应对 coder 自报 tests=pass 做真实复跑。
+
+    优先级：
+    1. ``cfg.verify.rerun_tests`` 显式配置 → 直接用。
+    2. ``NPC_MODE`` 环境变量 → 兼容 --shell-exports 旧路径。
+    3. ``p.mode``（从 run.json 持久化读取）→ npc init --auto 的默认编排路径，
+       不经 --shell-exports 导出环境变量，通过 run.json 传递 mode。
+    4. 三者均缺省 → False（interactive 默认不复跑）。
+    """
+    explicit = cfg.verify.rerun_tests
+    if explicit is not None:
+        return explicit
+    env_mode = os.environ.get("NPC_MODE")
+    if env_mode is not None:
+        return env_mode == "auto"
+    if p is not None:
+        return p.mode == "auto"
+    return False
 
 
 def _iso_to_ms(iso_str: str | None) -> int | None:
@@ -513,7 +537,23 @@ def run_review_round(
         raise ValueError(
             f"未知 review engine：{engine_name!r}（仅支持 codex / claude）"
         )
+
+    # 解析实际将执行的 review engine（engine_name CLI 参数优先于配置文件）
+    # 必须在 check_routing 之前确定，确保守卫校验的是实际执行的 engine，而非原始配置值。
     selected_engine = (engine_name or review_cfg.engine).lower()
+
+    # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝。
+    # 若 CLI 传入 engine_name 覆盖了配置中的 review.engine，需用覆盖后的值做校验，
+    # 否则会出现"按旧 engine 通过校验、按新 engine 实际执行"的漏洞。
+    if engine_name and engine_name.lower() != review_cfg.engine.lower():
+        effective_review_cfg = dataclasses.replace(review_cfg, engine=selected_engine)
+        effective_cfg = dataclasses.replace(cfg, review=effective_review_cfg)
+    else:
+        effective_cfg = cfg
+    violations = _verify.check_routing(effective_cfg)
+    if violations:
+        _io.emit({"ok": False, "error": "routing-violation", "violations": violations})
+        raise SystemExit(1)
 
     state = _state.read_state(p.state_json)
     entry = _get_entry(state, seq)
@@ -730,14 +770,26 @@ def run_review_round(
 # ============================================================
 
 
+class _GitHeadError(Exception):
+    """git rev-parse HEAD 失败时抛出，携带 stderr 摘要。"""
+
+    def __init__(self, stderr_summary: str) -> None:
+        self.stderr_summary = stderr_summary
+        super().__init__(stderr_summary)
+
+
 def _git_head(repo_root: Path) -> str:
-    out = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repo_root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        stderr = getattr(exc, "stderr", "") or ""
+        raise _GitHeadError(stderr.strip()[:500]) from exc
     return out.stdout.strip()
 
 
@@ -759,7 +811,25 @@ def run_archive(
     _do_phase_enter(p, seq, "archive")
 
     # 1. precheck（commit chain）
-    chain = _git_chain.check_chain(p.repo_root, entry)
+    try:
+        chain = _git_chain.check_chain(p.repo_root, entry)
+    except RuntimeError as exc:
+        # git 二进制缺失时 check_chain 内部抛 RuntimeError("未找到 git 命令")
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "git-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-missing",
+            "detail": str(exc),
+        }
     if not chain.get("ok"):
         _do_phase_exit(
             p,
@@ -777,15 +847,49 @@ def run_archive(
             "missing": chain.get("missing", []),
         }
 
-    osp = _find_openspec_bin(openspec_bin)
+    try:
+        osp = _find_openspec_bin(openspec_bin)
+    except FileNotFoundError as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-missing",
+            "detail": str(exc),
+        }
 
     # 2. openspec validate --strict
-    val = subprocess.run(
-        [osp, "validate", change_id, "--strict"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        val = subprocess.run(
+            [osp, "validate", change_id, "--strict"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-subprocess-failed", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-subprocess-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-subprocess-failed",
+            "detail": str(exc),
+        }
     if val.returncode != 0:
         _do_phase_exit(
             p,
@@ -804,12 +908,29 @@ def run_archive(
         }
 
     # 3. openspec archive --yes
-    arc = subprocess.run(
-        [osp, "archive", change_id, "--yes"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        arc = subprocess.run(
+            [osp, "archive", change_id, "--yes"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-subprocess-failed", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "openspec-subprocess-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-subprocess-failed",
+            "detail": str(exc),
+        }
     if arc.returncode != 0:
         _do_phase_exit(
             p,
@@ -828,13 +949,55 @@ def run_archive(
         }
 
     # 4. git add + commit
-    subprocess.run(["git", "add", "openspec/"], cwd=p.repo_root, check=True)
-    commit = subprocess.run(
-        ["git", "commit", "-m", f"chore: archive {change_id}"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        subprocess.run(
+            ["git", "add", "openspec/"],
+            cwd=p.repo_root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        stderr = getattr(exc, "stderr", "") or ""
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-add-failed", "stderr": stderr.strip()[:2000]},
+            progress_updates={"status": "failed", "reason": "git-add-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-add-failed",
+            "stderr_tail": stderr.strip()[-1000:],
+        }
+    try:
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"chore: archive {change_id}"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        # git 二进制完全缺失时 subprocess.run 自身抛 FileNotFoundError
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "git-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-missing",
+            "detail": str(exc),
+        }
     if commit.returncode != 0:
         _do_phase_exit(
             p,
@@ -851,7 +1014,24 @@ def run_archive(
             "error": "git-commit-failed",
             "stderr_tail": commit.stderr.strip()[-1000:],
         }
-    archive_commit = _git_head(p.repo_root)
+    try:
+        archive_commit = _git_head(p.repo_root)
+    except _GitHeadError as exc:
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-head-failed", "stderr": exc.stderr_summary},
+            progress_updates={"status": "failed", "reason": "git-head-failed"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-head-failed",
+            "stderr_tail": exc.stderr_summary,
+        }
 
     # 5. 计算 total_rounds = 最大 review-rN 索引
     phases = entry.get("phases") or {}
@@ -1017,10 +1197,52 @@ def record_implement(
         )
         return {"ok": False, "seq": seq, "error": "commit-not-found", "commit": commit}
 
+    # 真实复跑验证（tests=pass 自报硬轨）
+    tests_verified: bool | None = None
+    rerun_tail: str | None = None
+    try:
+        cfg = load_config(p.repo_root)
+    except ConfigError:
+        cfg = Config()
+    if _should_rerun_tests(cfg, p):
+        rerun = _verify.run_tests_result(p.repo_root, cfg)
+        if rerun.get("no_command"):
+            tests_verified = None  # 探测不到命令：降级，不阻塞
+        elif rerun["passed"]:
+            tests_verified = True
+        else:
+            tests_verified = False
+            rerun_tail = rerun.get("tail", "")
+            _do_phase_exit(
+                p, seq, "implement",
+                status="failed",
+                extra={
+                    "reason": "rerun-tests-failed",
+                    "tests": "fail",
+                    "tests_verified": False,
+                    "rerun_tail": rerun_tail,
+                },
+                progress_updates={"status": "failed", "reason": "rerun-tests-failed"},
+            )
+            return {
+                "ok": False,
+                "seq": seq,
+                "error": "rerun-tests-failed",
+                "tests": "fail",
+                "tests_verified": False,
+                "rerun_tail": rerun_tail,
+            }
+
     _do_phase_exit(
         p, seq, "implement",
         status="done",
-        extra={"commit": commit, "tasks": tasks, "tests": tests, "summary": summary_path},
+        extra={
+            "commit": commit,
+            "tasks": tasks,
+            "tests": tests,
+            "summary": summary_path,
+            "tests_verified": tests_verified,
+        },
         progress_updates={"status": "reviewing", "implement_commit": commit},
     )
     return {
@@ -1031,6 +1253,7 @@ def record_implement(
         "tasks": tasks,
         "tests": tests,
         "summary": summary_path,
+        "tests_verified": tests_verified,
     }
 
 
@@ -1123,6 +1346,43 @@ def record_fix(
         )
         return {"ok": False, "seq": seq, "round": round_n, "error": "commit-not-found"}
 
+    # 真实复跑验证（tests=pass 自报硬轨）
+    tests_verified: bool | None = None
+    rerun_tail: str | None = None
+    try:
+        cfg = load_config(p.repo_root)
+    except ConfigError:
+        cfg = Config()
+    if _should_rerun_tests(cfg, p):
+        rerun = _verify.run_tests_result(p.repo_root, cfg)
+        if rerun.get("no_command"):
+            tests_verified = None  # 探测不到命令：降级，不阻塞
+        elif rerun["passed"]:
+            tests_verified = True
+        else:
+            tests_verified = False
+            rerun_tail = rerun.get("tail", "")
+            _do_phase_exit(
+                p, seq, phase,
+                status="failed",
+                extra={
+                    "reason": "rerun-tests-failed",
+                    "tests": "fail",
+                    "tests_verified": False,
+                    "rerun_tail": rerun_tail,
+                },
+                progress_updates={"status": "needs-user-decision", "reason": f"rerun-tests-failed-r{round_n}"},
+            )
+            return {
+                "ok": False,
+                "seq": seq,
+                "round": round_n,
+                "error": "rerun-tests-failed",
+                "tests": "fail",
+                "tests_verified": False,
+                "rerun_tail": rerun_tail,
+            }
+
     _do_phase_exit(
         p, seq, phase,
         status="done",
@@ -1133,6 +1393,7 @@ def record_fix(
             "summary": summary_path,
             "categories_scanned": parsed.get("categories_scanned", ""),
             "regressions_added": parsed.get("regressions_added", ""),
+            "tests_verified": tests_verified,
         },
         progress_updates={"status": "in-fix-loop"},
     )
@@ -1145,6 +1406,7 @@ def record_fix(
         "fixed": fixed,
         "tests": tests,
         "summary": summary_path,
+        "tests_verified": tests_verified,
     }
 
 
@@ -1200,7 +1462,13 @@ def cli_archive_run(args: argparse.Namespace) -> None:
     try:
         result = run_archive(p, args.seq, openspec_bin=args.openspec_bin)
     except FileNotFoundError as e:
-        _io.emit_error("dependency_missing", str(e), exit_code=4)
+        # run_archive 内部已处理 openspec-missing 路径；此处捕获其他意外缺失依赖。
+        # 按 archive-error-contract：任何失败均以 exit 1 退出。
+        _io.emit_error("openspec-missing", str(e), exit_code=1)
+        return
+    except subprocess.CalledProcessError as e:
+        stderr = (e.stderr or "").strip()[:500]
+        _io.emit_error("git-subprocess-failed", f"cmd={e.cmd} stderr={stderr}", exit_code=1)
         return
     except ValueError as e:
         _io.emit_error("invalid_args", str(e), exit_code=2)

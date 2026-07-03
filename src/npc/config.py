@@ -137,12 +137,19 @@ class CoderConfig:
 
 @dataclass(frozen=True)
 class VerifyConfig:
-    """质量门命令覆盖；任一省略则由 ``npc verify`` 按 repo 清单自动探测。"""
+    """质量门命令覆盖；任一省略则由 ``npc verify`` 按 repo 清单自动探测。
+
+    ``rerun_tests``：record 阶段是否对 coder 自报 tests=pass 做真实复跑验证。
+    - ``True``：开启（推荐用于 --auto 档）
+    - ``False``：关闭，沿用旧行为（裸信 coder 自报）
+    - ``None``（默认）：由调用方根据运行模式决定（interactive=False，auto=True）
+    """
 
     test: str | None = None
     lint: str | None = None
     typecheck: str | None = None
     build: str | None = None
+    rerun_tests: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +299,7 @@ def _build(data: dict, source: str) -> Config:
             lint=_opt_str(verify_raw.get("lint"), "verify.lint", source),
             typecheck=_opt_str(verify_raw.get("typecheck"), "verify.typecheck", source),
             build=_opt_str(verify_raw.get("build"), "verify.build", source),
+            rerun_tests=_opt_bool(verify_raw.get("rerun_tests"), "verify.rerun_tests", source),
         ),
         source=source,
     )
@@ -303,3 +311,11 @@ def _opt_str(val: object, name: str, source: str) -> str | None:
     if not isinstance(val, str):
         raise ConfigError(f"{name} 必须是字符串（{source}）")
     return val or None
+
+
+def _opt_bool(val: object, name: str, source: str) -> bool | None:
+    if val is None:
+        return None
+    if not isinstance(val, bool):
+        raise ConfigError(f"{name} 必须是 bool（{source}）")
+    return val
