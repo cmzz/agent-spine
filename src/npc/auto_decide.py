@@ -90,7 +90,8 @@ def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> di
     """纯函数：基于 entry 与 trigger 计算 action 与 mutation 指令。
 
     progress 为全量 progress 列表（可选），用于跨 change 系统性阻塞检测。
-    传入时会在前置步骤检测是否应当 abort，优先级高于单 change 判断。
+    传入时会在系统性阻塞检测步骤判断是否 abort，但 merge-evicted 与 archive-failed
+    有专属契约，排除在系统性 abort 之外。
     """
     blocking_trend = entry.get("blocking_trend") or []
     categories_seen = entry.get("categories_seen") or []
@@ -99,8 +100,23 @@ def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> di
 
     out: dict = {"trigger": trigger}
 
+    # ── 前置：merge-evicted 专门契约 ─────────────────────────────────────────
+    # merge-evicted 驱逐超限必须始终返回 skip，不参与系统性 abort 检测；
+    # 原因：驱逐是局部 merge 冲突/测试失败事件，不代表全局阻塞，
+    # 强制 abort 会违反 layer-barrier 不阻塞语义。
+    if trigger == "merge-evicted":
+        out.update(
+            {
+                "action": "skip",
+                "reason": "merge-evicted-limit-exceeded",
+                "set_status": "skipped-auto",
+                "skipped_reason": "merge-evicted",
+            }
+        )
+        return out
+
     # ── 前置：跨 change 系统性阻塞检测 ──────────────────────────────────────
-    # archive-failed 二次决策不参与系统性检测（防止误触 abort）；
+    # archive-failed 与 merge-evicted 不参与系统性检测（见各自专门契约分支）；
     # 其余 trigger 均检测。
     if trigger != "archive-failed" and _is_systemic_block(progress or [], trigger):
         out.update(
@@ -109,18 +125,6 @@ def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> di
                 "reason": "systemic-failure",
                 "set_status": "skipped-auto",
                 "set_aborted": True,
-            }
-        )
-        return out
-
-    # merge-evicted：驱逐超限 → 默认 skip（不阻塞层屏障）
-    if trigger == "merge-evicted":
-        out.update(
-            {
-                "action": "skip",
-                "reason": "merge-evicted-limit-exceeded",
-                "set_status": "skipped-auto",
-                "skipped_reason": "merge-evicted",
             }
         )
         return out

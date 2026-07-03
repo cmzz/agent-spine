@@ -441,8 +441,7 @@ class MergeQueue:
         except Exception:
             pass
 
-        # 更新 state（锁/写入失败：emit error 但继续，不阻断 eviction 逻辑本身）
-        state_write_err: str = ""
+        # 更新 state（锁/写入失败：结构化上报，不得静默跳过——调用方需知 state 未持久化）
         try:
             _state.set_parallel_fields(
                 self.state_json, self.state_md,
@@ -453,6 +452,15 @@ class MergeQueue:
         except Exception as exc:
             state_write_err = f"state write failed (evicted): {exc}"
             self._emit_telemetry("merge_state_error", entry, error=state_write_err)
+            # state 未持久化 → 编排者必须看到失败并重试/人工处理；停止后续依赖该状态的动作
+            return MergeResult(
+                change_id=entry.change_id,
+                success=False,
+                evicted=True,
+                eviction_reason=reason,
+                eviction_count=new_eviction_count,
+                error=f"{state_write_err}; eviction present but state not persisted",
+            )
 
         self._emit_telemetry(
             "merge_evicted", entry,

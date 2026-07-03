@@ -371,3 +371,63 @@ class TestCliApplyAbort:
         # 验证 last_trigger 被记录
         entry3 = state_after["progress"][2]
         assert entry3.get("last_trigger") == "implementer-failed"
+
+
+# ── F2 round-4 回归：merge-evicted 绕过系统性 abort ─────────────────
+
+class TestMergeEvictedAlwaysSkips:
+    """F2 round-4 回归：merge-evicted 触发 _decide 时始终返回 skip，
+    不受系统性 abort 拦截，即使已有大量 skipped-auto 或连续 merge-evicted 记录。
+
+    spec 契约：merge-queue-eviction spec 要求 merge-evicted 默认 action=skip，
+    写 skipped-auto / skipped_reason=merge-evicted，不阻塞层屏障。
+    """
+
+    def test_merge_evicted_returns_skip_without_progress(self):
+        """无 progress 时 merge-evicted 仍返回 skip。"""
+        entry = _entry()
+        result = _ad._decide(entry, "merge-evicted", [])
+        assert result["action"] == "skip"
+        assert result["set_status"] == "skipped-auto"
+        assert result.get("skipped_reason") == "merge-evicted"
+
+    def test_merge_evicted_returns_skip_with_high_skip_ratio(self):
+        """即使 skipped-auto 占比已超 systemic 阈值，merge-evicted 仍返回 skip（不 abort）。"""
+        heavy_skip = [_entry(status="skipped-auto") for _ in range(6)] + [
+            _entry(status="archived"),
+            _entry(status="archived"),
+        ]
+        entry = _entry()
+        result = _ad._decide(entry, "merge-evicted", heavy_skip)
+        assert result["action"] == "skip", (
+            f"merge-evicted must skip even with high skip ratio, got {result['action']}"
+        )
+        assert result.get("skipped_reason") == "merge-evicted"
+        assert result.get("set_aborted") is not True
+
+    def test_merge_evicted_returns_skip_with_consecutive_merge_evicted(self):
+        """连续多个 merge-evicted 记录（达到或超过 systemic 阈值）时仍返回 skip，不 abort。
+
+        这是 F2 的核心回归：前序已有 3 个 merge-evicted last_trigger 记录，
+        按旧逻辑 _is_systemic_block 会计为 consecutive=4 ≥ 3 → abort；
+        修复后 merge-evicted 分支在 systemic check 前返回。
+        """
+        # 3 条前序 merge-evicted 记录（连续，即系统性检测会触发 abort）
+        consecutive_evicted = [
+            _entry(last_trigger="merge-evicted") for _ in range(3)
+        ]
+        entry = _entry()
+        result = _ad._decide(entry, "merge-evicted", consecutive_evicted)
+        assert result["action"] == "skip", (
+            f"merge-evicted must always skip, even after 3 consecutive; got {result['action']}"
+        )
+        assert result["set_status"] == "skipped-auto"
+        assert result.get("skipped_reason") == "merge-evicted"
+        assert result.get("set_aborted") is not True
+
+    def test_merge_evicted_skip_reason_is_correct(self):
+        """确认 skipped_reason 字段精确值为 'merge-evicted'（供 apply 写入 state）。"""
+        entry = _entry()
+        result = _ad._decide(entry, "merge-evicted")
+        assert result.get("skipped_reason") == "merge-evicted"
+        assert result["reason"] == "merge-evicted-limit-exceeded"

@@ -657,3 +657,158 @@ def test_default_auto_decide_returns_applied_false_on_subprocess_failure(tmp_pat
 
     assert applied is False, "subprocess failure must return applied=False"
     assert action == "skip"
+
+
+# ============================================================
+# Regression F1 (round-4): evicted state write failure propagates as structured error
+# ============================================================
+
+
+def test_evicted_state_write_failure_returns_structured_error(tmp_path):
+    """F1 round-4 回归：evicted 路径的 set_parallel_fields 抛 StateLockError →
+    MergeResult(success=False, evicted=True) 且 error 含 'state write failed (evicted)'.
+    停止后续 eviction-limit 判断和 auto-decide 调用。
+
+    真实路径：monkey-patch _state.set_parallel_fields，仅当 merge_status=='evicted' 时抛出。
+    """
+    from npc import state as _state
+    from npc.merge_queue import MergeQueue, MergeQueueEntry
+
+    worktree = tmp_path / "wt" / "change-ev"
+    worktree.mkdir(parents=True)
+
+    state_json, state_md = _make_state(tmp_path, ["change-ev"])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    auto_decide_calls: list[int] = []
+
+    def verify_fn(wt):
+        return False, "test failed"
+
+    def auto_decide_fn(seq):
+        auto_decide_calls.append(seq)
+        return (True, "skip")
+
+    original_set = _state.set_parallel_fields
+
+    def patched_set(sj, sm, seq, *, merge_status=None, **kw):
+        if merge_status == "evicted":
+            raise _state.StateLockError("simulated evicted lock timeout")
+        return original_set(sj, sm, seq, merge_status=merge_status, **kw)
+
+    import npc.merge_queue as _mq
+    orig_fn = _mq._state.set_parallel_fields
+    _mq._state.set_parallel_fields = patched_set
+
+    try:
+        queue = MergeQueue(
+            run_root=tmp_path / "run_wt",
+            repo_root=tmp_path / "repo",
+            run_branch="spine/test",
+            state_json=state_json,
+            state_md=state_md,
+            run_dir=run_dir,
+            max_evictions=1,   # first eviction hits the limit; but state write fails first
+            verify_fn=verify_fn,
+            auto_decide_fn=auto_decide_fn,
+            runner=_always_ok_runner,
+        )
+
+        entry = MergeQueueEntry(
+            change_id="change-ev",
+            seq=1,
+            dag_layer=0,
+            change_branch="spine/test/change-ev",
+            exec_worktree=worktree,
+            run_branch="spine/test",
+            eviction_count=0,
+        )
+
+        result = queue.process_entry(entry)
+    finally:
+        _mq._state.set_parallel_fields = orig_fn
+
+    # Must surface as structured error
+    assert result.success is False
+    assert result.evicted is True
+    assert "state write failed (evicted)" in result.error, f"unexpected: {result.error}"
+    # auto-decide must NOT be called because we stopped on state write failure
+    assert auto_decide_calls == [], f"auto-decide should not be called after state write failure: {auto_decide_calls}"
+
+
+def test_evicted_state_write_file_not_found_returns_structured_error(tmp_path):
+    """F1 round-4 回归：evicted 路径的 set_parallel_fields 因 FileNotFoundError
+    (state_json 不存在) 返回结构化失败。
+
+    真实路径：state_json 指向不存在文件，直接触发 FileNotFoundError 于实际 set_parallel_fields 中。
+    """
+    from npc.merge_queue import MergeQueue, MergeQueueEntry
+
+    worktree = tmp_path / "wt" / "change-ev2"
+    worktree.mkdir(parents=True)
+
+    # queued 写入先成功（用真实 state），evicted 写入后删除 state_json
+    state_json, state_md = _make_state(tmp_path, ["change-ev2"])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+
+    auto_decide_calls: list[int] = []
+
+    def verify_fn(wt):
+        return False, "test failed"
+
+    def auto_decide_fn(seq):
+        auto_decide_calls.append(seq)
+        return (True, "skip")
+
+    import npc.merge_queue as _mq
+    original_set = _mq._state.set_parallel_fields
+
+    queued_written = {"done": False}
+
+    def patched_set(sj, sm, seq, *, merge_status=None, **kw):
+        if merge_status == "queued":
+            result = original_set(sj, sm, seq, merge_status=merge_status, **kw)
+            queued_written["done"] = True
+            return result
+        if merge_status == "evicted":
+            # Simulate: file gone between queued and evicted writes
+            raise FileNotFoundError("state_json removed")
+        return original_set(sj, sm, seq, merge_status=merge_status, **kw)
+
+    _mq._state.set_parallel_fields = patched_set
+
+    try:
+        queue = MergeQueue(
+            run_root=tmp_path / "run_wt",
+            repo_root=tmp_path / "repo",
+            run_branch="spine/test",
+            state_json=state_json,
+            state_md=state_md,
+            run_dir=run_dir,
+            max_evictions=2,
+            verify_fn=verify_fn,
+            auto_decide_fn=auto_decide_fn,
+            runner=_always_ok_runner,
+        )
+
+        entry = MergeQueueEntry(
+            change_id="change-ev2",
+            seq=1,
+            dag_layer=0,
+            change_branch="spine/test/change-ev2",
+            exec_worktree=worktree,
+            run_branch="spine/test",
+            eviction_count=0,
+        )
+
+        result = queue.process_entry(entry)
+    finally:
+        _mq._state.set_parallel_fields = original_set
+
+    assert queued_written["done"], "queued state should have been written first"
+    assert result.success is False
+    assert result.evicted is True
+    assert "state write failed (evicted)" in result.error, f"unexpected: {result.error}"
+    assert auto_decide_calls == [], "auto-decide must not be called after evicted state write failure"
