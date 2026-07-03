@@ -153,12 +153,35 @@ class VerifyConfig:
 
 
 @dataclass(frozen=True)
+class SchedulerConfig:
+    """并行调度配置（[scheduler] 节）。
+
+    ``max_parallel``：同层最大并发 change 数，默认 3，整数 ≥1。
+    ``max_evictions``：同一 change 的最大 merge queue 驱逐次数，默认 2，整数 ≥1。
+    """
+
+    max_parallel: int = 3
+    max_evictions: int = 2
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.max_parallel, int) or self.max_parallel < 1:
+            raise ConfigError(
+                f"[scheduler].max_parallel 必须是整数 ≥1，得到：{self.max_parallel!r}"
+            )
+        if not isinstance(self.max_evictions, int) or self.max_evictions < 1:
+            raise ConfigError(
+                f"[scheduler].max_evictions 必须是整数 ≥1，得到：{self.max_evictions!r}"
+            )
+
+
+@dataclass(frozen=True)
 class Config:
     """npc 顶层配置。"""
 
     review: ReviewEngineConfig = field(default_factory=ReviewEngineConfig)
     coder: CoderConfig = field(default_factory=CoderConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     source: str = "<default>"
 
 
@@ -277,6 +300,16 @@ def _build(data: dict, source: str) -> Config:
     if not isinstance(verify_raw, dict):
         raise ConfigError(f"[verify] 节必须是 table（{source}）")
 
+    scheduler_raw = data.get("scheduler") or {}
+    if not isinstance(scheduler_raw, dict):
+        raise ConfigError(f"[scheduler] 节必须是 table（{source}）")
+    sched_mp_raw = scheduler_raw.get("max_parallel", 3)
+    sched_me_raw = scheduler_raw.get("max_evictions", 2)
+    if not isinstance(sched_mp_raw, int):
+        raise ConfigError(f"[scheduler].max_parallel 必须是整数（{source}）")
+    if not isinstance(sched_me_raw, int):
+        raise ConfigError(f"[scheduler].max_evictions 必须是整数（{source}）")
+
     return Config(
         review=ReviewEngineConfig(
             engine=engine,
@@ -300,6 +333,10 @@ def _build(data: dict, source: str) -> Config:
             typecheck=_opt_str(verify_raw.get("typecheck"), "verify.typecheck", source),
             build=_opt_str(verify_raw.get("build"), "verify.build", source),
             rerun_tests=_opt_bool(verify_raw.get("rerun_tests"), "verify.rerun_tests", source),
+        ),
+        scheduler=SchedulerConfig(
+            max_parallel=sched_mp_raw,
+            max_evictions=sched_me_raw,
         ),
         source=source,
     )

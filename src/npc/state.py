@@ -9,10 +9,12 @@ CLI handlers：init_run / get / add_change / set_progress / finalize
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -21,6 +23,55 @@ from . import git_ops as _git_ops
 
 
 SCHEMA_VERSION = 2
+
+# ----------------------------- 文件锁 -----------------------------
+
+LOCK_FILENAME = "state.lock"
+LOCK_TIMEOUT_SECONDS = 30
+LOCK_RETRY_INTERVAL = 0.05  # 50ms
+
+
+class StateLockError(Exception):
+    """获取 state.lock 超时。"""
+
+
+def _lock_path(state_json: Path) -> Path:
+    """返回与 state_json 同目录的 state.lock 路径。"""
+    return state_json.parent / LOCK_FILENAME
+
+
+def acquire_state_lock(state_json: Path, timeout: float = LOCK_TIMEOUT_SECONDS) -> object:
+    """获取 run 级 state 互斥锁（flock），返回锁文件对象（调用方负责 release_state_lock）。
+
+    超时则抛 :class:`StateLockError`（不静默跳过）。
+    """
+    lock_file = _lock_path(state_json)
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_file, "a+")  # noqa: SIM115 - 需要跨函数保持文件句柄
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise StateLockError(
+                    f"获取 state.lock 超时（{timeout}s）：{lock_file}"
+                )
+            time.sleep(LOCK_RETRY_INTERVAL)
+
+
+def release_state_lock(lock_fh: object) -> None:
+    """释放并关闭 state 锁文件句柄。"""
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)  # type: ignore[union-attr]
+    except Exception:
+        pass
+    try:
+        lock_fh.close()  # type: ignore[union-attr]
+    except Exception:
+        pass
 
 VALID_PROGRESS_STATUS = {
     "pending",
@@ -69,11 +120,26 @@ def update_state(
     state_json: Path,
     state_md: Path,
     mutator: Callable[[dict], None],
+    *,
+    use_lock: bool = True,
 ) -> dict:
-    """读 → mutator 就地修改 → 写。返回修改后的 state。"""
-    state = read_state(state_json)
-    mutator(state)
-    write_state(state_json, state_md, state)
+    """读 → mutator 就地修改 → 写。返回修改后的 state。
+
+    ``use_lock=True``（默认）时持有 run 级互斥锁，消除并行写丢更新。
+    锁获取超时会抛 :class:`StateLockError`（不静默降级）。
+    """
+    if use_lock:
+        lock_fh = acquire_state_lock(state_json)
+        try:
+            state = read_state(state_json)
+            mutator(state)
+            write_state(state_json, state_md, state)
+        finally:
+            release_state_lock(lock_fh)
+    else:
+        state = read_state(state_json)
+        mutator(state)
+        write_state(state_json, state_md, state)
     return state
 
 
@@ -663,3 +729,50 @@ def finalize(args: argparse.Namespace, runner=None) -> None:
         payload.update(merge_result)
 
     _io.emit(payload)
+
+
+# ----------------------------- 并行字段工具 -----------------------------
+
+
+def set_parallel_fields(
+    state_json: Path,
+    state_md: Path,
+    seq: int,
+    *,
+    dag_layer: int | None = None,
+    merge_status: str | None = None,
+    eviction_count: int | None = None,
+    change_branch: str | None = None,
+    exec_worktree: str | None = None,
+    skipped_reason: str | None = None,
+) -> None:
+    """原子更新 progress[seq-1] 的并行相关字段（加锁保护）。
+
+    允许字段：dag_layer / merge_status / eviction_count / change_branch / exec_worktree / skipped_reason。
+    传 None 的字段不修改。
+    """
+    valid_merge_status = {"pending", "queued", "evicted", "merged"}
+    if merge_status is not None and merge_status not in valid_merge_status:
+        raise ValueError(
+            f"merge_status={merge_status!r} 不合法（允许：{sorted(valid_merge_status)}）"
+        )
+
+    def mutate(state: dict) -> None:
+        progress = state.get("progress") or []
+        if not (1 <= seq <= len(progress)):
+            raise ValueError(f"seq={seq} 超出 progress 范围（total={len(progress)}）")
+        entry = progress[seq - 1]
+        if dag_layer is not None:
+            entry["dag_layer"] = dag_layer
+        if merge_status is not None:
+            entry["merge_status"] = merge_status
+        if eviction_count is not None:
+            entry["eviction_count"] = eviction_count
+        if change_branch is not None:
+            entry["change_branch"] = change_branch
+        if exec_worktree is not None:
+            entry["exec_worktree"] = exec_worktree
+        if skipped_reason is not None:
+            entry["skipped_reason"] = skipped_reason
+
+    update_state(state_json, state_md, mutate)

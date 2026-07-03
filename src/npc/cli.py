@@ -409,6 +409,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_plan_new.add_argument("--schema", default=None)
     p_plan_new.add_argument("--openspec-bin", dest="openspec_bin", default=None)
     p_plan_new.set_defaults(handler=_make_handler("plan", "cli_new_change"), _cmd_path="plan new-change")
+    p_plan_dag = sub_plan.add_parser(
+        "dag",
+        help="分析 plan_order 的 change 依赖与文件重叠，产出 DAG 分层（单行 JSON 输出）",
+    )
+    p_plan_dag.add_argument(
+        "--plan-order", required=True, dest="plan_order",
+        help='JSON 数组字符串，如 \'["a","b","c"]\'',
+    )
+    p_plan_dag.add_argument("--config", default=None, help="显式 TOML 配置路径")
+    p_plan_dag.set_defaults(handler=_make_handler("plan", "cli_dag"), _cmd_path="plan dag")
 
     # ===== git =====
     p_git = sub.add_parser("git", help="SDD git 卫生（分支/脏树/commit）")

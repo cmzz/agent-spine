@@ -29,6 +29,7 @@ VALID_TRIGGERS = {
     "summary-missing",
     "commit-not-found",
     "archive-failed",
+    "merge-evicted",
 }
 
 # 软阈值；与 skill --auto 默认参数同步。可改但不接 CLI 覆盖（避免主 session 误调）
@@ -108,6 +109,18 @@ def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> di
                 "reason": "systemic-failure",
                 "set_status": "skipped-auto",
                 "set_aborted": True,
+            }
+        )
+        return out
+
+    # merge-evicted：驱逐超限 → 默认 skip（不阻塞层屏障）
+    if trigger == "merge-evicted":
+        out.update(
+            {
+                "action": "skip",
+                "reason": "merge-evicted-limit-exceeded",
+                "set_status": "skipped-auto",
+                "skipped_reason": "merge-evicted",
             }
         )
         return out
@@ -241,6 +254,8 @@ def cli(args: argparse.Namespace) -> None:
         reason = decision.get("reason")
         set_aborted = decision.get("set_aborted", False)
 
+        skipped_reason = decision.get("skipped_reason")
+
         def mutate(state: dict) -> None:
             prog = state.get("progress") or []
             e = prog[seq - 1]
@@ -250,6 +265,9 @@ def cli(args: argparse.Namespace) -> None:
                 e["status"] = set_status
             if reason:
                 e["reason"] = reason
+            # merge-evicted 专用：记录 skipped_reason
+            if skipped_reason:
+                e["skipped_reason"] = skipped_reason
             # 记录本次 trigger，供后续系统性检测连续计数使用
             e["last_trigger"] = trigger
             # abort 决策：置顶层 aborted 标记，供 finalize 判断语义

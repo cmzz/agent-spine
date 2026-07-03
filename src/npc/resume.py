@@ -163,41 +163,123 @@ def _current_round_from_phases(phases: dict) -> int:
     return max_n
 
 
-def compute_resume(state: dict) -> dict:
-    """从 state dict 推断续跑断点。"""
-    progress = state.get("progress") or []
-    completed = 0
-    next_entry = None
-    for entry in progress:
-        if entry.get("status") == "archived":
-            completed += 1
-            continue
-        next_entry = entry
-        break
+TERMINAL_STATUSES = {"archived", "failed", "skipped-auto"}
 
-    if next_entry is None:
-        # 全部 archived
+
+def _entry_to_parallel_info(entry: dict) -> dict:
+    """提取 progress 条目中的并行相关字段（兼容旧 state 无字段）。"""
+    phases = entry.get("phases") or {}
+    cur_round = _current_round_from_phases(phases)
+    next_phase = _next_phase_for_entry(entry)
+    return {
+        "change_id": entry.get("change_id"),
+        "seq": entry.get("seq"),
+        "status": entry.get("status"),
+        "merge_status": entry.get("merge_status", "pending"),
+        "phase": next_phase,
+        "round": cur_round,
+        "eviction_count": entry.get("eviction_count", 0),
+        "change_branch": entry.get("change_branch"),
+        "exec_worktree": entry.get("exec_worktree"),
+    }
+
+
+def _is_parallel_state(progress: list[dict]) -> bool:
+    """判断 state 是否含有并行字段（有任一 dag_layer 字段则认为是并行 state）。"""
+    return any("dag_layer" in e for e in progress)
+
+
+def compute_resume(state: dict) -> dict:
+    """从 state dict 推断续跑断点。
+
+    并行 state（含 dag_layer 字段）：按层重建断点，找第一个未收敛层。
+    旧 state（无 dag_layer）：原线性 seq 游标语义。
+    """
+    progress = state.get("progress") or []
+
+    # ── 旧 state 向后兼容路径 ──────────────────────────────────────────
+    if not _is_parallel_state(progress):
+        completed = 0
+        next_entry = None
+        for entry in progress:
+            if entry.get("status") in TERMINAL_STATUSES:
+                if entry.get("status") == "archived":
+                    completed += 1
+            if entry.get("status") not in TERMINAL_STATUSES and next_entry is None:
+                next_entry = entry
+
+        # 按原逻辑：找第一个非终态
+        completed_archived = sum(1 for e in progress if e.get("status") == "archived")
+        next_entry_old = None
+        for entry in progress:
+            if entry.get("status") == "archived":
+                continue
+            next_entry_old = entry
+            break
+
+        if next_entry_old is None:
+            return {
+                "needs_resume": False,
+                "all_done": True,
+                "completed_changes": completed_archived,
+                "total_changes": len(progress),
+            }
+
+        next_phase = _next_phase_for_entry(next_entry_old)
+        phases = next_entry_old.get("phases") or {}
+        cur_round = _current_round_from_phases(phases)
         return {
-            "needs_resume": False,
-            "all_done": True,
-            "completed_changes": completed,
+            "needs_resume": True,
+            "completed_changes": completed_archived,
             "total_changes": len(progress),
+            "next_seq": next_entry_old.get("seq"),
+            "next_change_id": next_entry_old.get("change_id"),
+            "next_phase": next_phase,
+            "current_round": cur_round,
+            "blocking_trend": next_entry_old.get("blocking_trend", []),
+            "rounds_since_strict_decrease": next_entry_old.get("rounds_since_strict_decrease", 0),
         }
 
-    next_phase = _next_phase_for_entry(next_entry)
-    phases = next_entry.get("phases") or {}
-    cur_round = _current_round_from_phases(phases)
+    # ── 并行 state 路径：按层重建断点 ──────────────────────────────────
+    # 收集所有层
+    layers_map: dict[int, list[dict]] = {}
+    for entry in progress:
+        layer_idx = entry.get("dag_layer", 0)
+        layers_map.setdefault(layer_idx, []).append(entry)
+
+    all_layers = sorted(layers_map.keys())
+    completed_archived = sum(1 for e in progress if e.get("status") == "archived")
+    total = len(progress)
+
+    for layer_idx in all_layers:
+        layer_entries = layers_map[layer_idx]
+        # 检查该层是否全部收敛
+        non_terminal = [e for e in layer_entries if e.get("status") not in TERMINAL_STATUSES]
+        if non_terminal:
+            # 找到第一个未收敛层
+            blocked = [e.get("change_id") for e in layer_entries if e.get("status") in TERMINAL_STATUSES]
+            changes_info = [_entry_to_parallel_info(e) for e in layer_entries]
+            return {
+                "needs_resume": True,
+                "completed_changes": completed_archived,
+                "total_changes": total,
+                "layer": layer_idx,
+                "changes": changes_info,
+                "blocked": blocked,
+                # 单 change 兼容字段
+                "next_seq": non_terminal[0].get("seq"),
+                "next_change_id": non_terminal[0].get("change_id"),
+                "next_phase": _next_phase_for_entry(non_terminal[0]),
+                "current_round": _current_round_from_phases(non_terminal[0].get("phases") or {}),
+                "blocking_trend": non_terminal[0].get("blocking_trend", []),
+                "rounds_since_strict_decrease": non_terminal[0].get("rounds_since_strict_decrease", 0),
+            }
 
     return {
-        "needs_resume": True,
-        "completed_changes": completed,
-        "total_changes": len(progress),
-        "next_seq": next_entry.get("seq"),
-        "next_change_id": next_entry.get("change_id"),
-        "next_phase": next_phase,
-        "current_round": cur_round,
-        "blocking_trend": next_entry.get("blocking_trend", []),
-        "rounds_since_strict_decrease": next_entry.get("rounds_since_strict_decrease", 0),
+        "needs_resume": False,
+        "all_done": True,
+        "completed_changes": completed_archived,
+        "total_changes": total,
     }
 
 

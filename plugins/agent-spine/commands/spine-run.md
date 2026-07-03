@@ -104,11 +104,78 @@ npc state init-run --plan-order '["change-a","change-b","change-c"]'
 - **交互档**：把 plan_order + 每个 change 一句话意图列给用户，AskUserQuestion 确认/调整后再 `init-run`。
 - **auto 档**：把拆出来的**全部** change 按依赖顺序排进 plan_order，直接 `init-run`——不挑子集、不问"这轮跑哪些"、不确认。一次跑完整条依赖链。
 
+**Step 2.5 — DAG 分析（init-run 之后）**：
+```bash
+DAG=$(npc plan dag --plan-order '["change-a","change-b","change-c"]')
+# 输出：{"ok":true,"layers":[["change-a","change-b"],["change-c"]],"parallelizable_fraction":0.667,...}
+LAYERS=$(echo "$DAG" | jq -r '.layers')       # JSON 二维数组
+LAYERS_COUNT=$(echo "$LAYERS" | jq 'length')  # 层数
+# 输出诊断（供后续 /spine-analyze）：
+echo "$DAG" | jq -r '{parallelizable_fraction, serialization_reason, degraded_reason}'
+```
+
+`npc plan dag` 产出：
+- `layers`：二维数组，每层内的 change 可并行执行（已按 max_parallel 切片）
+- `serialization_reason`：各 change 被串行化的原因（hotspot 路径 / no-paths / cycle 等）
+- `parallelizable_fraction`：可并行 change 占比（telemetry 基线）
+- `degraded_reason`：若退化为全串行（依赖环 / 未知依赖），说明原因；`null` = 正常分层
+
+**DAG 退化为串行**（`degraded_reason != null`）：`layers` 仍合法（每层一个 change），Step 3 按层跑即自然回退为串行行为。
+
 ---
 
-## Step 3 — 主循环：逐个 change 跑完
+## Step 3 — 主循环：按 DAG 层调度
 
-对 `plan_order` 里每个 `SEQ`（1-based），按下面跑。**每一步只看 `npc` 返回的一行 JSON 的关键字段做分支，不读中间文件原文。**
+对 `LAYERS` 里每一层（`LAYER_IDX`）按下面跑。**同层 change 在 deferred 后端下并行 spawn，headless 后端降级为层内串行。**
+
+**层屏障**：一层内所有 change 到达终态（`archived` / `failed` / `skipped-auto`）之前，**不得**启动下一层的任何 phase。
+
+**依赖失败传播**：若某 change 的显式依赖前置未达 `archived` 终态（已 `failed` 或 `skipped-auto`），该 change 自动标记 `skipped-auto`（`skipped_reason=dep-failed`），不 implement、不占并发额度。
+
+```bash
+for LAYER_IDX in $(seq 0 $((LAYERS_COUNT - 1))); do
+  LAYER=$(echo "$LAYERS" | jq -r ".[$LAYER_IDX][]")
+  LAYER_SIZE=$(echo "$LAYERS" | jq -r ".[$LAYER_IDX] | length")
+
+  # 1. init-run 已建 state，为本层各 change add-change 并设 dag_layer
+  for CID in $LAYER; do
+    SEQ=<对应 plan_order 序号（1-based）>
+    CID=$(npc state get ".plan_order[$((SEQ-1))]" | tr -d '"')
+    npc state add-change $SEQ "$CID"
+    # 设 dag_layer（内部会 set_parallel_fields）
+  done
+
+  if [ "$LAYER_SIZE" -eq 1 ]; then
+    # 单元素层：直接在 run worktree 跑（与串行版完全等价，不建 per-change worktree）
+    SEQ=<唯一 change 的 seq>; CID=<唯一 change-id>
+    { 按 3a/3b/3c/3d 顺序跑单个 change }
+  else
+    # 多元素层：为每个 change 建 per-change worktree，并行 spawn implement（deferred 后端）
+    # 并行 spawn（deferred=true）：在单条消息内同时发出多个 Task(spine-coder)
+    for CID in $LAYER; do
+      { spawn per-change worktree + implement task }  # 并行发出
+    done
+    { 逐个收 RESULT → npc implement record（注意 --run-ts 绑定父 run）}
+
+    # headless 降级：若 deferred=false，层内串行执行（不建 per-change worktree）
+    # review-fix 循环仍按 change 独立推进（互不干扰）
+
+    # merge queue：层内全部 review-fix 收敛后，逐个进 merge queue 合回 run 分支
+    # npc 内部执行：rebase → verify tests → ff-merge → archive（串行）
+    # 驱逐超限 → npc auto-decide --trigger merge-evicted --apply → skipped-auto
+  fi
+
+  # 层屏障：等本层所有 change 到达终态再进下一层
+  # 检查：progress 中本层所有 change.status ∈ {archived, failed, skipped-auto}
+done
+```
+
+**per-change worktree 内 npc 调用规约**（并行层）：
+
+- 所有 npc 命令 **MUST** 显式携带 `--run-ts <parent_run_ts> --task-log-dir <parent_task_log_dir>`，或依赖 `.npc-run-pointer.json` 指针文件（`npc init` per-change worktree 时自动写入）
+- `npc implement record` / `npc fix record` 等写 state 的命令必须落到父 run 的 state.json，不得按 per-change worktree 的 cwd 推断
+
+以下保持原 3a/3b/3c/3d 语义（单 change 执行流程不变，各 change 独立推进）：
 
 ```bash
 CID=$(npc state get ".plan_order[$((SEQ-1))]" | tr -d '"')
@@ -407,14 +474,21 @@ SPINE_BRANCH=$(echo "$FINAL" | jq -r '.spine_branch // empty')
 ## Spine Run 完成：<final_status>
 
 **模式**：auto | interactive
-**计划**：N changes
+**计划**：N changes（M 层，并行度 P%）
 **结果**：archived A / failed F / skipped S
 **用时**：<duration>
 
-### 各 change
-- ✓ change-a  archived @ <commit>  (review 2 轮)
-- ✓ change-b  archived @ <commit>  (review 0 轮)
-- ✗ change-c  skipped — <reason>
+### 各 change（按 DAG 层）
+- 层 0（并行）：
+  - ✓ change-a  archived @ <commit>  (review 2 轮)
+  - ✓ change-b  archived @ <commit>  (merge-queue 驱逐 1 次，然后合回)
+- 层 1（串行）：
+  - ✗ change-c  skipped — dep-failed（依赖 change-a 未达 archived）
+
+### 并行统计
+- DAG 层数：M
+- 可并行比例：P%（serialization 热点：<top hotspot files>）
+- Merge queue 驱逐：total D 次
 
 ### Worktree 合回
 - merged_back=true  → 已 fast-forward 合回 <base_branch>，worktree 已拆除
@@ -444,6 +518,14 @@ SPINE_BRANCH=$(echo "$FINAL" | jq -r '.spine_branch // empty')
 - **worktree 隔离**：`npc init` 返回 `worktree_root` 后，整个 run 期间所有 npc 子命令与 coder spawn 均在该 worktree 内执行。主 checkout 在 run 期间不受任何写操作影响。续跑必须 cd 进悬空 worktree，不新建。
 - **ff-only，不自作主张推远端**：finalize 仅在顶层 status=`completed` 且 fast-forward 干净时才合回 `base_branch`；合回失败（分叉）则保留 `spine_branch` 留人决策——不执行 `git push`、不强制 merge、不删分支。
 - **auto 档的工具权限由 `npc init --auto` 自我预备**：init 会把授权写到**主 checkout**（live session 真正加载 settings 的位置，非 worktree）——`settings.json` 置 `defaultMode=acceptEdits` + harness Bash 白名单（可共享），`settings.local.json` 置 `additionalDirectories`（worktree 根 / task_log 等 cwd 外受信目录，机器专属绝对路径，gitignore，不污染可提交的 settings.json）+ **破坏性操作 deny 底线**（`Bash(git push --force*)`、`Bash(git reset --hard*)`、`Edit(.git/**)`）。deny 底线以并集追加、不改用户已有 deny，幂等。这消除了 worktree 内读/改文件的弹窗。合并、幂等、坏 JSON 不覆盖，失败不阻塞 init。极端无人值守可再叠加 `bypassPermissions`，但通常无需。**deny 属 settings 层、不进 context，compaction 后仍恒定生效**——这是 prompt 层约束做不到的。
-- **续跑优先**：`npc init` 报 `needs_resume` 时永远先 `resume detect` 接断点，cd 进悬空 worktree，不要新建覆盖。
+- **续跑优先**：`npc init` 报 `needs_resume` 时永远先 `resume detect` 接断点，cd 进悬空 worktree，不要新建覆盖。`npc resume detect` 并行 state 返回 `layer`/`changes[]` 结构，按层断点续跑。
 - **change 粒度单一**：拆解目标时，一个 change 只做一件可独立交付的事；过大就再拆。
 - 全程用 **TodoWrite** 反映真实进度，让用户可实时观察这个长时 run。
+- **并发上限**：`[scheduler].max_parallel`（默认 3）由 `npc plan dag` 自动切片；headless 后端不真并行（dag 分层照记）。
+- **层屏障**：一层内所有 change 到达终态前，**不得**启动下一层任何 phase——无论并行还是串行执行路径。
+- **merge queue 串行**：并行层收敛后 merge queue 串行执行（rebase→复测→ff→archive），**openspec/ 树是共享写，归队列串行段**，严禁在 per-change worktree 中 archive。
+- **驱逐超限转 auto-decide**：同一 change 驱逐次数达 `max_evictions`（默认 2）→ `npc auto-decide --trigger merge-evicted --apply`（默认 skip），不阻塞层屏障判定。
+- **依赖失败传播**：显式依赖的前置 change 终态非 `archived` → 下游自动 `skipped-auto`（`skipped_reason=dep-failed`）；仅路径重叠不传播。
+- **并行层 record 仍逐个检查 `.ok`**：即使并行 spawn，每个 change 的 `npc implement record` / `npc fix record` 返回值 MUST 独立检查。
+- **per-change worktree 内 npc 调用必须绑定父 run**：`--run-ts`/`--task-log-dir` 或 `.npc-run-pointer.json` 指针文件；不依赖 cwd 推断 task_log 归属。
+- **驱逐超限拆 worktree 前先 abort rebase**：`git rebase --abort` 还原中间态后再拆，不留孤儿 worktree。

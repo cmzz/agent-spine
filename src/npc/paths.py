@@ -538,3 +538,65 @@ def load_paths_from_env(state_json_override: str | None = None) -> Paths:
             run_events=env_paths.run_events,
         )
     return env_paths
+
+
+# ============================================================
+# Per-change worktree 绑定工具（Task 3.4）
+# ============================================================
+
+PER_CHANGE_POINTER_FILENAME = ".npc-run-pointer.json"
+"""per-change worktree 根目录下的 run 绑定指针文件名。"""
+
+
+def write_per_change_pointer(
+    worktree_root: Path,
+    parent_run_ts: str,
+    parent_task_log_dir: Path,
+    parent_state_json: Path,
+) -> Path:
+    """在 per-change worktree 根目录写入父 run 绑定指针文件。
+
+    使 per-change worktree 内的 npc 命令无需依赖 cwd 推断即可找到父 run。
+    返回写入的指针文件路径。
+    """
+    pointer_file = worktree_root / PER_CHANGE_POINTER_FILENAME
+    payload = {
+        "schema_version": 1,
+        "parent_run_ts": parent_run_ts,
+        "parent_task_log_dir": str(parent_task_log_dir),
+        "parent_state_json": str(parent_state_json),
+        "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    tmp = pointer_file.with_suffix(pointer_file.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(pointer_file)
+    return pointer_file
+
+
+def read_per_change_pointer(worktree_root: Path) -> dict | None:
+    """读取 per-change worktree 的 run 绑定指针；缺失或解析失败返回 None。"""
+    pointer_file = worktree_root / PER_CHANGE_POINTER_FILENAME
+    if not pointer_file.is_file():
+        return None
+    try:
+        data = json.loads(pointer_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def per_change_worktree_path(
+    home: Path | None,
+    run_ts: str,
+    change_id: str,
+) -> Path:
+    """计算 per-change worktree 的标准路径：``~/.spine/worktrees/<run_ts>/<change_id>``。"""
+    h = home or Path.home()
+    return h / ".spine" / "worktrees" / run_ts / change_id
+
+
+def per_change_branch_name(run_ts: str, change_id: str) -> str:
+    """计算 per-change 分支名：``spine/<run_ts>/<change_id>``。"""
+    return f"spine/{run_ts}/{change_id}"

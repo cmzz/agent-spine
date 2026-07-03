@@ -623,3 +623,73 @@ def cli_commit(args: argparse.Namespace, runner=subprocess.run) -> None:
             "branch": branch,
         }
     )
+
+
+# ============================================================
+# Per-change worktree 生命周期（Task 3.1）
+# ============================================================
+
+
+def create_per_change_worktree(
+    run_root: Path,
+    run_branch: str,
+    change_id: str,
+    run_ts: str,
+    home: Path | None = None,
+    runner=subprocess.run,
+) -> tuple[Path, str]:
+    """从 run 分支 HEAD 建 per-change worktree 与分支。
+
+    分支名：``spine/<run_ts>/<change_id>``
+    worktree 路径：``~/.spine/worktrees/<run_ts>/<change_id>``
+
+    返回 ``(worktree_path, branch_name)``。
+    失败抛 :class:`WorktreeError`。
+    """
+    from . import paths as _paths_mod
+    branch_name = _paths_mod.per_change_branch_name(run_ts, change_id)
+    worktree_path = _paths_mod.per_change_worktree_path(home, run_ts, change_id)
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = runner(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_path), run_branch],
+        cwd=str(run_root),
+        capture_output=True,
+        text=True,
+        env=_git_env(),
+    )
+    if proc.returncode != 0:
+        raise WorktreeError(
+            f"per-change worktree 创建失败（{change_id}）: {(proc.stderr or '').strip()}"
+        )
+    return worktree_path, branch_name
+
+
+def teardown_per_change_worktree(
+    run_root: Path,
+    worktree_path: Path,
+    branch_name: str,
+    runner=subprocess.run,
+    *,
+    abort_rebase_first: bool = False,
+) -> tuple[bool, str]:
+    """拆除 per-change worktree 与分支。
+
+    ``abort_rebase_first=True``：先在 worktree 中 ``git rebase --abort``（冲突残留场景）。
+    返回 ``(success, reason)``。
+    """
+    if abort_rebase_first and worktree_path.exists():
+        runner(
+            ["git", "rebase", "--abort"],
+            cwd=str(worktree_path),
+            capture_output=True,
+            text=True,
+            env=_git_env(),
+        )
+
+    ok, reason = worktree_remove(run_root, worktree_path, runner)
+    if not ok:
+        return False, reason
+    br_ok, br_reason = branch_delete(run_root, branch_name, runner)
+    if not br_ok:
+        return False, br_reason
+    return True, ""

@@ -23,9 +23,15 @@
         "review.round",
         "archive.done",
         "agent.spawn",
-        "agent.timeout"
+        "agent.timeout",
+        "merge_enqueued",
+        "merge_done",
+        "merge_evicted",
+        "merge_evict_limit",
+        "auto_decide.decision",
+        "run.finalize"
       ],
-      "description": "事件类型；phase.exit 用于 implement/fix/archive 等通用 phase 结束，review.round 是 pipeline.run_review_round 的高层信号"
+      "description": "事件类型；phase.exit 用于 implement/fix/archive 等通用 phase 结束，review.round 是 pipeline.run_review_round 的高层信号；merge_* 是并行 merge queue 事件"
     },
     "proj_key": {
       "type": "string",
@@ -100,6 +106,32 @@
     },
     "archive_commit": {
       "type": ["string", "null"]
+    },
+    "dag_layer": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "并行 DAG 分层编号（0 = 第一层）"
+    },
+    "merge_evictions": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "该 change 的 merge queue 驱逐次数"
+    },
+    "eviction_count": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "当前事件时的驱逐次数"
+    },
+    "serialization_reason": {
+      "type": ["object", "null"],
+      "description": "各 change 的串行化原因映射",
+      "additionalProperties": true
+    },
+    "parallelizable_fraction": {
+      "type": ["number", "null"],
+      "minimum": 0,
+      "maximum": 1,
+      "description": "可并行 change 占总数的比例"
     },
     "total_rounds": {
       "type": ["integer", "null"],

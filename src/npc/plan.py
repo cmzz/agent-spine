@@ -28,6 +28,7 @@ from pathlib import Path
 
 from . import _io
 from . import paths as _paths
+from . import config as _config
 
 
 # change-id 合法字符集：首字符必须是字母数字，其余允许 . _ -。
@@ -303,6 +304,371 @@ def run_new_change(args: argparse.Namespace, runner=subprocess.run) -> None:
             "files": files,
         }
     )
+
+
+# ============================================================
+# 子命令 3：npc plan dag（DAG 分层分析）
+# ============================================================
+
+# 从 markdown 文本提取文件路径的正则集：
+# 匹配反引号代码片段中的路径、src/ plugins/ tests/ openspec/ docs/ 前缀路径，
+# 以及 *.py *.md *.json *.toml 后缀路径。
+_PATH_RE = re.compile(
+    r"""
+    `([^`\s]+\.(?:py|md|json|toml|yaml|yml|sh|txt))`   # backtick
+    | (?<![A-Za-z0-9_/.-])                               # word boundary
+      ((?:src|plugins|tests|openspec|docs|\.npc)/[A-Za-z0-9/_\-\.]+\.(?:py|md|json|toml|yaml|yml|sh))
+    | (?<![A-Za-z0-9_/.-])
+      ([A-Za-z0-9_\-]+\.(?:py|json|toml|yaml|yml|sh))   # bare filename with extension
+    """,
+    re.VERBOSE,
+)
+
+
+def _extract_paths_from_text(text: str) -> set[str]:
+    """从文本中静态提取文件路径集合（正则匹配，归一化为 posix 字符串）。"""
+    paths: set[str] = set()
+    for m in _PATH_RE.finditer(text):
+        for group in m.groups():
+            if group:
+                # 过滤极短的（<3 字符）或含参数前缀
+                p = group.strip()
+                if len(p) >= 3 and not p.startswith("-"):
+                    paths.add(p)
+    return paths
+
+
+def _extract_paths_for_change(change_dir: Path) -> set[str]:
+    """从 tasks.md 和 specs/**/*.md 中提取 touched 路径集合。"""
+    paths: set[str] = set()
+    # tasks.md
+    tasks_file = change_dir / "tasks.md"
+    if tasks_file.is_file():
+        paths |= _extract_paths_from_text(tasks_file.read_text(encoding="utf-8", errors="ignore"))
+    # specs/**/*.md
+    specs_dir = change_dir / "specs"
+    if specs_dir.is_dir():
+        for spec_file in specs_dir.rglob("*.md"):
+            paths |= _extract_paths_from_text(spec_file.read_text(encoding="utf-8", errors="ignore"))
+    # proposal.md
+    proposal_file = change_dir / "proposal.md"
+    if proposal_file.is_file():
+        paths |= _extract_paths_from_text(proposal_file.read_text(encoding="utf-8", errors="ignore"))
+    return paths
+
+
+# 从 proposal.md / tasks.md 中提取显式依赖声明的正则
+# 匹配如：
+#   "依赖前置：orchestrator-check-record-result、..."
+#   "前置：x、y"
+#   "applyRequires: [x, y]"
+#   "depends on: x"
+_DEP_EXPLICIT_RE = re.compile(
+    r"""
+    (?:依赖前置|依赖|前置|applyRequires|depends?[ _]on|prerequisite)
+    [：:\s]+
+    ([A-Za-z0-9,、，\s_\-]+)
+    """,
+    re.VERBOSE | re.IGNORECASE,
+)
+_CHANGE_ID_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{2,}")
+
+
+def _extract_deps_for_change(change_dir: Path, known_ids: set[str]) -> set[str]:
+    """从 proposal.md / tasks.md 中提取显式依赖的 change-id（仅返回 known_ids 的子集）。"""
+    deps: set[str] = set()
+    for fname in ("proposal.md", "tasks.md"):
+        f = change_dir / fname
+        if not f.is_file():
+            continue
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        for m in _DEP_EXPLICIT_RE.finditer(text):
+            raw = m.group(1)
+            for tok in _CHANGE_ID_TOKEN_RE.findall(raw):
+                if tok in known_ids:
+                    deps.add(tok)
+    return deps
+
+
+def _topological_sort(nodes: list[str], deps: dict[str, set[str]]) -> list[str] | None:
+    """Kahn 算法拓扑排序。返回排序列表，有环返回 None。"""
+    in_degree: dict[str, int] = {n: 0 for n in nodes}
+    graph: dict[str, list[str]] = {n: [] for n in nodes}
+    for node, d_set in deps.items():
+        for dep in d_set:
+            if dep in graph:
+                graph[dep].append(node)
+                in_degree[node] += 1
+
+    queue = [n for n in nodes if in_degree[n] == 0]
+    order: list[str] = []
+    while queue:
+        queue.sort()  # 确定性排序
+        node = queue.pop(0)
+        order.append(node)
+        for succ in graph[node]:
+            in_degree[succ] -= 1
+            if in_degree[succ] == 0:
+                queue.append(succ)
+    if len(order) != len(nodes):
+        return None  # cycle
+    return order
+
+
+def _build_dag_layers(
+    plan_order: list[str],
+    deps: dict[str, set[str]],
+    paths_map: dict[str, set[str]],
+    max_parallel: int,
+) -> tuple[list[list[str]], dict[str, list[str]]]:
+    """构建 DAG 分层。
+
+    返回 (layers, serialization_reasons)。
+    layers 是分好的层（每层是 change_id 列表）。
+    serialization_reasons 是每个被串行化的 change 的原因列表。
+    """
+    serialization_reasons: dict[str, list[str]] = {cid: [] for cid in plan_order}
+    layers: list[list[str]] = []
+
+    # 用拓扑排序确定 plan_order 约束的层分配
+    # 每个 change 的层 = max(依赖层) + 1
+    layer_of: dict[str, int] = {}
+    for cid in plan_order:
+        dep_layers = [layer_of[d] for d in deps.get(cid, set()) if d in layer_of]
+        layer_of[cid] = (max(dep_layers) + 1) if dep_layers else 0
+
+    # 按 plan_order 分层（保持顺序）
+    max_layer = max(layer_of.values()) if layer_of else 0
+    raw_layers: list[list[str]] = [[] for _ in range(max_layer + 1)]
+    for cid in plan_order:
+        raw_layers[layer_of[cid]].append(cid)
+
+    # 在每层内检查路径冲突，冲突的 change 被拆到下一层
+    for raw_layer in raw_layers:
+        # 分配层内：贪心放置，路径不重叠
+        current_layer: list[str] = []
+        current_paths: set[str] = set()
+
+        for cid in raw_layer:
+            cid_paths = paths_map.get(cid, set())
+            if not cid_paths:
+                # 无路径信息：单独成层（保守退化）
+                if current_layer:
+                    layers.append(current_layer)
+                current_layer = []
+                current_paths = set()
+                layers.append([cid])
+                serialization_reasons[cid].append("no-paths")
+                continue
+
+            overlap = cid_paths & current_paths
+            if overlap:
+                # 路径重叠：检查与当前层中谁冲突，记录 hotspot
+                for placed in current_layer:
+                    placed_paths = paths_map.get(placed, set())
+                    hot = cid_paths & placed_paths
+                    if hot:
+                        hotspot_names = sorted(Path(p).name for p in hot)[:3]
+                        reason = "hotspot=" + ",".join(hotspot_names)
+                        serialization_reasons[cid].append(reason)
+                        serialization_reasons[placed].append(reason)
+                # 先提交当前层，开新层
+                if current_layer:
+                    layers.append(current_layer)
+                current_layer = [cid]
+                current_paths = set(cid_paths)
+            else:
+                current_layer.append(cid)
+                current_paths |= cid_paths
+
+        if current_layer:
+            layers.append(current_layer)
+
+    # max_parallel 切片
+    if max_parallel > 1:
+        sliced: list[list[str]] = []
+        for layer in layers:
+            if len(layer) > max_parallel:
+                for i in range(0, len(layer), max_parallel):
+                    chunk = layer[i:i + max_parallel]
+                    sliced.append(chunk)
+                    if len(layer[i:]) > max_parallel:
+                        for cid in chunk:
+                            serialization_reasons[cid].append("max-parallel-slice")
+            else:
+                sliced.append(layer)
+        layers = sliced
+    elif max_parallel == 1:
+        # 强制每层只有一个元素
+        single: list[list[str]] = []
+        for layer in layers:
+            for cid in layer:
+                single.append([cid])
+        layers = single
+
+    return layers, serialization_reasons
+
+
+def run_dag(args: argparse.Namespace) -> None:
+    """``npc plan dag``：分析 plan_order 中的 change 产出 DAG 分层。
+
+    从 --plan-order（JSON 数组）或当前 run state 读取 change 列表，
+    静态分析文件路径重叠与依赖，产出分层 JSON。
+    """
+    # 1. 解析 plan_order
+    plan_order_raw = getattr(args, "plan_order", None)
+    if plan_order_raw:
+        try:
+            plan_order = json.loads(plan_order_raw)
+            if not isinstance(plan_order, list) or not all(isinstance(x, str) for x in plan_order):
+                raise ValueError("plan_order 必须是字符串数组")
+        except (json.JSONDecodeError, ValueError) as e:
+            _io.emit_error("invalid_plan_order", f"--plan-order 解析失败：{e}", exit_code=2)
+            return
+    else:
+        _io.emit_error("invalid_args", "必须提供 --plan-order", exit_code=2)
+        return
+
+    if not plan_order:
+        _io.emit({"ok": True, "layers": [], "parallelizable_fraction": 0.0,
+                  "serialization_reason": {}, "degraded_reason": None})
+        return
+
+    # 2. 定位 repo_root 和 openspec/changes 目录
+    try:
+        repo_root = _resolve_repo_root(args)
+    except _paths.PathsError as e:
+        _io.emit_error("env_missing", f"未能定位 repo_root：{e}", exit_code=3)
+        return
+
+    changes_root = repo_root / "openspec" / "changes"
+
+    # 3. 加载配置读取 max_parallel
+    config_path = getattr(args, "config", None)
+    try:
+        cfg = _config.load_config(
+            repo_root,
+            override_path=Path(config_path) if config_path else None,
+        )
+    except _config.ConfigError as e:
+        _io.emit_error("config_error", str(e), exit_code=1)
+        return
+    max_parallel = cfg.scheduler.max_parallel
+    max_evictions = cfg.scheduler.max_evictions
+
+    known_ids = set(plan_order)
+
+    # 4. 提取每个 change 的路径和依赖
+    paths_map: dict[str, set[str]] = {}
+    deps_map: dict[str, set[str]] = {}
+    for cid in plan_order:
+        change_dir = changes_root / cid
+        # 尝试 archive 子目录（已归档的 change）
+        if not change_dir.is_dir():
+            for arc_candidate in (changes_root / "archive").glob(f"*-{cid}"):
+                if arc_candidate.is_dir():
+                    change_dir = arc_candidate
+                    break
+        paths_map[cid] = _extract_paths_for_change(change_dir) if change_dir.is_dir() else set()
+        deps_map[cid] = _extract_deps_for_change(change_dir, known_ids) if change_dir.is_dir() else set()
+        # 确保依赖只含 known_ids（防止指向 plan_order 外）
+        unknown_deps = deps_map[cid] - known_ids
+        deps_map[cid] = deps_map[cid] & known_ids
+
+    # 5. 检查依赖问题
+    degraded_reason: str | None = None
+    degraded = False
+
+    # 检查未知依赖（指向不在 plan_order 的 change）
+    unknown_dep_pairs: list[str] = []
+    for cid in plan_order:
+        change_dir = changes_root / cid
+        if not change_dir.is_dir():
+            for arc_candidate in (changes_root / "archive").glob(f"*-{cid}"):
+                if arc_candidate.is_dir():
+                    change_dir = arc_candidate
+                    break
+        all_deps = _extract_deps_for_change(change_dir, known_ids | {"_all_"}) if change_dir.is_dir() else set()
+        all_deps_before_filter = {d for d in all_deps}
+        unknown = all_deps_before_filter - known_ids
+        # 再次提取完整依赖（忽略 known 过滤）
+        if change_dir.is_dir():
+            full_deps = _extract_deps_for_change_all(change_dir)
+            unknown_ext = {d for d in full_deps if d not in known_ids and len(d) > 5}
+            if unknown_ext:
+                for ud in unknown_ext:
+                    unknown_dep_pairs.append(f"{cid}→{ud}")
+
+    if unknown_dep_pairs:
+        degraded = True
+        degraded_reason = f"unknown-dep: {', '.join(unknown_dep_pairs[:5])}"
+
+    # 检查依赖环
+    if not degraded:
+        sorted_order = _topological_sort(plan_order, deps_map)
+        if sorted_order is None:
+            degraded = True
+            # 找到有环的节点
+            cycle_nodes = [cid for cid in plan_order if deps_map.get(cid)]
+            degraded_reason = f"cycle: {cycle_nodes}"
+
+    if degraded:
+        # 完全串行：每个 change 单独成层
+        layers = [[cid] for cid in plan_order]
+        serialization_reasons = {cid: [degraded_reason or "degraded"] for cid in plan_order}
+        _io.emit({
+            "ok": True,
+            "layers": layers,
+            "serialization_reason": serialization_reasons,
+            "parallelizable_fraction": 0.0,
+            "degraded_reason": degraded_reason,
+            "max_parallel": max_parallel,
+            "max_evictions": max_evictions,
+        })
+        return
+
+    # 6. 构建 DAG 层
+    layers, serialization_reasons = _build_dag_layers(
+        plan_order, deps_map, paths_map, max_parallel
+    )
+
+    # 7. 计算 parallelizable_fraction
+    parallel_count = sum(len(layer) for layer in layers if len(layer) > 1)
+    total = len(plan_order)
+    parallelizable_fraction = parallel_count / total if total > 0 else 0.0
+
+    _io.emit({
+        "ok": True,
+        "layers": layers,
+        "serialization_reason": {
+            cid: reasons for cid, reasons in serialization_reasons.items() if reasons
+        },
+        "parallelizable_fraction": round(parallelizable_fraction, 3),
+        "degraded_reason": None,
+        "max_parallel": max_parallel,
+        "max_evictions": max_evictions,
+    })
+
+
+def _extract_deps_for_change_all(change_dir: Path) -> set[str]:
+    """从 proposal.md / tasks.md 中提取所有疑似 change-id 的依赖声明（不过滤 known）。"""
+    deps: set[str] = set()
+    for fname in ("proposal.md", "tasks.md"):
+        f = change_dir / fname
+        if not f.is_file():
+            continue
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        for m in _DEP_EXPLICIT_RE.finditer(text):
+            raw = m.group(1)
+            for tok in _CHANGE_ID_TOKEN_RE.findall(raw):
+                if len(tok) >= 5 and "-" in tok:  # change-id 通常含连字符
+                    deps.add(tok)
+    return deps
+
+
+def cli_dag(args: argparse.Namespace) -> None:
+    """``npc plan dag`` handler。"""
+    run_dag(args)
 
 
 # ============================================================
