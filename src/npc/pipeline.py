@@ -30,6 +30,7 @@ from . import (
     review as _review,
     state as _state,
     telemetry as _telemetry,
+    verify as _verify,
 )
 from .config import Config, ConfigError, load_config
 from .engines import (
@@ -513,6 +514,13 @@ def run_review_round(
         raise ValueError(
             f"未知 review engine：{engine_name!r}（仅支持 codex / claude）"
         )
+
+    # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝
+    violations = _verify.check_routing(cfg)
+    if violations:
+        _io.emit({"ok": False, "error": "routing-violation", "violations": violations})
+        raise SystemExit(1)
+
     selected_engine = (engine_name or review_cfg.engine).lower()
 
     state = _state.read_state(p.state_json)

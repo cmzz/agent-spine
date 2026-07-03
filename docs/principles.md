@@ -44,7 +44,7 @@
   - **per-phase** `[coder.phase].fix = "mimo"`（如只把 fix 给 MiMo，implement 仍 claude）；或
   - 临时 `npc implement/fix run --backend mimo`。
   - 无配置 → 默认 `claude`。`~/.config/npc/mimo.env` 是否存在**不再**自动触发路由。
-- 不变量约束（由 `npc verify routing` 在代码层强制）：review 永不与 coder 同源；review 引擎/bin/model 含 mimo 即 violation；mimo + in-session 亦是 violation。
+- 不变量约束（由 `npc verify routing` 与 `run_review_round` 入口在代码层强制）：review 永不与 coder 同源；review 引擎/bin/model 含 mimo 即 violation；mimo + in-session 亦是 violation。
 - MiMo 密钥存仓库外 `~/.config/npc/mimo.env`（chmod 600，绝不入 git）；backend=mimo 时由 `npc implement/fix run` 注入到子进程 env。
 
 ---

@@ -838,3 +838,104 @@ def test_run_archive_openspec_archive_subprocess_failed_returns_structured_json(
     parsed = json.loads(serialized)
     assert parsed["ok"] is False
     assert parsed["error"] == "openspec-subprocess-failed"
+
+
+# ============================================================
+# 接线测试：run_review_round routing guard（wire-verify-routing）
+# ============================================================
+
+
+def _make_p_with_repo(env_setup, fake_repo: Path):
+    """把 env_setup Paths 的 repo_root 替换为 fake_repo。"""
+    p = env_setup
+    return type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+
+def test_run_review_round_rejects_mimo_in_review_model(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review claude_model 含 mimo → run_review_round 拒绝执行并返回 routing-violation。
+
+    接线测试：断言不变量 4（review 永不路由 MiMo）在 run_review_round 入口被强制。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 构造含 mimo 的 review 配置（claude_model 含 "mimo"）
+    cfg_path = tmp_path / "npc-mimo.toml"
+    cfg_path.write_text(
+        '[review]\nengine = "claude"\n[review.claude]\nmodel = "mimo-v2.5-pro"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "mimo_exec_only" in rules
+
+
+def test_run_review_round_rejects_review_same_source_as_coder(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: review 与 coder 同源（相同 claude bin+model）→ 拒绝执行 routing-violation。
+
+    接线测试：断言不变量 1（生成⊥验证）在 run_review_round 入口被强制。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder=claude(bin=claude, model=claude-opus-4-8) 与 review=claude(同 bin+model) → 同源
+    cfg_path = tmp_path / "npc-same.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-opus-4-8"\n'
+        '[review]\nengine = "claude"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "gen_not_orthogonal" in rules
+
+
+def test_run_review_round_allows_legal_routing(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 合法路由（coder=claude，review=codex）→ check_routing 无 violation，review 正常进入原逻辑。
+
+    接线测试：断言合法配置不被路由守卫误拦。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 合法：coder=claude, review=codex（不同源、不含 mimo）
+    cfg_path = tmp_path / "npc-legal.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\n[review]\nengine = "codex"\n',
+        encoding="utf-8",
+    )
+
+    review_payload = {"verdict": "approve", "findings": []}
+    monkeypatch.setattr(_pipeline, "_codex_exec", _stub_codex_writes_review(review_payload))
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert result["verdict"] == "approve"
+    assert result.get("error") != "routing-violation"
