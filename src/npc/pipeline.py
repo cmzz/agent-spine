@@ -771,7 +771,25 @@ def run_archive(
     _do_phase_enter(p, seq, "archive")
 
     # 1. precheck（commit chain）
-    chain = _git_chain.check_chain(p.repo_root, entry)
+    try:
+        chain = _git_chain.check_chain(p.repo_root, entry)
+    except RuntimeError as exc:
+        # git 二进制缺失时 check_chain 内部抛 RuntimeError("未找到 git 命令")
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "git-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-missing",
+            "detail": str(exc),
+        }
     if not chain.get("ok"):
         _do_phase_exit(
             p,
@@ -865,12 +883,30 @@ def run_archive(
             "error": "git-add-failed",
             "stderr_tail": stderr.strip()[-1000:],
         }
-    commit = subprocess.run(
-        ["git", "commit", "-m", f"chore: archive {change_id}"],
-        cwd=p.repo_root,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        commit = subprocess.run(
+            ["git", "commit", "-m", f"chore: archive {change_id}"],
+            cwd=p.repo_root,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        # git 二进制完全缺失时 subprocess.run 自身抛 FileNotFoundError
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "git-missing", "detail": str(exc)},
+            progress_updates={"status": "failed", "reason": "git-missing"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "git-missing",
+            "detail": str(exc),
+        }
     if commit.returncode != 0:
         _do_phase_exit(
             p,

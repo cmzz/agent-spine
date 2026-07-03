@@ -651,3 +651,81 @@ def test_run_archive_git_head_failed_returns_structured_json(
     parsed = json.loads(serialized)
     assert parsed["ok"] is False
     assert parsed["error"] == "git-head-failed"
+
+
+def test_run_archive_check_chain_git_missing_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: check_chain 在 git 二进制缺失时抛 RuntimeError，run_archive 应将其转换为
+    结构化 JSON（ok=false, error=git-missing），而非让裸异常逃逸到 CLI 层被标为 dependency_missing exit 4。
+    这是 F1 修复的回归测试：验证 precheck 阶段的 git-missing 路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 模拟 git_chain.check_chain 因 git 缺失抛 RuntimeError
+    import npc.git_chain as _git_chain_mod
+
+    def fake_check_chain(repo_root, entry):
+        raise RuntimeError("未找到 git 命令")
+
+    monkeypatch.setattr(_git_chain_mod, "check_chain", fake_check_chain)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：异常被转化为结构化错误，而非裸 traceback
+    assert result["ok"] is False
+    assert result["error"] == "git-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-missing"
+
+
+def test_run_archive_git_commit_fnf_returns_structured_json(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """Scenario: git commit 的 subprocess.run 因 git 二进制缺失抛 FileNotFoundError，
+    run_archive 应将其转换为结构化 JSON（ok=false, error=git-missing），而非被 CLI 层
+    捕获为 dependency_missing exit 4。
+    这是 F1 修复的回归测试：验证 git commit 阶段的 git-missing 路径。
+    """
+    p_with_repo = _make_archive_ready(env_setup, make_args, capsys, fake_repo)
+
+    # 创建 openspec/ 内容让 git add 能在真实 git 上成功
+    (fake_repo / "openspec").mkdir(exist_ok=True)
+    (fake_repo / "openspec" / "x.md").write_text("dummy")
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, *args, **kwargs):
+        if isinstance(cmd, list) and len(cmd) >= 2 and "openspec" in cmd[0]:
+            r = MagicMock()
+            r.returncode = 0
+            r.stdout = ""
+            r.stderr = ""
+            return r
+        if isinstance(cmd, list) and cmd[:2] == ["git", "commit"]:
+            raise FileNotFoundError(2, "No such file or directory: 'git'")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(_pipeline, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+
+    result = _pipeline.run_archive(p_with_repo, 1)
+
+    # 核心断言：FileNotFoundError 被转化为结构化错误
+    assert result["ok"] is False
+    assert result["error"] == "git-missing"
+    assert result["seq"] == 1
+
+    # 验证可被 json.dumps 序列化且不含 Traceback
+    serialized = json.dumps(result)
+    assert "Traceback" not in serialized
+    parsed = json.loads(serialized)
+    assert parsed["ok"] is False
+    assert parsed["error"] == "git-missing"
