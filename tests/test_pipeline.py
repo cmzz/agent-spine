@@ -1076,11 +1076,15 @@ def test_record_implement_rerun_fail_overrides_self_report(
 
     assert result["ok"] is False
     assert result["error"] == "rerun-tests-failed"
+    assert result["tests"] == "fail"  # F1 regression: rerun failure must override self-report
     assert result["tests_verified"] is False
     assert "failed" in result.get("rerun_tail", "")
 
     s = json.loads(p.state_json.read_text())
     assert s["progress"][0]["status"] == "failed"
+    # phase record must also carry tests="fail" so consumers see the override
+    phase_record = s["progress"][0]["phases"]["implement"]
+    assert phase_record.get("tests") == "fail"
 
 
 def test_record_implement_rerun_pass_sets_verified_true(
@@ -1214,10 +1218,14 @@ def test_record_fix_rerun_fail_overrides_self_report(
 
     assert result["ok"] is False
     assert result["error"] == "rerun-tests-failed"
+    assert result["tests"] == "fail"  # F2 regression: rerun failure must override self-report in fix path
     assert result["tests_verified"] is False
 
     s = json.loads(p.state_json.read_text())
     assert s["progress"][0]["status"] == "needs-user-decision"
+    # phase record must also carry tests="fail" so consumers see the override
+    phase_record = s["progress"][0]["phases"]["fix-r1"]
+    assert phase_record.get("tests") == "fail"
 
 
 # ============================================================

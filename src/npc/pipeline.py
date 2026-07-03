@@ -1218,6 +1218,7 @@ def record_implement(
                 status="failed",
                 extra={
                     "reason": "rerun-tests-failed",
+                    "tests": "fail",
                     "tests_verified": False,
                     "rerun_tail": rerun_tail,
                 },
@@ -1227,6 +1228,7 @@ def record_implement(
                 "ok": False,
                 "seq": seq,
                 "error": "rerun-tests-failed",
+                "tests": "fail",
                 "tests_verified": False,
                 "rerun_tail": rerun_tail,
             }
@@ -1365,6 +1367,7 @@ def record_fix(
                 status="failed",
                 extra={
                     "reason": "rerun-tests-failed",
+                    "tests": "fail",
                     "tests_verified": False,
                     "rerun_tail": rerun_tail,
                 },
@@ -1375,6 +1378,7 @@ def record_fix(
                 "seq": seq,
                 "round": round_n,
                 "error": "rerun-tests-failed",
+                "tests": "fail",
                 "tests_verified": False,
                 "rerun_tail": rerun_tail,
             }
