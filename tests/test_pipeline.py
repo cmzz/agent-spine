@@ -208,10 +208,22 @@ def _stub_claude_writes_review(review_payload: dict):
 
 
 def test_run_review_round_uses_claude_when_engine_name_override(
-    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """显式 engine_name='claude' 应路由到 _claude_exec，不调 _codex_exec。"""
+    """显式 engine_name='claude' 应路由到 _claude_exec，不调 _codex_exec。
+
+    注：需提供 coder model 与 review.claude.model 不同的配置，确保不触发
+    gen_not_orthogonal（coder=claude-sonnet vs review=claude-opus → 不同源）。
+    """
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder 与 review 用不同 model → 不同源，不触发 gen_not_orthogonal
+    cfg_path = tmp_path / "npc-diff-model.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
 
     review_payload = {"verdict": "approve", "findings": []}
 
@@ -235,7 +247,7 @@ def test_run_review_round_uses_claude_when_engine_name_override(
     p = env_setup
     p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
 
-    result = _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="claude")
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="claude", config_path=cfg_path)
     assert result["ok"] is True
     assert result["engine"] == "claude"
     assert result["verdict"] == "approve"
@@ -275,9 +287,17 @@ def test_run_review_round_claude_from_config_toml(
 
 
 def test_run_review_round_claude_fails_then_retry_fails(
-    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder 与 review 用不同 model → 不同源，不触发 gen_not_orthogonal
+    cfg_path = tmp_path / "npc-diff-model.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
 
     calls = []
 
@@ -297,7 +317,7 @@ def test_run_review_round_claude_fails_then_retry_fails(
     p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
 
     result = _pipeline.run_review_round(
-        p_with_repo, 1, 0, retries=1, engine_name="claude"
+        p_with_repo, 1, 0, retries=1, engine_name="claude", config_path=cfg_path
     )
     assert result["ok"] is False
     assert result["error"] == "claude-exec-failed"
@@ -938,4 +958,71 @@ def test_run_review_round_allows_legal_routing(
     result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
     assert result["ok"] is True
     assert result["verdict"] == "approve"
+    assert result.get("error") != "routing-violation"
+
+
+def test_run_review_round_rejects_engine_name_cli_override_same_source(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review.engine=codex（通过校验），但 CLI --engine claude 覆盖后
+    coder 与 review 同源（gen_not_orthogonal）→ 守卫必须用实际执行 engine 校验，拒绝执行。
+
+    回归测试 F1：确保 engine_name CLI 覆盖场景下路由守卫检验的是实际执行的 engine，
+    而非原始 cfg 中的 review.engine（codex），否则违规路由会绕过守卫。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # 配置：coder=claude(bin=claude, model=claude-opus-4-8)，review.engine=codex
+    # 若不修复：check_routing 看到 review.engine=codex，与 coder=claude 不同源 → 通过
+    # 修复后：CLI engine_name="claude" 覆盖，check_routing 看到 review.engine=claude，
+    #          与 coder 完全同源（同 bin+model）→ gen_not_orthogonal → 拒绝
+    cfg_path = tmp_path / "npc-codex-base.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-opus-4-8"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path, engine_name="claude")
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "gen_not_orthogonal" in rules
+
+
+def test_run_review_round_allows_engine_name_cli_override_different_source(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: 配置 review.engine=codex，CLI --engine claude 覆盖，但 coder 与 review
+    使用不同 model → 不同源，路由守卫应放行。
+
+    回归测试 F1 正向场景：确保合法的 CLI engine 覆盖不会被误拒。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+
+    # coder=claude(model=claude-sonnet)，review.claude.model=claude-opus → 不同源，合法
+    cfg_path = tmp_path / "npc-cli-claude-diff.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "claude"\nbin = "claude"\nmodel = "claude-sonnet-4-5"\n'
+        '[review]\nengine = "codex"\n[review.claude]\nbin = "claude"\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+
+    review_payload = {"verdict": "approve", "findings": []}
+    monkeypatch.setattr(_pipeline, "_claude_exec", _stub_claude_writes_review(review_payload))
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path, engine_name="claude")
+    assert result["ok"] is True
     assert result.get("error") != "routing-violation"
