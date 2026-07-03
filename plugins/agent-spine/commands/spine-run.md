@@ -129,19 +129,32 @@ IMPL=$(npc implement run --seq $SEQ)
   SPAWN_PROMPT=$(echo "$IMPL" | jq -r '.spawn_prompt')
   # spawn 前取超时预算（必须；绝不无限等待）：
   BUDGET=$(npc agent timeout-budget --seq $SEQ --phase implement)
-  TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
-  if [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
+  BUDGET_EXIT=$?
+  # 校验 exit code、.ok 字段及 timeout_sec 正整数（任一失败 → 不 spawn，直接硬停该 change）：
+  if [ $BUDGET_EXIT -ne 0 ] \
+     || [ "$(echo "$BUDGET" | jq -r '.ok // false')" != "true" ] \
+     || ! echo "$BUDGET" | jq -e '.timeout_sec | type == "number" and . > 0' >/dev/null 2>&1; then
+    # timeout-budget 调用失败或返回无效数据，无法安全 spawn；以 implementer-failed 进决策点
+    DEC=$(npc auto-decide --trigger implementer-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    # 按 ACTION 执行（同 3d）
+  elif [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
     # 预算耗尽，直接转决策点（不再 spawn）
     DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
     ACTION=$(echo "$DEC" | jq -r '.action')   # 通常 skip
     # 按 ACTION 执行（skip → 继续下一 change；abort → 进 Step 4）
   else
+    TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
     # 调 Task 工具，由主 session 原地 spawn spine-coder subagent（带 timeout=TIMEOUT_SEC）：
     RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
     if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
       # 超时或失败：记账后决定是否重派
       RT=$(npc agent record-timeout --seq $SEQ --phase implement)
-      if [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+      RT_EXIT=$?
+      # 校验 record-timeout 结果（exit code + .ok）：失败时保守视为 exhausted，不继续重派
+      if [ $RT_EXIT -ne 0 ] \
+         || [ "$(echo "$RT" | jq -r '.ok // false')" != "true" ] \
+         || [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
         DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
         ACTION=$(echo "$DEC" | jq -r '.action')   # skip
         # 按 ACTION 执行
@@ -186,7 +199,17 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
     FIX_DONE=false
     while true; do
       BUDGET=$(npc agent timeout-budget --seq $SEQ --phase $FIX_PHASE)
-      TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
+      BUDGET_EXIT=$?
+      # 校验 exit code、.ok 字段及 timeout_sec 正整数（任一失败 → 不 spawn，硬停该 fix phase）：
+      if [ $BUDGET_EXIT -ne 0 ] \
+         || [ "$(echo "$BUDGET" | jq -r '.ok // false')" != "true" ] \
+         || ! echo "$BUDGET" | jq -e '.timeout_sec | type == "number" and . > 0' >/dev/null 2>&1; then
+        # timeout-budget 调用失败，无法安全 spawn；保守视为 fixer-failed 进决策点
+        DEC=$(npc auto-decide --trigger fixer-failed --seq $SEQ --apply)
+        ACTION=$(echo "$DEC" | jq -r '.action')
+        FIX_EXHAUSTED=true
+        break 2
+      fi
       if [ "$(echo "$BUDGET" | jq -r '.exhausted')" = "true" ]; then
         # 预算耗尽，不再 spawn，转决策点
         DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
@@ -194,11 +217,16 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
         FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发
         break 2  # 同时跳出内层循环和外层 while
       fi
+      TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec')
       RESULT_LINE=$(Agent subagent_type=spine-coder prompt="$SPAWN_PROMPT" timeout=$TIMEOUT_SEC)
       if [ $? -ne 0 ] || [ -z "$RESULT_LINE" ]; then
         # 超时：记账后在同一 phase 重试（timeout_retries 累积到 exhausted）
         RT=$(npc agent record-timeout --seq $SEQ --phase $FIX_PHASE)
-        if [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
+        RT_EXIT=$?
+        # 校验 record-timeout 结果（exit code + .ok）：失败时保守视为 exhausted，不继续重派
+        if [ $RT_EXIT -ne 0 ] \
+           || [ "$(echo "$RT" | jq -r '.ok // false')" != "true" ] \
+           || [ "$(echo "$RT" | jq -r '.exhausted')" = "true" ]; then
           DEC=$(npc auto-decide --trigger agent-timeout-exhausted --seq $SEQ --apply)
           ACTION=$(echo "$DEC" | jq -r '.action')
           FIX_EXHAUSTED=true   # 标记走预算耗尽路径，post-loop 需按 ACTION 分发

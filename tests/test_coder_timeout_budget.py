@@ -523,3 +523,141 @@ class TestFixExhaustedControlFlow:
             "After exhausted + auto-decide --apply, change must be skipped-auto in state"
         )
         assert s["progress"][0].get("last_trigger") == "agent-timeout-exhausted"
+
+
+# ============================================================
+# 3.7  守卫测试：spine-run.md error-handling — budget/record-timeout 失败路径
+#      覆盖 F1 finding：deferred=true 路径必须校验 exit code + .ok + timeout_sec
+# ============================================================
+
+
+class TestSpineRunErrorHandlingGuard:
+    """验证 spine-run.md 文件中 timeout-budget / record-timeout 的失败路径守卫。
+
+    F1 finding 指出：旧代码未检查 exit code 和 .ok，导致 budget 失败时
+    TIMEOUT_SEC 为空、仍执行 spawn，退化为无有效超时；record-timeout 失败时
+    timeout_retries 不累积，内层 while true 永久重派。
+
+    这些测试验证修复后 spine-run.md 的文本结构包含必要的防御性检查。
+    """
+
+    @pytest.fixture(autouse=True)
+    def spine_run_text(self) -> str:
+        spine_run = (
+            Path(__file__).parent.parent
+            / "plugins"
+            / "agent-spine"
+            / "commands"
+            / "spine-run.md"
+        )
+        return spine_run.read_text(encoding="utf-8")
+
+    def test_implement_path_checks_budget_exit_code(self, spine_run_text):
+        """3a implement deferred=true 路径：timeout-budget 后必须保存并检查 exit code。
+
+        修复前：直接 jq 解析 $BUDGET，exit code 从未检查。
+        修复后：BUDGET_EXIT=$? 并在条件中检查 $BUDGET_EXIT -ne 0。
+        """
+        assert "BUDGET_EXIT=$?" in spine_run_text, (
+            "BUDGET_EXIT=$? capture missing — timeout-budget exit code not checked"
+        )
+        assert "$BUDGET_EXIT -ne 0" in spine_run_text, (
+            "exit code check ($BUDGET_EXIT -ne 0) missing in budget validation guard"
+        )
+
+    def test_implement_path_checks_budget_ok_field(self, spine_run_text):
+        """3a implement deferred=true 路径：timeout-budget 响应的 .ok 字段必须被校验。
+
+        修复前：只检查 .exhausted，从不校验 .ok，非 JSON 输出会让 .exhausted 为 false
+        导致继续 spawn（TIMEOUT_SEC 为 null/空，spawn 无有效超时）。
+        修复后：'.ok // false' 守卫，确保 budget 调用自身成功。
+        """
+        assert "'.ok // false'" in spine_run_text or ".ok // false" in spine_run_text, (
+            ".ok // false guard missing — budget failure not detected when .ok absent"
+        )
+
+    def test_implement_path_validates_timeout_sec_positive_integer(self, spine_run_text):
+        """3a implement deferred=true 路径：timeout_sec 必须被校验为正整数后才提取。
+
+        修复前：TIMEOUT_SEC=$(echo "$BUDGET" | jq -r '.timeout_sec') 无验证，
+        null/0/负数均可传入 spawn，退化为无限等待或立即超时。
+        修复后：jq -e '.timeout_sec | type == "number" and . > 0' 守卫。
+        """
+        assert 'type == "number" and . > 0' in spine_run_text, (
+            "timeout_sec positive integer validation missing — invalid budget not rejected"
+        )
+
+    def test_implement_path_does_not_spawn_on_budget_failure(self, spine_run_text):
+        """3a implement 路径：budget 失败时必须进决策点，不得落到 spawn 行。
+
+        通过检查 implementer-failed trigger 出现在 implement 路径中来验证：
+        budget 失败 → 以 implementer-failed 触发 auto-decide，不 spawn。
+        """
+        assert "implementer-failed" in spine_run_text, (
+            "implementer-failed trigger missing — budget failure in implement path has no decision exit"
+        )
+
+    def test_fix_path_checks_budget_exit_code(self, spine_run_text):
+        """3b fix deferred=true 路径：timeout-budget 后必须检查 exit code。
+
+        fix 内层循环同样要求：BUDGET_EXIT=$? + $BUDGET_EXIT -ne 0 条件检查。
+        """
+        occurrences = spine_run_text.count("BUDGET_EXIT=$?")
+        assert occurrences >= 2, (
+            f"BUDGET_EXIT=$? only appears {occurrences} time(s); "
+            "both implement and fix-rN paths must capture budget exit code"
+        )
+
+    def test_fix_path_does_not_spawn_on_budget_failure(self, spine_run_text):
+        """3b fix 路径：budget 失败时必须以 fixer-failed 进决策点，不得 spawn。
+
+        修复前：budget 失败 → TIMEOUT_SEC 为 null → spawn 无效超时 → record-timeout 失败
+        → 内层 while true 无限重派。修复后：fixer-failed trigger 跳出两层循环。
+        """
+        assert "fixer-failed" in spine_run_text, (
+            "fixer-failed trigger missing — budget failure in fix path has no decision exit"
+        )
+
+    def test_record_timeout_exit_code_checked_in_implement_path(self, spine_run_text):
+        """3a implement 路径：record-timeout 后必须检查 exit code（RT_EXIT=$?）。
+
+        修复前：RT=$(npc agent record-timeout ...) 后直接读 .exhausted，
+        record-timeout 失败时 .exhausted=false，continue 无限重派。
+        修复后：RT_EXIT=$? + RT_EXIT -ne 0 守卫，失败时保守视为 exhausted。
+        """
+        assert "RT_EXIT=$?" in spine_run_text, (
+            "RT_EXIT=$? capture missing — record-timeout exit code not checked"
+        )
+        assert "$RT_EXIT -ne 0" in spine_run_text, (
+            "exit code check ($RT_EXIT -ne 0) missing in record-timeout validation"
+        )
+
+    def test_record_timeout_ok_field_checked(self, spine_run_text):
+        """record-timeout 响应的 .ok 字段必须被校验。
+
+        record-timeout 失败（非 JSON 或 .ok=false）时，必须保守视为 exhausted，
+        不继续重派，避免 while true 无限循环。
+        """
+        ok_count = spine_run_text.count("'.ok // false'") + spine_run_text.count(".ok // false")
+        assert ok_count >= 2, (
+            f".ok // false guard appears only {ok_count} time(s); "
+            "both timeout-budget and record-timeout responses must be validated"
+        )
+
+    def test_timeout_sec_only_extracted_after_validation(self, spine_run_text):
+        """TIMEOUT_SEC 赋值必须在 jq 正整数验证守卫之后，不在其之前。
+
+        确保不存在在验证前先提取 TIMEOUT_SEC 的旧代码残留。
+        """
+        validation_guard = 'type == "number" and . > 0'
+        timeout_extraction = "TIMEOUT_SEC=$(echo \"$BUDGET\" | jq -r '.timeout_sec')"
+        assert timeout_extraction in spine_run_text, (
+            "TIMEOUT_SEC extraction line missing from spine-run.md"
+        )
+        guard_pos = spine_run_text.find(validation_guard)
+        timeout_pos = spine_run_text.find(timeout_extraction)
+        assert guard_pos < timeout_pos, (
+            f"Validation guard (pos {guard_pos}) must appear before "
+            f"TIMEOUT_SEC extraction (pos {timeout_pos}) — "
+            "timeout_sec must be validated before being used"
+        )
