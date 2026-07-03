@@ -210,3 +210,109 @@ def test_grant_local_dirs_skips_unparseable(tmp_path):
     assert res["ok"] is False
     assert res["skipped"] == "unparseable"
     assert lp.read_text() == "{ not json"
+
+
+# ============================================================
+# merge_auto_deny 纯函数（deny 底线）
+# ============================================================
+
+
+def test_merge_deny_empty_adds_all_rules():
+    new, summary = sa.merge_auto_deny({})
+    assert set(sa.AUTO_DENY_RULES).issubset(set(new["permissions"]["deny"]))
+    assert summary["added_deny"] == list(sa.AUTO_DENY_RULES)
+
+
+def test_merge_deny_preserves_existing_user_deny():
+    existing = {"permissions": {"deny": ["Read(.env)", "Read(.secrets)"]}}
+    new, summary = sa.merge_auto_deny(existing)
+    # 用户条目原样保留
+    assert "Read(.env)" in new["permissions"]["deny"]
+    assert "Read(.secrets)" in new["permissions"]["deny"]
+    # harness deny 追加
+    assert "Bash(git push --force*)" in new["permissions"]["deny"]
+    assert "Bash(git reset --hard*)" in new["permissions"]["deny"]
+    assert "Edit(.git/**)" in new["permissions"]["deny"]
+
+
+def test_merge_deny_idempotent():
+    new1, s1 = sa.merge_auto_deny({})
+    new2, s2 = sa.merge_auto_deny(new1)
+    # 第二次不再追加
+    assert s2["added_deny"] == []
+    assert new2["permissions"]["deny"] == new1["permissions"]["deny"]
+
+
+def test_merge_deny_does_not_mutate_input():
+    existing = {"permissions": {"deny": ["Read(.env)"]}}
+    sa.merge_auto_deny(existing)
+    assert existing == {"permissions": {"deny": ["Read(.env)"]}}
+
+
+# ============================================================
+# grant_auto_local_dirs：verify deny rules written
+# ============================================================
+
+
+def test_grant_local_dirs_writes_deny_rules(tmp_path):
+    """Task 3.1：空 settings.local.json → 三条 deny 写入。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is True
+    lp = repo / ".claude" / "settings.local.json"
+    data = json.loads(lp.read_text())
+    deny = data["permissions"]["deny"]
+    assert "Bash(git push --force*)" in deny
+    assert "Bash(git reset --hard*)" in deny
+    assert "Edit(.git/**)" in deny
+    assert set(sa.AUTO_DENY_RULES).issubset(set(deny))
+    assert res["added_deny"] == list(sa.AUTO_DENY_RULES)
+
+
+def test_grant_local_dirs_preserves_user_deny(tmp_path):
+    """Task 3.2：用户已有 deny → 并集保留用户条目。"""
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    lp = repo / ".claude" / "settings.local.json"
+    lp.write_text(json.dumps({"permissions": {"deny": ["Read(.env)", "Read(.secrets)"]}}))
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is True
+    data = json.loads(lp.read_text())
+    deny = data["permissions"]["deny"]
+    # 用户条目保留
+    assert "Read(.env)" in deny
+    assert "Read(.secrets)" in deny
+    # harness deny 追加
+    assert "Bash(git push --force*)" in deny
+    assert "Bash(git reset --hard*)" in deny
+    assert "Edit(.git/**)" in deny
+
+
+def test_grant_local_dirs_deny_idempotent(tmp_path):
+    """Task 3.3：重复运行 init --auto → deny 无重复条目。"""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    res2 = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res2["ok"] is True
+    assert res2["added_deny"] == []
+    data = json.loads((repo / ".claude" / "settings.local.json").read_text())
+    deny = data["permissions"]["deny"]
+    # 无重复
+    assert deny.count("Bash(git push --force*)") == 1
+    assert deny.count("Bash(git reset --hard*)") == 1
+    assert deny.count("Edit(.git/**)") == 1
+
+
+def test_grant_local_dirs_bad_json_not_overwritten(tmp_path):
+    """Task 3.4：坏 JSON → 不覆盖、init 不失败（返回 ok=False）。"""
+    repo = tmp_path / "repo"
+    (repo / ".claude").mkdir(parents=True)
+    lp = repo / ".claude" / "settings.local.json"
+    lp.write_text("{ this is not valid json")
+    res = sa.grant_auto_local_dirs(repo, home=Path("/home/x"))
+    assert res["ok"] is False
+    assert res["skipped"] == "unparseable"
+    # 原文件未被覆盖
+    assert lp.read_text() == "{ this is not valid json"

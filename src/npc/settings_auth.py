@@ -45,6 +45,14 @@ _HARNESS_BINS = (
 )
 HARNESS_BASH_ALLOW = tuple(f"Bash({c} *)" for c in _HARNESS_BINS)
 
+# harness 破坏性操作 deny 底线（写入 settings.local.json）。
+# 这些规则属 settings 层（非 context 层），compaction 后仍恒定生效。
+AUTO_DENY_RULES: tuple[str, ...] = (
+    "Bash(git push --force*)",
+    "Bash(git reset --hard*)",
+    "Edit(.git/**)",
+)
+
 AUTO_MODE = "acceptEdits"
 
 
@@ -96,14 +104,39 @@ def merge_additional_dirs(existing: dict, dirs: list[str]) -> tuple[dict, dict]:
     return new, {"added_dirs": added}
 
 
+def merge_auto_deny(existing: dict) -> tuple[dict, dict]:
+    """把 auto deny 底线合并进既有 settings dict。纯函数。
+
+    返回 ``(new_settings, summary)``。``summary`` 含 ``added_deny``
+    （新追加的条目；已存在的不重复，幂等）。
+    既有 deny 条目原样保留（不删不改）。
+    """
+    new = deepcopy(existing) if isinstance(existing, dict) else {}
+    perms = dict(new.get("permissions") or {})
+
+    deny = list(perms.get("deny") or [])
+    added: list[str] = []
+    for item in AUTO_DENY_RULES:
+        if item not in deny:
+            deny.append(item)
+            added.append(item)
+    perms["deny"] = deny
+
+    new["permissions"] = perms
+    return new, {"added_deny": added}
+
+
 def grant_auto_local_dirs(repo_root: Path, home: Path | None = None) -> dict:
-    """把 --auto 所需的 cwd 外受信目录写入 ``<repo>/.claude/settings.local.json``。
+    """把 --auto 所需的 cwd 外受信目录和破坏性操作 deny 底线写入 settings.local.json。
 
     ``settings.local.json`` 是 gitignore 的本地配置——机器专属绝对路径写这里，
     绝不污染可共享/可提交的 ``settings.json``。合并、幂等、坏 JSON 不覆盖，与
     ``grant_auto_permissions`` 同纪律。
 
-    返回 ``{ok, path, created, added_dirs, skipped?}``。
+    同时写入 deny 底线（AUTO_DENY_RULES）：force push / hard reset / .git 直改。
+    deny 属 settings 层、不进 context，compaction 后仍恒定生效。
+
+    返回 ``{ok, path, created, added_dirs, added_deny, skipped?}``。
     """
     settings_path = repo_root / ".claude" / "settings.local.json"
     existed = settings_path.is_file()
@@ -117,7 +150,8 @@ def grant_auto_local_dirs(repo_root: Path, home: Path | None = None) -> dict:
         except (OSError, json.JSONDecodeError):
             return {"ok": False, "path": str(settings_path), "skipped": "unparseable"}
 
-    new, summary = merge_additional_dirs(existing, auto_local_dirs(home))
+    new, dir_summary = merge_additional_dirs(existing, auto_local_dirs(home))
+    new, deny_summary = merge_auto_deny(new)
 
     settings_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = settings_path.with_suffix(".json.tmp")
@@ -128,7 +162,8 @@ def grant_auto_local_dirs(repo_root: Path, home: Path | None = None) -> dict:
         "ok": True,
         "path": str(settings_path),
         "created": not existed,
-        "added_dirs": summary["added_dirs"],
+        "added_dirs": dir_summary["added_dirs"],
+        "added_deny": deny_summary["added_deny"],
     }
 
 
