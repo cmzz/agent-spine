@@ -179,8 +179,16 @@ IMPL=$(npc implement run --seq $SEQ)
 
 ```bash
 R=$(npc review run --seq $SEQ --round 0)
+# 不变量 2：先检查 .ok，再读业务字段（review 自身失败时返回体无 blocking/stale）
+if [ "$(echo "$R" | jq -r '.ok')" != "true" ]; then
+  # review run 自身失败（如 codex-exec-failed）→ 转 3d，不进循环
+  DEC=$(npc auto-decide --trigger codex-failed --seq $SEQ --apply)
+  ACTION=$(echo "$DEC" | jq -r '.action')
+  # 按 3d ACTION 执行（skip / abort / 其余）；跳过下方 review-fix 循环
+else
 N=0
 FIX_EXHAUSTED=false   # 标记 fix 分支是否因预算耗尽而 break 2
+# .ok=true 时才读 blocking/stale，避免 null 参与整数比较
 while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
    && [ "$(echo "$R" | jq -r '.stale')" = "false" ] \
    && [ $N -lt 20 ]; do
@@ -245,10 +253,19 @@ while [ "$(echo "$R" | jq -r '.blocking')" -gt 0 ] \
   # headless（mimo/显式）：npc 内部已 record，无需额外步骤
 
   R=$(npc review run --seq $SEQ --round $N)
+  # 循环内每次 review run 后同样先检查 .ok（守护不变量 2）
+  if [ "$(echo "$R" | jq -r '.ok')" != "true" ]; then
+    # review run 自身失败 → 退出循环并转 3d（trigger=codex-failed）
+    DEC=$(npc auto-decide --trigger codex-failed --seq $SEQ --apply)
+    ACTION=$(echo "$DEC" | jq -r '.action')
+    FIX_EXHAUSTED=true   # 复用 FIX_EXHAUSTED 标志让 post-loop 按 ACTION 分发
+    break
+  fi
 done
+fi  # end: if R.ok=true (round0 guard)
 ```
 
-循环退出后优先检查 `FIX_EXHAUSTED` 标志——预算耗尽路径 `ACTION` 已由 `npc auto-decide --apply` 写入，
+循环退出后优先检查 `FIX_EXHAUSTED` 标志——预算耗尽路径或 review 自身失败的 `ACTION` 已由 `npc auto-decide --apply` 写入，
 必须按 3d 语义立即执行，不得用旧的 `R` 做 blocking/stale 判断：
 - `FIX_EXHAUSTED=true` → 按 `ACTION` 执行（skip：继续下一 change；abort：进 Step 4；其余同 3d）。
 - `FIX_EXHAUSTED=false` → 正常出口：
@@ -271,6 +288,7 @@ echo "$ARCH" | jq -r '{ok, archive_commit, total_rounds, error}'
 |---|---|
 | 3a implement 失败 | `implementer-failed` |
 | 3b fix 失败 | `fixer-failed` |
+| 3b review 自身失败（如 codex-exec-failed） | `codex-failed` |
 | 3b review 卡死（`stale=true`） | `stale` |
 | 3b review 卡死（轮次越上限） | `max-rounds` |
 | 3c archive 失败 | `archive-failed` |
