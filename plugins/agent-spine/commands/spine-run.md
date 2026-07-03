@@ -179,9 +179,18 @@ echo "$ARCH" | jq -r '{ok, archive_commit, total_rounds, error}'
 
 ### 3d. 决策点（卡死 / implement 失败 / archive 失败时）
 
-**auto 档**：
+**auto 档**：按场景选真实合法的 trigger 值（`npc auto-decide` 只接受 `auto_decide.VALID_TRIGGERS` 中的词，别的值一律 `invalid_trigger` exit 2）：
+
+| 触发场景 | `--trigger` 值 |
+|---|---|
+| 3a implement 失败 | `implementer-failed` |
+| 3b fix 失败 | `fixer-failed` |
+| 3b review 卡死（`stale=true`） | `stale` |
+| 3b review 卡死（轮次越上限） | `max-rounds` |
+| 3c archive 失败 | `archive-failed` |
+
 ```bash
-DEC=$(npc auto-decide --trigger <implement-failed|review-stale|archive-failed> --seq $SEQ)
+DEC=$(npc auto-decide --trigger <上表对应值> --seq $SEQ)
 ACTION=$(echo "$DEC" | jq -r '.action')   # continue-retry | skip | force-archive | abort
 ```
 按 `ACTION` 执行：`continue-retry` 回到对应阶段重试；`skip` 标记跳过下一个 change；`force-archive` 强行 `npc archive run`；`abort` 终止整个 run。**不打断用户。**

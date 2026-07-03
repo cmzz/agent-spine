@@ -28,6 +28,7 @@ VALID_TRIGGERS = {
     "fixer-failed",
     "summary-missing",
     "commit-not-found",
+    "archive-failed",
 }
 
 # 软阈值；与 skill --auto 默认参数同步。可改但不接 CLI 覆盖（避免主 session 误调）
@@ -39,6 +40,7 @@ RETRY_TRIGGERS = {  # 仅这几类 trigger 走 "continue-retry → 再失败就 
     "fixer-failed",
     "summary-missing",
     "commit-not-found",
+    "archive-failed",
 }
 
 

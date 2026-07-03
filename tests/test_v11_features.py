@@ -290,6 +290,30 @@ class TestAutoDecide:
         assert payload["action"] == "skip"
         assert "oversized" in payload["reason"]
 
+    def test_archive_failed_first_retry(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        _auto_decide.cli(make_args(seq=1, trigger="archive-failed", apply=False))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["action"] == "continue-retry"
+
+    def test_archive_failed_second_time_skips(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        s = json.loads(env_setup.state_json.read_text())
+        s["progress"][0]["auto_retry_archive-failed"] = 1
+        env_setup.state_json.write_text(json.dumps(s, indent=2))
+        _auto_decide.cli(make_args(seq=1, trigger="archive-failed", apply=False))
+        payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+        assert payload["action"] == "skip"
+        assert payload["set_status"] == "skipped-auto"
+
+    def test_archive_failed_apply_mutation(self, env_setup, capsys, make_args):
+        self._seed(env_setup, capsys, make_args)
+        _auto_decide.cli(make_args(seq=1, trigger="archive-failed", apply=True))
+        capsys.readouterr()
+        s = json.loads(env_setup.state_json.read_text())
+        assert s["progress"][0]["auto_retry_archive-failed"] == 1
+        assert s["progress"][0].get("status") is None or s["progress"][0]["status"] != "skipped-auto"
+
     def test_apply_writes_status(self, env_setup, capsys, make_args):
         self._seed(
             env_setup,
