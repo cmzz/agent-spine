@@ -267,3 +267,97 @@ def test_runs_observed_dedup_by_run_ts(isolate_telemetry: Path):
 
     assert stats["runs_observed"] == 2  # 两个不同 run_ts
     assert stats["cages"]["stale"] == 8  # 总触发次数
+
+
+# ============================================================
+# F1 回归：timeout 笼子维度存在于 _CAGE_DEFS
+# ============================================================
+
+
+def test_cage_defs_include_timeout_dimensions():
+    """_CAGE_DEFS 必须包含 timeout-budget 和 record-timeout 维度（spec/proposal 要求）。"""
+    cage_names = {c["name"] for c in _telemetry._CAGE_DEFS}
+    assert "timeout-budget" in cage_names, "timeout-budget 笼子缺失于 _CAGE_DEFS"
+    assert "record-timeout" in cage_names, "record-timeout 笼子缺失于 _CAGE_DEFS"
+
+
+def test_cage_stats_timeout_cages_appear_in_no_data(isolate_telemetry: Path):
+    """timeout-budget / record-timeout 事件尚未接线，应归入 no_data 而非 untriggered。"""
+    # 写入足够事件让 auto_decide.decision 出现在流里，但不 emit 任何 agent.timeout_budget 事件
+    _telemetry.emit_event(_make_auto_decide_event("stale", "run-0", _recent_ts(1)))
+
+    all_evts = list(_telemetry.iter_events())
+    stats = _telemetry.cage_stats(all_evts, since_dt=None)
+
+    assert "timeout-budget" in stats["no_data"], "timeout-budget 应在 no_data（事件未接线）"
+    assert "record-timeout" in stats["no_data"], "record-timeout 应在 no_data（事件未接线）"
+    assert "timeout-budget" not in stats["untriggered"]
+    assert "record-timeout" not in stats["untriggered"]
+
+
+def test_cage_defs_cover_all_spec_dimensions():
+    """验证 _CAGE_DEFS 覆盖 spec/tasks 中列出的全部维度。"""
+    cage_names = {c["name"] for c in _telemetry._CAGE_DEFS}
+    required = {
+        "stale", "max-rounds", "agent-timeout-exhausted",
+        "timeout-budget", "record-timeout",
+        "routing-violation", "verify-tests-rerun",
+    }
+    missing = required - cage_names
+    assert not missing, f"以下 spec 要求的笼子维度缺失：{missing}"
+
+
+# ============================================================
+# F2 回归：runs_observed 按 --since 窗口过滤
+# ============================================================
+
+
+def test_runs_observed_uses_windowed_events(isolate_telemetry: Path):
+    """窗口外 run 数充足但窗口内 run 数不足时，deletion_candidates 必须为空。
+
+    场景：10 个旧 run（> min_runs=5），近 30d 内 0 个 run。
+    F2 修复前：runs_observed=10 ≥ 5 → deletion_candidates 非空（误判）。
+    F2 修复后：runs_observed=0 < 5  → deletion_candidates=[]（正确）。
+    """
+    old_ts = _recent_ts(60)  # 60 天前，窗口外
+
+    # 写 10 个不同旧 run 的事件（超过 min_runs 阈值）
+    for i in range(10):
+        _telemetry.emit_event(
+            _make_auto_decide_event("stale", f"run-old-{i}", old_ts)
+        )
+
+    since_30d = datetime.now(timezone.utc) - timedelta(days=30)
+    all_evts = list(_telemetry.iter_events())
+    stats = _telemetry.cage_stats(all_evts, since_dt=since_30d)
+
+    # 窗口内 runs_observed 应为 0
+    assert stats["runs_observed"] == 0, (
+        f"runs_observed 应反映窗口内 run 数（0），实际得到 {stats['runs_observed']}"
+    )
+
+
+def test_runs_observed_windowed_vs_historical(isolate_telemetry: Path):
+    """窗口内有 run 而窗口外也有更多 run 时，runs_observed 应只计窗口内的。"""
+    new_ts = _recent_ts(5)    # 5 天前（窗口内）
+    old_ts = _recent_ts(60)   # 60 天前（窗口外）
+
+    # 2 个新 run（窗口内）
+    for i in range(2):
+        _telemetry.emit_event(
+            _make_auto_decide_event("stale", f"run-new-{i}", new_ts)
+        )
+    # 8 个旧 run（窗口外）
+    for i in range(8):
+        _telemetry.emit_event(
+            _make_auto_decide_event("stale", f"run-old-{i}", old_ts)
+        )
+
+    since_30d = datetime.now(timezone.utc) - timedelta(days=30)
+    all_evts = list(_telemetry.iter_events())
+    stats = _telemetry.cage_stats(all_evts, since_dt=since_30d)
+
+    # 窗口内只有 2 个 run
+    assert stats["runs_observed"] == 2, (
+        f"runs_observed 应为窗口内 run 数（2），实际得到 {stats['runs_observed']}"
+    )

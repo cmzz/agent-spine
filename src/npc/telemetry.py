@@ -424,6 +424,10 @@ _CAGE_DEFS: list[dict] = [
     # 以下笼子的 telemetry event 尚未接线（no_data）
     {"name": "routing-violation",     "kind": "cage.routing_violation", "trigger": None,                    "has_data": False},
     {"name": "verify-tests-rerun",    "kind": "cage.verify_tests",      "trigger": None,                    "has_data": False},
+    # timeout-budget / record-timeout 笼子（事件尚未接线，归 no_data）
+    # proposal 明确列出 "agent timeout-budget/record-timeout" 作为统计维度
+    {"name": "timeout-budget",        "kind": "agent.timeout_budget",   "trigger": None,                    "has_data": False},
+    {"name": "record-timeout",        "kind": "agent.record_timeout",   "trigger": None,                    "has_data": False},
 ]
 
 # 默认观察窗口足够的最少 run 数阈值（untriggered 才有意义被列为删除候选）
@@ -449,19 +453,21 @@ def cage_stats(
     - ``no_data``：该笼子的事件种类在整个事件流中从未出现（无论时间窗口）
     - ``untriggered``：事件种类存在，但该笼子在观察窗口内计数为 0
     """
-    # 收集所有事件（先确定 run 数，再按时间窗口过滤 cage 计数）
+    # 收集所有事件（先确定 no_data 判断用的全量 kind 集合，再按时间窗口过滤统计）
     all_events: list[dict] = list(events)
 
+    # 时间窗口过滤后的事件
+    windowed = [ev for ev in all_events if _within_since(ev.get("ts", ""), since_dt)]
+
     # 统计观察到的唯一 run（以 run_ts 去重；无 run_ts 时回退到 proj_key）
+    # 使用窗口内事件：runs_observed 应反映观察窗口内的 run 数，
+    # 避免把窗口外的历史 run 算入，导致"窗口内 0 触发笼子"被误列为删除候选
     run_ids: set[str] = set()
-    for ev in all_events:
+    for ev in windowed:
         rt = ev.get("run_ts") or ev.get("proj_key") or ""
         if rt:
             run_ids.add(rt)
     runs_observed = len(run_ids)
-
-    # 时间窗口过滤后的事件
-    windowed = [ev for ev in all_events if _within_since(ev.get("ts", ""), since_dt)]
 
     # 统计在整个事件流（不受时间窗口限制）中出现过的 kind 集合，用于判断 no_data
     all_kinds: set[str] = {ev.get("kind", "") for ev in all_events}
