@@ -161,6 +161,19 @@ def _decide(entry: dict, trigger: str, progress: list[dict] | None = None) -> di
         return out
 
     # 软失败 trigger：第一次给一次 retry 机会
+    # 特例：archive-failed 在 force-archive 兜底路径下（上一次 last_trigger 为
+    # stale/max-rounds，说明已经 force-archive --apply 过）必须直接收敛为终态，
+    # 不再给 retry 机会，防止 stale→force-archive→archive-failed→continue-retry 死循环。
+    if trigger == "archive-failed" and entry.get("last_trigger") in ("stale", "max-rounds"):
+        out.update(
+            {
+                "action": "skip",
+                "reason": "archive-failed-after-force-archive",
+                "set_status": "skipped-auto",
+            }
+        )
+        return out
+
     retry_key = f"auto_retry_{trigger}"
     retries = int(entry.get(retry_key) or 0)
     if retries < 1:

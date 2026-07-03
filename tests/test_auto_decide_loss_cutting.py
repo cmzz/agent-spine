@@ -253,6 +253,46 @@ class TestArchiveFailedSecondaryDecision:
         # 应走正常的 continue-retry，而非 abort
         assert result["action"] == "continue-retry"
 
+    def test_stale_force_archive_then_archive_failed_converges_to_skip(self):
+        """端到端路径：stale → force-archive（--apply）→ archive-failed → 必须收敛为终态 skip。
+
+        这是 F1 修复的核心回归：--apply 后 last_trigger="stale" 写入 entry；
+        下一次 archive-failed 触发时检测到 last_trigger 为 stale，直接返回 skip
+        而非 continue-retry，防止死循环。
+        """
+        # 模拟 stale → force-archive --apply 后的 entry 状态：
+        # last_trigger 被写为 "stale"，无 auto_retry_archive-failed 计数
+        entry_after_force_archive = _entry(
+            blocking_trend=[2, 1, 2],
+            last_trigger="stale",
+        )
+        result = _ad._decide(entry_after_force_archive, "archive-failed", [])
+        assert result["action"] == "skip", (
+            f"stale→force-archive→archive-failed 应收敛为 skip，实际得到 {result['action']}"
+        )
+        assert result["set_status"] == "skipped-auto"
+        assert result["reason"] == "archive-failed-after-force-archive"
+
+    def test_max_rounds_force_archive_then_archive_failed_converges_to_skip(self):
+        """max-rounds → force-archive（--apply）→ archive-failed 同样应收敛为终态 skip。"""
+        entry_after_force_archive = _entry(
+            blocking_trend=[1, 1, 1],
+            last_trigger="max-rounds",
+        )
+        result = _ad._decide(entry_after_force_archive, "archive-failed", [])
+        assert result["action"] == "skip"
+        assert result["set_status"] == "skipped-auto"
+        assert result["reason"] == "archive-failed-after-force-archive"
+
+    def test_archive_failed_without_force_archive_still_retries(self):
+        """没有 force-archive 前置（last_trigger 不是 stale/max-rounds）→ 保留 continue-retry 语义。"""
+        # 前一个触发是 implementer-failed，不是 stale/max-rounds
+        entry = _entry(last_trigger="implementer-failed")
+        result = _ad._decide(entry, "archive-failed", [])
+        assert result["action"] == "continue-retry", (
+            "非 force-archive 路径下首次 archive-failed 应仍给 continue-retry 机会"
+        )
+
 
 # ── CLI --apply 集成测试 ──────────────────────────────────────────────
 
