@@ -88,6 +88,11 @@
       "type": ["array", "null"],
       "items": {"type": "string"}
     },
+    "spec_attribution_counts": {
+      "type": ["object", "null"],
+      "description": "review.round 携带的 spec 归因分布：spec-silent/spec-ambiguous/spec-contradicted/impl-deviation/unknown 各自计数；由 npc telemetry agg 聚合为 spec_attributable_blocking_rate",
+      "additionalProperties": {"type": "integer", "minimum": 0}
+    },
     "round": {
       "type": ["integer", "null"],
       "minimum": 0

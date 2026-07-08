@@ -209,8 +209,9 @@ def _round_0_template(change_id: str, project_context: str) -> str:
 - 你的最终消息必须是**且仅是**一个合法的 JSON 对象，符合本次调用提供的 output-schema。
 - 字段含义：
   - verdict: "approve" = 无任何 in_scope blocking 且无 advisory；"passed-with-advisory" = 无 in_scope blocking 但有 advisory；"changes-requested" = 至少 1 个 in_scope blocking。
-  - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope。
+  - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope / spec_attribution。
   - in_scope=true 表示与本 change diff 直接相关；diff 之外的既有问题或越界建议必须 in_scope=false，不计入 blocking。
+  - spec_attribution 四选一，用于判断该 finding 的根因是否可归因于 spec 文档本身：spec-silent = spec 未规定该行为；spec-ambiguous = spec 有规定但存在多种合理解读；spec-contradicted = 实现与 spec 明文相悖；impl-deviation = spec 明确无歧义，实现未照做。
 - 与 tasks.md / design.md 决策一致的实现不作为 finding 报告。
 - 不要返回 markdown 包裹、不要返回散文、不要返回额外字段。
 """

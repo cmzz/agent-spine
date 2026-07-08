@@ -1,7 +1,8 @@
 """Codex review output schema 文件自举。
 
 schema 跨项目共享，落 ~/task_log/.new-plan-review-schema.json，避免污染工程目录。
-schema 内容稳定，仅在文件缺失时写入。
+``ensure_schema`` 在磁盘内容与 ``REVIEW_SCHEMA`` 语义不一致时重写该文件，
+使 ``REVIEW_SCHEMA`` 的代码修改能够真正传达给 codex（而非仅在文件缺失时生效）。
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ REVIEW_SCHEMA = {
                     "detail",
                     "recommendation",
                     "in_scope",
+                    "spec_attribution",
                 ],
                 "properties": {
                     "id": {"type": "string", "description": "本轮唯一 id，建议格式 F1/F2..."},
@@ -70,6 +72,21 @@ REVIEW_SCHEMA = {
                             "false = diff 之外的既有问题或越界建议（不计入 blocking）"
                         ),
                     },
+                    "spec_attribution": {
+                        "type": "string",
+                        "enum": [
+                            "spec-silent",
+                            "spec-ambiguous",
+                            "spec-contradicted",
+                            "impl-deviation",
+                        ],
+                        "description": (
+                            "spec-silent = spec 未规定该行为；"
+                            "spec-ambiguous = spec 有规定但存在多种合理解读；"
+                            "spec-contradicted = 实现与 spec 明文相悖；"
+                            "impl-deviation = spec 明确无歧义，实现未照做。"
+                        ),
+                    },
                 },
             },
         },
@@ -78,9 +95,20 @@ REVIEW_SCHEMA = {
 
 
 def ensure_schema(schema_path: Path) -> bool:
-    """schema 文件不存在时写入。返回 True 表示新建。"""
+    """schema 文件内容与 ``REVIEW_SCHEMA`` 不一致时重写（含文件缺失时新建）。
+
+    判定基于解析后的 JSON 对象语义相等，而非字节相等，避免缩进/键序差异
+    导致无谓重写。解析失败（损坏的 JSON）视为不等，同样触发重写。
+
+    返回 True 表示发生了写入（新建或重写），False 表示内容已一致、未写入。
+    """
     if schema_path.exists():
-        return False
+        try:
+            existing = json.loads(schema_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = None
+        if existing == REVIEW_SCHEMA:
+            return False
     schema_path.parent.mkdir(parents=True, exist_ok=True)
     schema_path.write_text(json.dumps(REVIEW_SCHEMA, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return True

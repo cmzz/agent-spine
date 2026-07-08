@@ -88,6 +88,28 @@ def test_findings_handler(tmp_path, capsys, make_args):
     assert "F1" in content and "F2" not in content
 
 
+def test_render_findings_does_not_leak_spec_attribution():
+    """守不变量 1（生成⊥验证）：spec_attribution 是验证方对 spec 质量的判断，
+    MUST NOT 回流到给 coder 的 fixer findings 渲染，否则等于提前告知 reviewer 的评判维度。"""
+    findings = [
+        {
+            "id": "F1",
+            "severity": "critical",
+            "category": "validation",
+            "title": "缺校验",
+            "file": "src/a.go",
+            "line_range": "42-58",
+            "detail": "未检查 username 长度",
+            "recommendation": "len(username) > 256 时报错",
+            "in_scope": True,
+            "spec_attribution": "spec-silent",
+        },
+    ]
+    out = _fixer.render_findings(findings)
+    assert "spec_attribution" not in out
+    assert "spec-silent" not in out
+
+
 def test_findings_handler_missing_review(tmp_path, capsys, make_args):
     out = tmp_path / "f.md"
     with pytest.raises(SystemExit):

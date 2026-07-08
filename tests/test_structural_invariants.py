@@ -183,10 +183,15 @@ def test_emit_review_round_produces_all_contract_fields(isolate_telemetry, monke
         round_n=0, base="/tmp/base", ok=True, engine="codex", verdict="approve",
         blocking_count=0, blocking_categories=[], duration_ms=10, retry_count=0,
         outcome_reason=None, state_json=None, run_events=None,
+        spec_attribution_counts={"spec-silent": 1, "impl-deviation": 0, "unknown": 0},
     )
     assert len(captured) == 1
     missing = _telemetry.EMIT_FIELD_CONTRACT["review.round"] - set(captured[0].keys())
     assert not missing, f"review.round 事件缺少契约字段：{missing}"
+    assert "spec_attribution_counts" in captured[0]
+    assert captured[0]["spec_attribution_counts"] == {
+        "spec-silent": 1, "impl-deviation": 0, "unknown": 0,
+    }
 
 
 def test_emit_archive_done_produces_all_contract_fields(isolate_telemetry, monkeypatch):

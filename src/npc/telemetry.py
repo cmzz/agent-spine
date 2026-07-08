@@ -68,7 +68,7 @@ EMIT_FIELD_CONTRACT: dict[str, frozenset[str]] = {
         "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
         "phase", "round", "status", "duration_ms", "verdict", "blocking_count",
         "blocking_categories", "engine", "retry_count", "outcome_reason",
-        "tokens", "pointer",
+        "tokens", "pointer", "spec_attribution_counts",
     }),
     "archive.done": frozenset({
         "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
@@ -346,6 +346,24 @@ def _iso_week_key(ts: str) -> str | None:
     return f"{iso[0]:04d}-W{iso[1]:02d}"
 
 
+# spec_attributable_blocking_rate 分子侧的三个归因值（指向 spec 侧责任）；
+# impl-deviation 指向实现侧责任，unknown 完全不计入分子或分母（D4：既不稀释也不抬高）。
+_SPEC_SIDE_ATTRIBUTIONS = ("spec-silent", "spec-ambiguous", "spec-contradicted")
+
+
+def _spec_attributable_rate(counts: dict[str, int]) -> float | None:
+    """由 spec_attribution_counts 计算 spec_attributable_blocking_rate。
+
+    分母为 0（无任何已归因 blocking finding）时返回 None（渲染为 JSON null），
+    而非 0 —— 与仓库既有约定一致：缺数据不得伪装成"表现良好"。
+    """
+    numerator = sum(counts.get(k, 0) for k in _SPEC_SIDE_ATTRIBUTIONS)
+    denominator = numerator + counts.get("impl-deviation", 0)
+    if denominator == 0:
+        return None
+    return round(numerator / denominator, 4)
+
+
 def aggregate(
     events: Iterable[dict],
     by: str,
@@ -371,6 +389,7 @@ def aggregate(
         "reasons": defaultdict(int),
         "verdicts": defaultdict(int),
         "blocking_categories": defaultdict(int),
+        "spec_attribution_counts": defaultdict(int),
     })
 
     for ev in events:
@@ -419,6 +438,11 @@ def aggregate(
         for cat in ev.get("blocking_categories") or []:
             if cat:
                 b["blocking_categories"][cat] += 1
+        sac = ev.get("spec_attribution_counts")
+        if isinstance(sac, dict):
+            for attr_key, attr_val in sac.items():
+                if isinstance(attr_val, int):
+                    b["spec_attribution_counts"][attr_key] += attr_val
 
     out: dict[str, dict] = {}
     for k, b in buckets.items():
@@ -443,6 +467,10 @@ def aggregate(
             "reasons": dict(b["reasons"]),
             "verdicts": dict(b["verdicts"]),
             "top_blocking_categories": _top_n_dict(b["blocking_categories"], 5),
+            "spec_attribution_counts": dict(b["spec_attribution_counts"]),
+            "spec_attributable_blocking_rate": _spec_attributable_rate(
+                b["spec_attribution_counts"]
+            ),
         }
     return out
 
@@ -917,6 +945,7 @@ def emit_review_round(
     outcome_reason: str | None,
     state_json: Path | str | None,
     run_events: Path | str | None,
+    spec_attribution_counts: dict[str, int] | None = None,
 ) -> None:
     """review-rN 一轮结束（成功 / 失败都调用一次）。"""
     base_p = Path(base)
@@ -940,6 +969,7 @@ def emit_review_round(
         "retry_count": retry_count,
         "outcome_reason": outcome_reason,
         "tokens": _build_tokens(focus_md, review_json),
+        "spec_attribution_counts": spec_attribution_counts,
         "pointer": _build_pointer(
             state_json=state_json,
             run_events=run_events,

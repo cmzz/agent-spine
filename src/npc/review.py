@@ -1,7 +1,8 @@
 """Review JSON 解析：从 codex --output-schema 输出派生关键指标。
 
 输入：codex review 写出的 round-N.review.json（已通过 schema 校验）
-输出：JSON 单行，含 verdict / blocking / advisory / categories / blocking_findings
+输出：JSON 单行，含 verdict / blocking / advisory / categories / blocking_findings /
+spec_attribution_counts
 """
 
 from __future__ import annotations
@@ -16,6 +17,14 @@ from . import _io
 
 BLOCKING_SEVERITIES = {"critical", "high"}
 
+# spec_attribution 四值枚举（与 schema.REVIEW_SCHEMA 的 spec_attribution.enum 同源）。
+SPEC_ATTRIBUTION_VALUES = (
+    "spec-silent",
+    "spec-ambiguous",
+    "spec-contradicted",
+    "impl-deviation",
+)
+
 
 def parse_review(review_json: dict) -> dict:
     """从 review JSON 派生指标。纯函数。"""
@@ -27,6 +36,10 @@ def parse_review(review_json: dict) -> dict:
     advisory_count = 0
     categories: list[str] = []
     seen_cats: set[str] = set()
+    # spec_attribution_counts：仅统计 in_scope 且 severity ∈ BLOCKING_SEVERITIES 的 finding
+    # （统计范围与 blocking 一致）。缺失该字段（历史 review.json）计入 unknown，不抛异常。
+    spec_attribution_counts: dict[str, int] = {v: 0 for v in SPEC_ATTRIBUTION_VALUES}
+    spec_attribution_counts["unknown"] = 0
 
     for f in findings:
         sev = f.get("severity")
@@ -37,6 +50,11 @@ def parse_review(review_json: dict) -> dict:
             categories.append(cat)
         if sev in BLOCKING_SEVERITIES and in_scope:
             blocking_list.append(f)
+            attribution = f.get("spec_attribution")
+            if attribution in SPEC_ATTRIBUTION_VALUES:
+                spec_attribution_counts[attribution] += 1
+            else:
+                spec_attribution_counts["unknown"] += 1
         else:
             advisory_count += 1
 
@@ -47,6 +65,7 @@ def parse_review(review_json: dict) -> dict:
         "advisory": advisory_count,
         "categories": categories,
         "blocking_findings": blocking_list,
+        "spec_attribution_counts": spec_attribution_counts,
     }
 
 
