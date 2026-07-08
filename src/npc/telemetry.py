@@ -45,15 +45,20 @@ SCHEMA_FILENAME = "schema-v1.json"
 AGG_DIRNAME = "aggregates"
 
 # ============================================================
-# emit 输出字段契约（结构不变量 R1，第一层：单一事实源，近各 emit_* 函数）
+# emit 输出字段契约（结构不变量 R1，第一层：单一事实源，覆盖仓库内全部真实 telemetry kind）
 # ============================================================
 #
 # 每个 telemetry kind 的事件"必须携带"的字段名集合（存在即可，值可为 None）。
+# 范围 MUST 覆盖仓库内所有实际 emit 的 kind，不止本文件的 emit_* 函数
+# ——auto_decide.py / merge_queue.py / spec_report.py / state.py 均直接调用
+# `telemetry.emit_event()`，各自的 kind 同样 MUST 在此登记。
+#
 # `tests/test_structural_invariants.py` 会：
 #   1. monkeypatch emit_event 捕获各 emit_* 函数产出的真实事件，断言含此处登记的全部字段；
-#   2. AST 扫描本文件所有 emit_* 函数字面量声明的 "kind"，断言均已在此登记（防止新增 kind 漏登记）。
+#   2. AST 扫描本文件 emit_* 函数 + auto_decide.py/merge_queue.py/spec_report.py/state.py
+#      的 emit_event(...) 调用点字面量声明的 "kind"，断言均已在此登记（防止新增 kind 漏登记）。
 #
-# 新增一个 emit_* kind 时，MUST 在此登记其字段契约，否则结构测试 fail。
+# 新增一个 emit kind 时（无论落在哪个模块），MUST 在此登记其字段契约，否则结构测试 fail。
 EMIT_FIELD_CONTRACT: dict[str, frozenset[str]] = {
     "phase.exit": frozenset({
         "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
@@ -72,6 +77,48 @@ EMIT_FIELD_CONTRACT: dict[str, frozenset[str]] = {
     "agent.spawn": frozenset({
         "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
         "phase", "round", "tokens", "pointer",
+    }),
+    # auto_decide.py：apply_decision() 落地一条决策后 emit（best-effort）
+    "auto_decide.decision": frozenset({
+        "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
+        "trigger", "action", "reason", "seq", "applied",
+    }),
+    # merge_queue.py：MergeQueue._emit_telemetry() 的公共基础字段
+    # （kind 由调用点传入字符串字面量；各 kind 在此基础上各自附加字段，见下方逐条登记）
+    "merge_enqueued": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+    }),
+    "merge_state_error": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+        "error",
+    }),
+    "merge_done": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+        "archive_ok",
+    }),
+    "merge_evicted": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+        "reason",
+    }),
+    "merge_evict_limit": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+    }),
+    "merge_evict_auto_decide_failed": frozenset({
+        "proj_key", "run_ts", "change_id", "change_seq", "dag_layer", "eviction_count",
+        "fallback_err",
+    }),
+    # spec_report.py：cli_spec_report() 写完 json/md 后 emit（best-effort）
+    "spec.report": frozenset({
+        "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id", "status",
+        "final_status", "review_rounds", "fix_rounds", "blocking_trend",
+        "total_duration_ms", "estimated_tokens_total", "self_report_summary_verdict",
+        "pointer",
+    }),
+    # state.py：cli_finalize() 的 incomplete 与成功路径均 emit 同一字段集合
+    "run.finalize": frozenset({
+        "proj_key", "canonical_proj_key", "run_ts", "status", "merged_back",
+        "worktree_removed", "spine_branch", "archived_count", "failed_count",
+        "skipped_count", "total_count",
     }),
 }
 

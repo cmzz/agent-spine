@@ -1164,13 +1164,26 @@ def run_archive(
 #
 # `record_implement` / `record_fix` MUST 引用本常量，通过 `_missing_required_keys()`
 # 显式校验，缺任一键时返回 `ok:false` 并指明缺失键（而非静默兜底）。
+#
+# "failure" 条目：commit=- 且 tests=fail 时的失败态 schema（implement / fix 共用，
+# 详见 plugins/agent-spine/hooks/verify-subagent-result.sh 的 SCHEMA_VARIANT=failure
+# 分支）。只登记 implement 失败与 fix 失败两种失败态 RESULT 行共同必需的字段
+# （commit/tests/summary/notes）；tasks/fixed 等 phase 专属字段不强制，因为失败态下
+# coder 未必已算出该值。record_implement / record_fix MUST 在检测到 commit=-/tests=fail
+# 时改用本条目校验，而非继续套用各自 phase 的成功态必需键集合。
 RESULT_REQUIRED_KEYS: dict[str, frozenset[str]] = {
     "implement": frozenset({"commit", "tasks", "tests", "summary"}),
     "fix": frozenset({
         "commit", "fixed", "tests", "summary",
         "categories_scanned", "regressions_added",
     }),
+    "failure": frozenset({"commit", "tests", "summary", "notes"}),
 }
+
+
+def _is_failure_schema(parsed: dict) -> bool:
+    """判断一条已解析的 RESULT 行是否走失败态 schema（commit=- 且 tests=fail）。"""
+    return parsed.get("commit") == "-" and parsed.get("tests") == "fail"
 
 
 def _missing_required_keys(parsed: dict, phase: str) -> list[str]:
@@ -1234,7 +1247,8 @@ def record_implement(
         )
         return {"ok": False, "seq": seq, "error": "result-line-missing"}
 
-    missing_keys = _missing_required_keys(parsed, "implement")
+    check_phase = "failure" if _is_failure_schema(parsed) else "implement"
+    missing_keys = _missing_required_keys(parsed, check_phase)
     if missing_keys:
         _do_phase_exit(
             p, seq, "implement",
@@ -1399,7 +1413,8 @@ def record_fix(
         )
         return {"ok": False, "seq": seq, "round": round_n, "error": "result-line-missing"}
 
-    missing_keys = _missing_required_keys(parsed, "fix")
+    check_phase = "failure" if _is_failure_schema(parsed) else "fix"
+    missing_keys = _missing_required_keys(parsed, check_phase)
     if missing_keys:
         _do_phase_exit(
             p, seq, phase,

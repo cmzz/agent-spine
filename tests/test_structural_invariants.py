@@ -29,6 +29,10 @@ from npc import verify as _verify
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TELEMETRY_SRC = REPO_ROOT / "src" / "npc" / "telemetry.py"
 PIPELINE_SRC = REPO_ROOT / "src" / "npc" / "pipeline.py"
+AUTO_DECIDE_SRC = REPO_ROOT / "src" / "npc" / "auto_decide.py"
+MERGE_QUEUE_SRC = REPO_ROOT / "src" / "npc" / "merge_queue.py"
+SPEC_REPORT_SRC = REPO_ROOT / "src" / "npc" / "spec_report.py"
+STATE_SRC = REPO_ROOT / "src" / "npc" / "state.py"
 HOOKS_JSON_PATH = REPO_ROOT / "plugins" / "agent-spine" / "hooks" / "hooks.json"
 HOOK_SCRIPT_PATH = REPO_ROOT / "plugins" / "agent-spine" / "hooks" / "verify-subagent-result.sh"
 
@@ -56,7 +60,12 @@ def _make_commit(fake_repo: Path, fname: str, msg: str) -> str:
 
 
 def test_emit_field_contract_registers_known_kinds():
-    for kind in ("phase.exit", "review.round", "archive.done", "agent.spawn"):
+    for kind in (
+        "phase.exit", "review.round", "archive.done", "agent.spawn",
+        "auto_decide.decision", "merge_enqueued", "merge_state_error",
+        "merge_done", "merge_evicted", "merge_evict_limit",
+        "merge_evict_auto_decide_failed", "spec.report", "run.finalize",
+    ):
         assert kind in _telemetry.EMIT_FIELD_CONTRACT
         assert _telemetry.EMIT_FIELD_CONTRACT[kind], f"{kind} 契约字段集合不应为空"
 
@@ -83,10 +92,69 @@ def _emit_kind_literals_in_source() -> dict[str, str]:
     return found
 
 
+def _direct_emit_event_kind_literals(src_path: Path) -> dict[str, str]:
+    """AST 扫描任意源文件：找 `<expr>.emit_event({"kind": "<literal>", ...})` 调用点的 kind 字面量。
+
+    覆盖 auto_decide.py / spec_report.py / state.py 这类"直接调用
+    telemetry.emit_event(dict 字面量)"的调用点（不像 telemetry.py 内部先建 record 变量
+    再传给 emit_event，而是 dict 字面量就地作为调用参数）。
+    """
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "emit_event":
+            for arg in node.args:
+                if isinstance(arg, ast.Dict):
+                    for k, v in zip(arg.keys, arg.values):
+                        if (
+                            isinstance(k, ast.Constant)
+                            and k.value == "kind"
+                            and isinstance(v, ast.Constant)
+                            and isinstance(v.value, str)
+                        ):
+                            found[v.value] = src_path.name
+    return found
+
+
+def _merge_queue_kind_literals(src_path: Path) -> dict[str, str]:
+    """AST 扫描 merge_queue.py：``self._emit_telemetry("<literal>", entry, ...)`` 调用点。
+
+    merge_queue.py 的 kind 是通过 ``_emit_telemetry(kind, entry, **extra)`` 辅助方法
+    间接传给 ``emit_event({"kind": kind, ...})`` 的（kind 在该 dict 字面量里是变量，非
+    字符串常量），真正的 kind 字面量出现在各调用点的第一个参数上，须单独扫描。
+    """
+    tree = ast.parse(src_path.read_text(encoding="utf-8"))
+    found: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "_emit_telemetry":
+            if not node.args:
+                continue
+            kind_arg = node.args[0]
+            if isinstance(kind_arg, ast.Constant) and isinstance(kind_arg.value, str):
+                found[kind_arg.value] = src_path.name
+    return found
+
+
+def _all_repo_emit_kind_literals() -> dict[str, str]:
+    """汇总仓库内所有真实 telemetry emit 调用点的 kind 字面量（跨模块）。
+
+    覆盖：
+    - telemetry.py 内 emit_* 函数（既有扫描）
+    - auto_decide.py / spec_report.py / state.py 的直接 emit_event(dict字面量) 调用
+    - merge_queue.py 的 self._emit_telemetry(<literal>, ...) 调用
+    """
+    found: dict[str, str] = dict(_emit_kind_literals_in_source())
+    for src in (AUTO_DECIDE_SRC, SPEC_REPORT_SRC, STATE_SRC):
+        found.update(_direct_emit_event_kind_literals(src))
+    found.update(_merge_queue_kind_literals(MERGE_QUEUE_SRC))
+    return found
+
+
 def test_every_emit_kind_is_registered_in_contract():
-    """Scenario：新增 emit_* kind 未登记进 EMIT_FIELD_CONTRACT → fail。"""
-    found = _emit_kind_literals_in_source()
-    assert found, "AST 未找到任何 emit_* kind 字面量，扫描逻辑可能已失效"
+    """Scenario：新增 emit_* kind（telemetry.py 内，或仓库内任意模块直接调 emit_event /
+    _emit_telemetry）未登记进 EMIT_FIELD_CONTRACT → fail。"""
+    found = _all_repo_emit_kind_literals()
+    assert found, "AST 未找到任何 emit kind 字面量，扫描逻辑可能已失效"
     missing = {kind: fn for kind, fn in found.items() if kind not in _telemetry.EMIT_FIELD_CONTRACT}
     assert not missing, f"以下 emit kind 未登记进 EMIT_FIELD_CONTRACT：{missing}"
 
@@ -150,6 +218,73 @@ def test_emit_agent_spawn_produces_all_contract_fields(isolate_telemetry, monkey
     assert len(captured) == 1
     missing = _telemetry.EMIT_FIELD_CONTRACT["agent.spawn"] - set(captured[0].keys())
     assert not missing, f"agent.spawn 事件缺少契约字段：{missing}"
+
+
+def test_merge_queue_emit_telemetry_produces_all_contract_fields(monkeypatch, tmp_path: Path):
+    """Real invocation：MergeQueue._emit_telemetry 是 merge_enqueued/merge_done/...
+    等 kind 的唯一落地点，真调它验证字段契约不被绕过。"""
+    from npc import merge_queue as _mq
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _telemetry, "emit_event", lambda record, **kw: (captured.append(record), True)[1]
+    )
+
+    mq = _mq.MergeQueue(
+        run_root=tmp_path / "run",
+        repo_root=tmp_path / "repo",
+        run_branch="spine/2026-01-01-0000",
+        state_json=tmp_path / "state.json",
+        state_md=tmp_path / "state.md",
+        run_dir=tmp_path,
+        proj_key="demo",
+        run_ts="2026-01-01-0000",
+    )
+    entry = _mq.MergeQueueEntry(
+        change_id="add-foo", seq=1, dag_layer=0,
+        change_branch="spine/2026-01-01-0000/add-foo",
+        exec_worktree=tmp_path / "wt", run_branch="spine/2026-01-01-0000",
+    )
+
+    for kind, extra in (
+        ("merge_enqueued", {}),
+        ("merge_state_error", {"error": "boom"}),
+        ("merge_done", {"archive_ok": True, "archive_commit": "abc123"}),
+        ("merge_evicted", {"reason": "conflict"}),
+        ("merge_evict_limit", {}),
+        ("merge_evict_auto_decide_failed", {"fallback_err": ""}),
+    ):
+        captured.clear()
+        mq._emit_telemetry(kind, entry, **extra)
+        assert len(captured) == 1
+        missing = _telemetry.EMIT_FIELD_CONTRACT[kind] - set(captured[0].keys())
+        assert not missing, f"{kind} 事件缺少契约字段：{missing}"
+
+
+def test_state_finalize_incomplete_emits_run_finalize_with_all_contract_fields(
+    env_setup, make_args, capsys, monkeypatch
+):
+    """Real invocation：state.finalize 的 incomplete 分支是 run.finalize kind 的落地点
+    之一（另一为成功路径，字段集合相同，见 telemetry.EMIT_FIELD_CONTRACT 注释）。"""
+    _state.init_run(make_args(plan_order='["add-foo"]'))
+    capsys.readouterr()
+    _state.add_change(make_args(seq=1, change_id="add-foo", base=None))
+    capsys.readouterr()
+
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _telemetry, "emit_event", lambda record, **kw: (captured.append(record), True)[1]
+    )
+    with pytest.raises(SystemExit):
+        _state.finalize(make_args())
+    capsys.readouterr()
+
+    finalize_events = [ev for ev in captured if ev.get("kind") == "run.finalize"]
+    assert len(finalize_events) == 1
+    ev = finalize_events[0]
+    assert ev["status"] == "incomplete"
+    missing = _telemetry.EMIT_FIELD_CONTRACT["run.finalize"] - set(ev.keys())
+    assert not missing, f"run.finalize 事件缺少契约字段：{missing}"
 
 
 # ============================================================
@@ -385,6 +520,55 @@ def test_result_required_keys_implement_and_fix_are_distinct_entries():
     assert "implement" in _pipeline.RESULT_REQUIRED_KEYS
     assert "fix" in _pipeline.RESULT_REQUIRED_KEYS
     assert _pipeline.RESULT_REQUIRED_KEYS["implement"] != _pipeline.RESULT_REQUIRED_KEYS["fix"]
+
+
+@pytest.mark.parametrize("missing_key", sorted(_pipeline.RESULT_REQUIRED_KEYS["failure"]))
+def test_record_implement_rejects_failure_result_line_missing_required_key(
+    env_setup, make_args, capsys, fake_repo: Path, missing_key
+):
+    """Scenario：失败态 RESULT 行（commit=- tests=fail）缺 RESULT_REQUIRED_KEYS['failure']
+    中某一键 → ok:false 且指明缺失键。implement / fix 失败态共用同一 failure schema。"""
+    _bootstrap_run(make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    fields = {"commit": "-", "tasks": "0", "tests": "fail", "summary": "-", "notes": "boom"}
+    del fields[missing_key]
+    result_line = "RESULT: " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+    result = _pipeline.record_implement(p_with_repo, 1, result_line, require_summary=False)
+    assert result["ok"] is False
+    assert result["error"] == "result-missing-keys"
+    assert missing_key in result["missing_keys"]
+
+
+@pytest.mark.parametrize("missing_key", sorted(_pipeline.RESULT_REQUIRED_KEYS["failure"]))
+def test_record_fix_rejects_failure_result_line_missing_required_key(
+    env_setup, make_args, capsys, fake_repo: Path, missing_key
+):
+    """同上，针对 fix-rN 失败态 RESULT 行（commit=- tests=fail）。"""
+    _bootstrap_run(make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    fields = {
+        "commit": "-", "fixed": "0", "tests": "fail", "summary": "-",
+        "categories_scanned": "-", "regressions_added": "-", "notes": "boom",
+    }
+    del fields[missing_key]
+    result_line = "RESULT: " + " ".join(f"{k}={v}" for k, v in fields.items())
+
+    result = _pipeline.record_fix(p_with_repo, 1, 1, result_line, require_summary=False)
+    assert result["ok"] is False
+    assert result["error"] == "result-missing-keys"
+    assert missing_key in result["missing_keys"]
+
+
+def test_result_required_keys_has_failure_entry_distinct_from_implement_and_fix():
+    """R2 要求 implement/fix/failure 三个 phase 各自登记必需键；failure 与两者均不同。"""
+    assert "failure" in _pipeline.RESULT_REQUIRED_KEYS
+    assert _pipeline.RESULT_REQUIRED_KEYS["failure"] != _pipeline.RESULT_REQUIRED_KEYS["implement"]
+    assert _pipeline.RESULT_REQUIRED_KEYS["failure"] != _pipeline.RESULT_REQUIRED_KEYS["fix"]
 
 
 # ============================================================
