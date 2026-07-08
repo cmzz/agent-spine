@@ -76,6 +76,19 @@ def _iso_to_ms(iso_str: str | None) -> int | None:
         return None
 
 
+def _resolve_started_ms(cur: dict) -> int | None:
+    """从 phase 记录取 started 基准（毫秒）。
+
+    优先 ``started_ms``；缺失时回退解析 ``started_at``（ISO）。两者皆缺才 None。
+    这让 phase 二次 exit（started_ms 已被首次 exit 抹掉，但 started_at 保留）
+    以及只有 started_at 的路径仍能算出正确 duration。
+    """
+    started_ms = cur.get("started_ms")
+    if started_ms is not None:
+        return int(started_ms)
+    return _iso_to_ms(cur.get("started_at"))
+
+
 def _ensure_phase_in_progress(
     p: _paths.Paths,
     seq: int,
@@ -249,9 +262,9 @@ def _do_phase_exit(
         entry = _get_entry(state, seq)
         phases = entry.setdefault("phases", {})
         cur = phases.get(phase) or {}
-        started_ms = cur.get("started_ms")
+        started_ms = _resolve_started_ms(cur)
         started_at = cur.get("started_at")
-        duration_ms = max(0, done_ms - int(started_ms)) if started_ms is not None else None
+        duration_ms = max(0, done_ms - started_ms) if started_ms is not None else None
         new_phase: dict[str, Any] = {
             "status": status,
             "done_at": done_at,
@@ -259,6 +272,8 @@ def _do_phase_exit(
         }
         if started_at:
             new_phase["started_at"] = started_at
+        if started_ms is not None:
+            new_phase["started_ms"] = started_ms
         new_phase.update(extra)
         phases[phase] = new_phase
         # progress 字段批量更新
@@ -328,9 +343,9 @@ def _do_review_phase_exit_and_trend(
         entry = _get_entry(state, seq)
         phases = entry.setdefault("phases", {})
         cur = phases.get(phase) or {}
-        started_ms = cur.get("started_ms")
+        started_ms = _resolve_started_ms(cur)
         started_at = cur.get("started_at")
-        duration_ms = max(0, done_ms - int(started_ms)) if started_ms is not None else None
+        duration_ms = max(0, done_ms - started_ms) if started_ms is not None else None
         new_phase: dict[str, Any] = {
             "status": "done",
             "done_at": done_at,
@@ -342,6 +357,8 @@ def _do_review_phase_exit_and_trend(
         }
         if started_at:
             new_phase["started_at"] = started_at
+        if started_ms is not None:
+            new_phase["started_ms"] = started_ms
         phases[phase] = new_phase
 
         trend = list(entry.get("blocking_trend") or [])
