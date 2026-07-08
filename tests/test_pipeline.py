@@ -55,7 +55,7 @@ def _stub_codex_writes_review(review_payload: dict):
 
 def test_parse_result_line_basic():
     line = "RESULT: commit=abc123 tasks=5 tests=pass summary=/tmp/x.md notes=ok"
-    out = _pipeline._parse_result_line(line, ["commit", "tasks"])
+    out = _pipeline._parse_result_line(line)
     assert out["commit"] == "abc123"
     assert out["tasks"] == "5"
     assert out["tests"] == "pass"
@@ -63,13 +63,58 @@ def test_parse_result_line_basic():
 
 def test_parse_result_line_value_with_spaces_until_next_key():
     line = "stuff before\nRESULT: commit=- tests=fail notes=this is a multi word note"
-    out = _pipeline._parse_result_line(line, ["commit"])
+    out = _pipeline._parse_result_line(line)
     assert out["commit"] == "-"
     assert out["notes"] == "this is a multi word note"
 
 
 def test_parse_result_line_missing():
-    assert _pipeline._parse_result_line("nothing here", []) is None
+    assert _pipeline._parse_result_line("nothing here") is None
+
+
+# ============================================================
+# RESULT 行解析 + 校验（R2 round 2：解析器级必需键校验）
+# ============================================================
+
+
+def test_parse_and_validate_result_line_missing_key_surfaces_failure():
+    """R2 finding 复现用例：implement RESULT 行缺 `tasks` 时，解析器级校验
+    必须直接报出缺失键，而不是把 parsed 字典（缺了 tasks）原样交还给调用方。
+    """
+    line = "RESULT: commit=abc tests=pass summary=/tmp/s.md"
+    parsed, missing = _pipeline._parse_and_validate_result_line(line, "implement")
+    assert parsed is not None
+    assert "tasks" not in parsed
+    assert missing == ["tasks"]
+
+
+def test_parse_and_validate_result_line_all_keys_present_no_missing():
+    line = "RESULT: commit=abc tasks=3 tests=pass summary=/tmp/s.md notes=-"
+    parsed, missing = _pipeline._parse_and_validate_result_line(line, "implement")
+    assert parsed is not None
+    assert missing == []
+
+
+def test_parse_and_validate_result_line_missing_result_returns_none():
+    parsed, missing = _pipeline._parse_and_validate_result_line("nothing here", "implement")
+    assert parsed is None
+    assert missing == []
+
+
+def test_parse_and_validate_result_line_fix_missing_multiple_keys():
+    line = "RESULT: commit=abc fixed=2 tests=pass summary=/tmp/s.md"
+    parsed, missing = _pipeline._parse_and_validate_result_line(line, "fix")
+    assert parsed is not None
+    assert missing == ["categories_scanned", "regressions_added"]
+
+
+def test_parse_and_validate_result_line_failure_schema_uses_failure_keys():
+    """commit=- 且 tests=fail 时应切到 RESULT_REQUIRED_KEYS['failure']，
+    tasks/fixed 等 phase 专属字段不应被误判为缺失。"""
+    line = "RESULT: commit=- tests=fail summary=/tmp/s.md notes=boom"
+    parsed, missing = _pipeline._parse_and_validate_result_line(line, "implement")
+    assert parsed is not None
+    assert missing == []
 
 
 # ============================================================

@@ -1158,19 +1158,25 @@ def run_archive(
 
 # RESULT 行必需键 —— 单一事实源（结构不变量 R2）。
 #
-# 背景缺陷：历史上 `_parse_result_line(text, keys)` 接收 `keys` 参数却从不校验，
-# 直接把解析出的字典原样返回；缺键的 RESULT 行会被静默当作合法输入处理（往往在下游
-# `.get(key, 默认值)` 处产生误导性默认值，而不是快速失败并指明缺了什么）。
+# 背景缺陷（R2 round 1）：历史上 `_parse_result_line(text, keys)` 接收 `keys`
+# 参数却从不校验，直接把解析出的字典原样返回；缺键的 RESULT 行会被静默当作
+# 合法输入处理（往往在下游 `.get(key, 默认值)` 处产生误导性默认值，而不是快速
+# 失败并指明缺了什么）。
 #
-# `record_implement` / `record_fix` MUST 引用本常量，通过 `_missing_required_keys()`
-# 显式校验，缺任一键时返回 `ok:false` 并指明缺失键（而非静默兜底）。
+# 背景缺陷（R2 round 2 复查）：round 1 修复只在 `record_implement` /
+# `record_fix` 里加了调用点层面的 `_missing_required_keys()` 检查，但
+# `_parse_result_line` 本身仍然接收（且忽略）一个 `keys` 参数——参数名具有
+# 误导性，且解析器层面并未真正强制这条不变量，只是恰好两个调用方都记得手动
+# 校验。现改为：`_parse_result_line` 不再接收/暗示做校验的 `keys` 参数，改由
+# `_parse_and_validate_result_line(text, phase)` 统一做「解析 + 校验」，
+# `record_implement` / `record_fix` 必须调用这一个函数，不得绕开。
 #
 # "failure" 条目：commit=- 且 tests=fail 时的失败态 schema（implement / fix 共用，
 # 详见 plugins/agent-spine/hooks/verify-subagent-result.sh 的 SCHEMA_VARIANT=failure
 # 分支）。只登记 implement 失败与 fix 失败两种失败态 RESULT 行共同必需的字段
 # （commit/tests/summary/notes）；tasks/fixed 等 phase 专属字段不强制，因为失败态下
-# coder 未必已算出该值。record_implement / record_fix MUST 在检测到 commit=-/tests=fail
-# 时改用本条目校验，而非继续套用各自 phase 的成功态必需键集合。
+# coder 未必已算出该值。`_parse_and_validate_result_line` 在检测到 commit=-/tests=fail
+# 时自动切到本条目校验，而非继续套用各自 phase 的成功态必需键集合。
 RESULT_REQUIRED_KEYS: dict[str, frozenset[str]] = {
     "implement": frozenset({"commit", "tasks", "tests", "summary"}),
     "fix": frozenset({
@@ -1192,10 +1198,14 @@ def _missing_required_keys(parsed: dict, phase: str) -> list[str]:
     return sorted(k for k in required if k not in parsed)
 
 
-def _parse_result_line(text: str, keys: list[str]) -> dict | None:
-    """从 sub-agent message 末尾抽 RESULT 行。
+def _parse_result_line(text: str) -> dict | None:
+    """从 sub-agent message 末尾抽 RESULT 行，纯 tokenize，不做 key 校验。
 
     格式：``RESULT: key1=value1 key2=value2 ...``。
+
+    本函数只负责把 RESULT 行切成 dict；required-key 校验由
+    `_parse_and_validate_result_line()` 统一完成（R2 结构不变量：解析器
+    不得对缺键静默放行，见 RESULT_REQUIRED_KEYS 注释）。
     """
     if "RESULT:" not in text:
         return None
@@ -1215,9 +1225,33 @@ def _parse_result_line(text: str, keys: list[str]) -> dict | None:
                 continue
             k, _, v = tok.partition("=")
             out[k.strip()] = v.strip()
-        # 校验 keys
         return out
     return None
+
+
+def _parse_and_validate_result_line(
+    text: str, phase: str
+) -> tuple[dict | None, list[str]]:
+    """解析 RESULT 行并按 `RESULT_REQUIRED_KEYS` 强制校验必需键。
+
+    这是 R2 结构不变量的**解析器级**落点：`_parse_result_line` 本身只做
+    tokenize，绝不允许调用方绕过 required-key 校验直接拿到"看似合法但缺键"
+    的 dict —— 所有调用方（`record_implement` / `record_fix`）必须走本函数。
+
+    Returns:
+        (parsed, missing_keys)
+        - parsed is None：整行 RESULT 缺失（连 tokenize 都没匹配到）。
+        - parsed is not None 且 missing_keys 非空：已解析但缺
+          RESULT_REQUIRED_KEYS[phase]（或失败态覆盖为 RESULT_REQUIRED_KEYS["failure"]）
+          中的键，调用方 MUST 视为解析失败，不得使用 parsed 中的字段兜底。
+        - parsed is not None 且 missing_keys 为空：合法，可安全使用。
+    """
+    parsed = _parse_result_line(text)
+    if parsed is None:
+        return None, []
+    check_phase = "failure" if _is_failure_schema(parsed) else phase
+    missing = _missing_required_keys(parsed, check_phase)
+    return parsed, missing
 
 
 def record_implement(
@@ -1237,7 +1271,7 @@ def record_implement(
     change_id = entry["change_id"]
     base = Path(entry.get("base") or _paths.base_for(p, seq, change_id))
 
-    parsed = _parse_result_line(result_line, list(RESULT_REQUIRED_KEYS["implement"]))
+    parsed, missing_keys = _parse_and_validate_result_line(result_line, "implement")
     if parsed is None:
         _do_phase_exit(
             p, seq, "implement",
@@ -1247,8 +1281,6 @@ def record_implement(
         )
         return {"ok": False, "seq": seq, "error": "result-line-missing"}
 
-    check_phase = "failure" if _is_failure_schema(parsed) else "implement"
-    missing_keys = _missing_required_keys(parsed, check_phase)
     if missing_keys:
         _do_phase_exit(
             p, seq, "implement",
@@ -1400,10 +1432,7 @@ def record_fix(
     entry = _get_entry(state, seq)
     change_id = entry["change_id"]
 
-    parsed = _parse_result_line(
-        result_line,
-        list(RESULT_REQUIRED_KEYS["fix"]),
-    )
+    parsed, missing_keys = _parse_and_validate_result_line(result_line, "fix")
     if parsed is None:
         _do_phase_exit(
             p, seq, phase,
@@ -1413,8 +1442,6 @@ def record_fix(
         )
         return {"ok": False, "seq": seq, "round": round_n, "error": "result-line-missing"}
 
-    check_phase = "failure" if _is_failure_schema(parsed) else "fix"
-    missing_keys = _missing_required_keys(parsed, check_phase)
     if missing_keys:
         _do_phase_exit(
             p, seq, phase,
