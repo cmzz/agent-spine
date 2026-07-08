@@ -155,6 +155,47 @@ class CoderConfig:
 
 
 @dataclass(frozen=True)
+class SpecWriterConfig:
+    """spec 生成方后端配置。语义与 :class:`CoderConfig` 同构，但刻意精简：
+
+    spec 生成的分发方式恒为 in-session（由 ``spine-spec-writer`` 定死，见
+    change ``spec-routing-invariant`` 的 design.md D2），因此本配置 MUST NOT
+    含 ``dispatch`` / ``phase`` 字段——配置面积不随执行路径的自由度膨胀。
+    """
+
+    backend: str | None = None  # None = 未显式配置 → 默认 claude（安全默认值）
+    bin: str | None = None
+    model: str | None = None
+
+    @property
+    def effective_backend(self) -> str:
+        """未显式配置时的有效默认（claude）。供 check_routing 等只读消费者用。"""
+        return self.backend or "claude"
+
+    def __post_init__(self) -> None:
+        if self.backend is not None and self.backend not in SUPPORTED_CODER_BACKENDS:
+            raise ConfigError(
+                f"未知 spec_writer backend：{self.backend!r}"
+                f"（仅支持 {'/'.join(SUPPORTED_CODER_BACKENDS)}）"
+            )
+
+
+@dataclass(frozen=True)
+class SpecReviewConfig:
+    """spec 验证方引擎配置。语义与 :class:`ReviewEngineConfig` 同构。"""
+
+    engine: str = "codex"  # 安全默认值：与既有 review 默认一致
+    claude_bin: str | None = None
+    claude_model: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.engine not in SUPPORTED_ENGINES:
+            raise ConfigError(
+                f"未知 spec_review engine：{self.engine!r}（仅支持 {'/'.join(SUPPORTED_ENGINES)}）"
+            )
+
+
+@dataclass(frozen=True)
 class VerifyConfig:
     """质量门命令覆盖；任一省略则由 ``npc verify`` 按 repo 清单自动探测。
 
@@ -201,6 +242,8 @@ class Config:
     coder: CoderConfig = field(default_factory=CoderConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    spec_writer: SpecWriterConfig = field(default_factory=SpecWriterConfig)
+    spec_review: SpecReviewConfig = field(default_factory=SpecReviewConfig)
     source: str = "<default>"
 
 
@@ -319,6 +362,27 @@ def _build(data: dict, source: str) -> Config:
     if not isinstance(verify_raw, dict):
         raise ConfigError(f"[verify] 节必须是 table（{source}）")
 
+    spec_writer_raw = data.get("spec_writer") or {}
+    if not isinstance(spec_writer_raw, dict):
+        raise ConfigError(f"[spec_writer] 节必须是 table（{source}）")
+    spec_writer_backend_val = spec_writer_raw.get("backend")
+    spec_writer_backend = (
+        str(spec_writer_backend_val) if spec_writer_backend_val is not None else None
+    )
+    spec_writer_bin = _opt_str(spec_writer_raw.get("bin"), "spec_writer.bin", source)
+    spec_writer_model = _opt_str(spec_writer_raw.get("model"), "spec_writer.model", source)
+
+    spec_review_raw = data.get("spec_review") or {}
+    if not isinstance(spec_review_raw, dict):
+        raise ConfigError(f"[spec_review] 节必须是 table（{source}）")
+    spec_review_engine = str(spec_review_raw.get("engine", "codex"))
+    spec_review_claude_bin = _opt_str(
+        spec_review_raw.get("claude_bin"), "spec_review.claude_bin", source
+    )
+    spec_review_claude_model = _opt_str(
+        spec_review_raw.get("claude_model"), "spec_review.claude_model", source
+    )
+
     scheduler_raw = data.get("scheduler") or {}
     if not isinstance(scheduler_raw, dict):
         raise ConfigError(f"[scheduler] 节必须是 table（{source}）")
@@ -370,6 +434,16 @@ def _build(data: dict, source: str) -> Config:
         scheduler=SchedulerConfig(
             max_parallel=sched_mp_raw,
             max_evictions=sched_me_raw,
+        ),
+        spec_writer=SpecWriterConfig(
+            backend=spec_writer_backend,
+            bin=spec_writer_bin,
+            model=spec_writer_model,
+        ),
+        spec_review=SpecReviewConfig(
+            engine=spec_review_engine,
+            claude_bin=spec_review_claude_bin,
+            claude_model=spec_review_claude_model,
         ),
         source=source,
     )

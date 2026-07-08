@@ -216,12 +216,28 @@ def check_routing(cfg: _config.Config) -> list[dict]:
 
     每项 ``{"rule", "detail"}``。规则：
 
+    coder ⊥ review（既有）：
+
     1. ``backend_unsupported`` / ``engine_unsupported``：coder.backend 与
        review.engine 必须在各自 SUPPORTED 列表（backend 用 effective_backend）。
     2. ``gen_not_orthogonal``：coder 与 review 解析到同一执行身份 → 等于自己评
-       自己，违反 生成⊥验证。覆盖 (a) 都是 claude 且同 bin+model；(b) 都是 mimo。
+       自己，违反 生成⊥验证。覆盖 (a) 都是 claude 且同 bin+model；(b) 都是
+       mimo；(c) 都是 codex（change ``spec-routing-invariant`` 补的既有漏洞）。
     3. ``mimo_exec_only``：review 路由到 MiMo（engine 含 'mimo'，或 claude_model
        / claude_bin 含 'mimo'）→ 违反 MiMo 仅限 coder。合并为单条 violation。
+    4. ``mimo_in_session``：coder 某 phase 后端为 mimo 且 dispatch 为
+       in-session → 违反 MiMo 只许 headless。
+
+    spec_writer ⊥ spec_review（change ``spec-routing-invariant`` 新增，与上述
+    四条同构，spec 侧独立判定、互不影响）：
+
+    5. ``spec_backend_unsupported`` / ``spec_engine_unsupported``：同 1，作用
+       于 spec_writer.effective_backend / spec_review.engine。
+    6. ``spec_gen_not_orthogonal``：同 2，覆盖 (a) claude 同 bin+model；(b)
+       mimo/mimo；(c) codex/codex。
+    7. ``spec_mimo_exec_only``：同 3，作用于 spec_review。
+    8. ``spec_mimo_in_session``：spec 生成恒 in-session（无 per-phase dispatch
+       配置），故 spec_writer.effective_backend == 'mimo' 即违规。
     """
     violations: list[dict] = []
     coder = cfg.coder
@@ -252,7 +268,8 @@ def check_routing(cfg: _config.Config) -> list[dict]:
         and coder.model == review.claude_model
     )
     both_mimo = effective_backend == "mimo" and review.engine == "mimo"
-    if same_claude_identity or both_mimo:
+    both_codex = effective_backend == "codex" and review.engine == "codex"
+    if same_claude_identity or both_mimo or both_codex:
         violations.append(
             {
                 "rule": "gen_not_orthogonal",
@@ -275,6 +292,12 @@ def check_routing(cfg: _config.Config) -> list[dict]:
 
     # 规则 4：in-session 绝不与 mimo 同源（mimo 只许 headless）
     _check_mimo_in_session(cfg, violations)
+
+    # 规则 5-8：spec_writer ⊥ spec_review（与上述四条同构，独立判定）
+    _check_spec_backend_engine_unsupported(cfg, violations)
+    _check_spec_gen_not_orthogonal(cfg, violations)
+    _check_spec_mimo_exec_only(cfg, violations)
+    _check_spec_mimo_in_session(cfg, violations)
 
     return violations
 
@@ -303,6 +326,107 @@ def _check_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
                     ),
                 }
             )
+
+
+def _check_spec_backend_engine_unsupported(cfg: _config.Config, violations: list[dict]) -> None:
+    """校验 spec_writer/spec_review 后端有效性（纯函数，原地追加 violation）。
+
+    与既有规则 1（``backend_unsupported`` / ``engine_unsupported``）同构。
+    """
+    spec_writer = cfg.spec_writer
+    spec_review = cfg.spec_review
+    effective_backend = spec_writer.effective_backend
+
+    if effective_backend not in _config.SUPPORTED_CODER_BACKENDS:
+        violations.append(
+            {
+                "rule": "spec_backend_unsupported",
+                "detail": (
+                    f"spec_writer.backend={effective_backend!r} 不在支持列表 "
+                    f"{_config.SUPPORTED_CODER_BACKENDS}"
+                ),
+            }
+        )
+    if spec_review.engine not in _config.SUPPORTED_ENGINES:
+        violations.append(
+            {
+                "rule": "spec_engine_unsupported",
+                "detail": (
+                    f"spec_review.engine={spec_review.engine!r} 不在支持列表 "
+                    f"{_config.SUPPORTED_ENGINES}"
+                ),
+            }
+        )
+
+
+def _check_spec_gen_not_orthogonal(cfg: _config.Config, violations: list[dict]) -> None:
+    """校验 spec_writer 与 spec_review 是否解析到同一执行身份（纯函数）。
+
+    与既有规则 2（``gen_not_orthogonal``）同构，覆盖三种同源形态：
+    (a) 双方均为 claude 且 bin+model 相同；(b) 双方均为 mimo；(c) 双方均为 codex。
+    """
+    spec_writer = cfg.spec_writer
+    spec_review = cfg.spec_review
+    effective_backend = spec_writer.effective_backend
+
+    same_claude_identity = (
+        effective_backend == "claude"
+        and spec_review.engine == "claude"
+        and spec_writer.bin == spec_review.claude_bin
+        and spec_writer.model == spec_review.claude_model
+    )
+    both_mimo = effective_backend == "mimo" and spec_review.engine == "mimo"
+    both_codex = effective_backend == "codex" and spec_review.engine == "codex"
+    if same_claude_identity or both_mimo or both_codex:
+        violations.append(
+            {
+                "rule": "spec_gen_not_orthogonal",
+                "detail": "spec_writer 与 spec_review 解析到同一执行身份，等于自己评自己",
+            }
+        )
+
+
+def _check_spec_mimo_exec_only(cfg: _config.Config, violations: list[dict]) -> None:
+    """校验 spec_review 是否路由到 MiMo（纯函数）。
+
+    与既有规则 3（``mimo_exec_only``）同构，多条件合并为单条 violation。
+    """
+    spec_review = cfg.spec_review
+    if (
+        _contains_mimo(spec_review.engine)
+        or _contains_mimo(spec_review.claude_model)
+        or _contains_mimo(spec_review.claude_bin)
+    ):
+        violations.append(
+            {
+                "rule": "spec_mimo_exec_only",
+                "detail": (
+                    "spec_review 路由含 MiMo（engine/claude_bin/claude_model 含 "
+                    "'mimo'），违反 MiMo 仅限执行"
+                ),
+            }
+        )
+
+
+def _check_spec_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
+    """校验 spec_writer 是否路由到 MiMo（纯函数）。
+
+    spec 生成的分发方式恒为 in-session（无 per-phase dispatch 配置，见
+    design.md D2），故 ``spec_writer.effective_backend == "mimo"`` 本身即蕴含
+    「mimo + in-session」，与既有规则 4（``mimo_in_session``）语义一致，
+    但无需像它一样遍历 phase/dispatch。
+    """
+    spec_writer = cfg.spec_writer
+    if spec_writer.effective_backend == "mimo":
+        violations.append(
+            {
+                "rule": "spec_mimo_in_session",
+                "detail": (
+                    "spec_writer 后端=mimo 但 spec 生成恒 in-session，"
+                    "违反 MiMo 只许 headless"
+                ),
+            }
+        )
 
 
 def run_routing(args: argparse.Namespace) -> None:
