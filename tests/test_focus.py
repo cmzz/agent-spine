@@ -116,6 +116,52 @@ def test_render_round_n_requires_implement_commit(env_setup, capsys, make_args, 
     assert payload["error"] == "missing_implement_commit"
 
 
+_SPEC_ATTRIBUTION_ENUM_VALUES = [
+    "spec-silent",
+    "spec-ambiguous",
+    "spec-contradicted",
+    "impl-deviation",
+]
+
+
+def test_round_0_and_round_n_both_include_spec_attribution_contract(
+    env_setup, capsys, make_args, tmp_path
+):
+    """回归 fix round 1 F1：Round 0 与 Round N 的输出要求必须同源，都得包含
+    spec_attribution 字段名与全部四个枚举值，避免 re-review 场景 reviewer 不知道
+    要填该字段导致 telemetry 信号缺失。"""
+    out0 = tmp_path / "round0.md"
+    _focus.render(
+        make_args(
+            round_n=0,
+            change_id="add-foo",
+            implement_commit=None,
+            output=str(out0),
+            project_context=None,
+        )
+    )
+    capsys.readouterr()
+    text0 = out0.read_text()
+
+    outn = tmp_path / "roundn.md"
+    _focus.render(
+        make_args(
+            round_n=2,
+            change_id="add-foo",
+            implement_commit="abc1234",
+            output=str(outn),
+            project_context=None,
+        )
+    )
+    capsys.readouterr()
+    textn = outn.read_text()
+
+    for text in (text0, textn):
+        assert "spec_attribution" in text
+        for value in _SPEC_ATTRIBUTION_ENUM_VALUES:
+            assert value in text
+
+
 def test_render_round_n_includes_history_hints(env_setup, capsys, make_args, tmp_path):
     out = tmp_path / "f.md"
     _focus.render(

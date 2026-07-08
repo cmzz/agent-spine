@@ -182,6 +182,26 @@ def load_project_context(
     return DEFAULT_PROJECT_CONTEXT, "default"
 
 
+SPEC_ATTRIBUTION_ENUM_SEMANTICS = """spec_attribution 四选一，用于判断该 finding 的根因是否可归因于 spec 文档本身：spec-silent = spec 未规定该行为；spec-ambiguous = spec 有规定但存在多种合理解读；spec-contradicted = 实现与 spec 明文相悖；impl-deviation = spec 明确无歧义，实现未照做。"""
+
+
+def _output_requirements_block() -> str:
+    """Round 0 与 Round N 共享的「输出要求」文案，含 spec_attribution 四值语义。
+
+    单一来源，避免两份模板各自维护导致 Round N 的 reviewer 提示漂移/缺失
+    spec_attribution 字段说明（见 fix round 1 finding F1）。
+    """
+    return f"""**输出要求（极重要）**：
+- 你的最终消息必须是**且仅是**一个合法的 JSON 对象，符合本次调用提供的 output-schema。
+- 字段含义：
+  - verdict: "approve" = 无任何 in_scope blocking 且无 advisory；"passed-with-advisory" = 无 in_scope blocking 但有 advisory；"changes-requested" = 至少 1 个 in_scope blocking。
+  - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope / spec_attribution。
+  - in_scope=true 表示与本 change diff 直接相关；diff 之外的既有问题或越界建议必须 in_scope=false，不计入 blocking。
+  - {SPEC_ATTRIBUTION_ENUM_SEMANTICS}
+- 与 tasks.md / design.md 决策一致的实现不作为 finding 报告。
+- 不要返回 markdown 包裹、不要返回散文、不要返回额外字段。"""
+
+
 def _round_0_template(change_id: str, project_context: str) -> str:
     return f"""本次审查的是 OpenSpec change `{change_id}` 的代码 diff。
 请先在仓库内运行：
@@ -205,15 +225,7 @@ def _round_0_template(change_id: str, project_context: str) -> str:
 4. 测试是否覆盖 spec 列出的验收场景与显式标注的边界情况；对并发 / 事务 / 锁 / 重试 / 竞态 / 部分失败场景，mock-only 测试视为"未充分覆盖"
 5. 与 project.md / CLAUDE.md 中规定的项目级约束的一致性
 
-**输出要求（极重要）**：
-- 你的最终消息必须是**且仅是**一个合法的 JSON 对象，符合本次调用提供的 output-schema。
-- 字段含义：
-  - verdict: "approve" = 无任何 in_scope blocking 且无 advisory；"passed-with-advisory" = 无 in_scope blocking 但有 advisory；"changes-requested" = 至少 1 个 in_scope blocking。
-  - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope / spec_attribution。
-  - in_scope=true 表示与本 change diff 直接相关；diff 之外的既有问题或越界建议必须 in_scope=false，不计入 blocking。
-  - spec_attribution 四选一，用于判断该 finding 的根因是否可归因于 spec 文档本身：spec-silent = spec 未规定该行为；spec-ambiguous = spec 有规定但存在多种合理解读；spec-contradicted = 实现与 spec 明文相悖；impl-deviation = spec 明确无歧义，实现未照做。
-- 与 tasks.md / design.md 决策一致的实现不作为 finding 报告。
-- 不要返回 markdown 包裹、不要返回散文、不要返回额外字段。
+{_output_requirements_block()}
 """
 
 
@@ -252,7 +264,7 @@ def _round_n_template(
 
 请直接报告本轮的新 findings 或仍未修复的 carry-over findings；不要重复列已修复的项。**对前几轮已被标注为"spec-aligned 不修"的 finding（见 $LOG_BASE/change.md 的 Carried Over / Advisory 段），不再重报**。
 
-输出要求同 Round 0：仅一个合法 JSON 对象，符合 output-schema；in_scope=false 不计入 blocking。
+{_output_requirements_block()}
 """
 
 
