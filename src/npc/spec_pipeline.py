@@ -891,6 +891,14 @@ def run_spec_fix_loop(review_fn, fix_fn, max_rounds: int) -> dict:
     语义：``max_rounds=N`` 表示「最多执行 N 次 fix」，review 轮次索引 0..N
     （共 N+1 次 review）。不复用 code review 的「blocking 单调下降代表收敛」判据
     ——spec 的 blocking 计数可以在改写后反弹，不代表卡死（D4）。
+
+    round 5 F1 修复：``spec_review_run`` 的每一条 ``ok=False`` 返回路径（gate 失败、
+    ``spec_routing_violation``、``dependency_missing``、``<engine>-exec-failed``、
+    ``invalid_spec_review_schema`` 等）都**不带 ``blocking`` 键**——只有 ``ok=True``
+    的成功评审结果才会写入 ``blocking``（见 spec_review_run 各 return 分支）。因此
+    以「``blocking`` 键是否存在」而非「``.get("blocking", 0) == 0``」来判定评审是否
+    真正跑完：前者对非门失败会显式落到 ``review-failed`` 分支并立刻终止循环（不再调用
+    fix_fn，不推进 round_n），避免把「评审没跑成」误判为「评审跑完且 clean」。
     """
     fix_calls = 0
     review_results: list[dict] = []
@@ -898,6 +906,15 @@ def run_spec_fix_loop(review_fn, fix_fn, max_rounds: int) -> dict:
     while True:
         result = review_fn(round_n)
         review_results.append(result)
+        if "blocking" not in result:
+            return {
+                "status": "review-failed",
+                "rounds": round_n + 1,
+                "fix_calls": fix_calls,
+                "review_results": review_results,
+                "error": result.get("error"),
+                "gate_failed": result.get("gate_failed"),
+            }
         if result.get("blocking", 0) == 0:
             return {
                 "status": "clean",

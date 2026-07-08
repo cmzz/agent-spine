@@ -529,6 +529,64 @@ def test_fix_loop_source_has_no_stale_detection_reference():
     assert "import trend" not in src
 
 
+def test_fix_loop_review_failure_without_ok_is_not_mistaken_for_clean():
+    """round 5 F1：非门失败（如 dependency_missing）没有 `.blocking` 键——
+    循环绝不能把它读成 `.get("blocking", 0) == 0` 而当作 clean。"""
+    calls = {"review": 0, "fix": 0}
+
+    def review_fn(round_n):
+        calls["review"] += 1
+        return {"ok": False, "error": "dependency_missing"}
+
+    def fix_fn(round_n):
+        calls["fix"] += 1
+
+    result = _sp.run_spec_fix_loop(review_fn, fix_fn, max_rounds=3)
+    assert result["status"] == "review-failed"
+    assert result["status"] != "clean"
+    assert result["error"] == "dependency_missing"
+    assert calls["fix"] == 0
+    assert calls["review"] == 1
+
+
+def test_fix_loop_review_failure_stops_immediately_not_retried():
+    """评审未真正跑完时不应重试掩盖——立即终止，不推进到下一轮 fix。"""
+    calls = {"review": 0, "fix": 0}
+
+    def review_fn(round_n):
+        calls["review"] += 1
+        return {"ok": False, "error": "claude-exec-failed"}
+
+    def fix_fn(round_n):
+        calls["fix"] += 1
+
+    result = _sp.run_spec_fix_loop(review_fn, fix_fn, max_rounds=3)
+    assert result["status"] == "review-failed"
+    assert result["rounds"] == 1
+    assert calls["fix"] == 0
+
+
+def test_fix_loop_gate_failed_review_result_also_not_clean():
+    """`gate_failed` 非空的确定性门失败同样没有 `.blocking` 键，同一分支处理。"""
+
+    def review_fn(round_n):
+        return {
+            "ok": False,
+            "change": "add-foo",
+            "round": round_n,
+            "gate_failed": "openspec_validate",
+            "gate_skipped": False,
+            "detail": "strict validation error",
+        }
+
+    def fix_fn(round_n):
+        pass
+
+    result = _sp.run_spec_fix_loop(review_fn, fix_fn, max_rounds=3)
+    assert result["status"] == "review-failed"
+    assert result["gate_failed"] == "openspec_validate"
+
+
 # ============================================================
 # 5. RESULT 契约（tasks 5.1–5.4）
 # ============================================================
