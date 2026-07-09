@@ -130,6 +130,41 @@
 - **WHEN** 执行 `npc spec interrogate decide --change <id> --decisions-md "<text>"`
 - **THEN** `.ok == false`，错误标识 `pattern_interrogation_missing`
 
+### Requirement: render_spec_writer 消费 pattern-interrogation.md
+`npc spec write run` 渲染的 write 轮 prompt MUST 列出 `openspec/changes/<id>/pattern-interrogation.md` 为必读输入。该 prompt MUST 含以下判据与指令的原文，判据 MUST 为机械的字符串存在性检查（`pattern-interrogation.md` 是否含 `## User Decisions (Interactive)` 这一 H2 标题），MUST NOT 要求 writer 对任一条 Open Question 单独判断其是否"已被回应"/"resolved"：
+
+- 若 `pattern-interrogation.md` 含 `## User Decisions (Interactive)` 标题：MUST 把该文件的 `## Open Questions` 段全文与 `## User Decisions (Interactive)` 段全文原样写入 `design.md` 的 `## Pattern Mapping` 段。
+- 若不含该标题：MUST 把 `## Open Questions` 段全文与 `## Assumptions` 段全文原样写入 `design.md` 的 `## Pattern Mapping` 与 `## Assumptions` 段。
+
+该 prompt MUST 另含以下指令：若本 change 的 `tasks.md` 需要列出涉及 ≥2 处调用点/文件的落点清单，MUST 先执行一条确定性搜索命令（`grep`/`rg`/`git grep`）枚举，并把命令原文与匹配计数写入该清单所在的 tasks.md 段落。
+
+#### Scenario: prompt 列出 pattern-interrogation.md 为必读输入
+- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
+- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 prompt 文件全文
+- **THEN** 其文本含子串 `pattern-interrogation.md`
+
+#### Scenario: prompt 含机械判据而非语义裁决指令
+- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
+- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
+- **THEN** 其文本含子串 `## User Decisions (Interactive)`
+- **AND** MUST NOT 含要求逐条判断 Open Question 是否"已被回应"或"resolved"的措辞
+
+#### Scenario: 含 User Decisions 标题分支的指令原文
+- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
+- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
+- **THEN** 其文本含"把 `## Open Questions` + `## User Decisions (Interactive)` 段原样写入 design.md 的 `## Pattern Mapping` 段"这一指令的原文（或与之逐字一致的表述）
+
+#### Scenario: 不含 User Decisions 标题分支的指令原文
+- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
+- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
+- **THEN** 其文本含"把 `## Open Questions` + `## Assumptions` 段原样写入 design.md 的 `## Pattern Mapping` 与 `## Assumptions` 段"这一指令的原文（或与之逐字一致的表述）
+
+#### Scenario: 多落点清单需先跑确定性搜索命令
+- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
+- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
+- **THEN** 其文本含要求"先执行确定性搜索命令（`grep`/`rg`/`git grep`）枚举涉及 ≥2 处调用点/文件的落点清单，并把命令原文与匹配计数写入 tasks.md 对应段落"的指令原文
+
+
 ## MODIFIED Requirements
 
 ### Requirement: spec writer 的 RESULT 契约
@@ -197,40 +232,6 @@
 - **AND** MUST NOT 含子串 `implementation-leak`
 - **AND** MUST NOT 含任何 `SPEC_REVIEW_SCHEMA` 的 `category` 枚举值
 - **AND** MUST NOT 含任何 `round-*.spec-review.json` 原文
-
-### Requirement: render_spec_writer 消费 pattern-interrogation.md
-`npc spec write run` 渲染的 write 轮 prompt MUST 列出 `openspec/changes/<id>/pattern-interrogation.md` 为必读输入。该 prompt MUST 含以下判据与指令的原文，判据 MUST 为机械的字符串存在性检查（`pattern-interrogation.md` 是否含 `## User Decisions (Interactive)` 这一 H2 标题），MUST NOT 要求 writer 对任一条 Open Question 单独判断其是否"已被回应"/"resolved"：
-
-- 若 `pattern-interrogation.md` 含 `## User Decisions (Interactive)` 标题：MUST 把该文件的 `## Open Questions` 段全文与 `## User Decisions (Interactive)` 段全文原样写入 `design.md` 的 `## Pattern Mapping` 段。
-- 若不含该标题：MUST 把 `## Open Questions` 段全文与 `## Assumptions` 段全文原样写入 `design.md` 的 `## Pattern Mapping` 与 `## Assumptions` 段。
-
-该 prompt MUST 另含以下指令：若本 change 的 `tasks.md` 需要列出涉及 ≥2 处调用点/文件的落点清单，MUST 先执行一条确定性搜索命令（`grep`/`rg`/`git grep`）枚举，并把命令原文与匹配计数写入该清单所在的 tasks.md 段落。
-
-#### Scenario: prompt 列出 pattern-interrogation.md 为必读输入
-- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
-- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 prompt 文件全文
-- **THEN** 其文本含子串 `pattern-interrogation.md`
-
-#### Scenario: prompt 含机械判据而非语义裁决指令
-- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
-- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
-- **THEN** 其文本含子串 `## User Decisions (Interactive)`
-- **AND** MUST NOT 含要求逐条判断 Open Question 是否"已被回应"或"resolved"的措辞
-
-#### Scenario: 含 User Decisions 标题分支的指令原文
-- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
-- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
-- **THEN** 其文本含"把 `## Open Questions` + `## User Decisions (Interactive)` 段原样写入 design.md 的 `## Pattern Mapping` 段"这一指令的原文（或与之逐字一致的表述）
-
-#### Scenario: 不含 User Decisions 标题分支的指令原文
-- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
-- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
-- **THEN** 其文本含"把 `## Open Questions` + `## Assumptions` 段原样写入 design.md 的 `## Pattern Mapping` 与 `## Assumptions` 段"这一指令的原文（或与之逐字一致的表述）
-
-#### Scenario: 多落点清单需先跑确定性搜索命令
-- **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
-- **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 write prompt 全文
-- **THEN** 其文本含要求"先执行确定性搜索命令（`grep`/`rg`/`git grep`）枚举涉及 ≥2 处调用点/文件的落点清单，并把命令原文与匹配计数写入 tasks.md 对应段落"的指令原文
 
 ### Requirement: 用户入口与 subagent 注册
 仓库 MUST 提供 `plugins/agent-spine/commands/spine-spec.md` 作为 `/spine-spec` 的入口，与 `plugins/agent-spine/agents/spine-spec-writer.md` 作为执行体契约。两者 MUST 在 `plugins/agent-spine/.claude-plugin/plugin.json` 的对应清单中注册。`spine-spec.md` MUST 支持 `--auto` 标志：省略时为交互档（关键闸口调用 `AskUserQuestion`），含 `--auto` 时为全自主档（全程不调用 `AskUserQuestion`），语义 MUST 与 `plugins/agent-spine/commands/spine-run.md` 的 `--auto` 判断逻辑一致。
