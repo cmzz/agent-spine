@@ -263,6 +263,85 @@ def test_non_dict_line_returns_structured_error(env_setup):
     assert not (p.run_dir / "lessons.md").exists()
 
 
+def test_non_utf8_events_returns_structured_error_no_throw(env_setup):
+    """F1 回归：events.jsonl 含非法 UTF-8 字节时，整文件解码在逐行 JSON 解析之前就会抛
+    UnicodeDecodeError（ValueError 子类，非 OSError）。best-effort 契约要求兜成
+    {ok:false, error:"events-invalid"}，不抛栈，且不写出 lessons.md。"""
+    p = env_setup
+    base = _paths.base_for(p, 1, "change-a")
+    _write_state(p, [{"seq": 1, "change_id": "change-a", "status": "archived",
+                      "base": str(base), "phases": {}}])
+    base.mkdir(parents=True, exist_ok=True)
+    # 非法 UTF-8 起始字节 0xff：read_text(encoding="utf-8") 会抛 UnicodeDecodeError
+    (base / "events.jsonl").write_bytes(b"\xff\xfe not valid utf-8\n")
+
+    res = _lessons.extract_and_append(p, 1)  # 不得抛栈
+    assert res["ok"] is False
+    assert res["error"] == "events-invalid"
+    assert res["change_id"] == "change-a"
+    assert not (p.run_dir / "lessons.md").exists()
+
+
+def test_non_utf8_lessons_md_does_not_crash_record(env_setup):
+    """既有 lessons.md 含非法 UTF-8 字节时，record 路径的 _heading_exists 幂等探测
+    （_entry_change_ids）与 append 前的 read-back 都会解码失败。二者都必须结构化降级/兜底，
+    不抛 UnicodeDecodeError。"""
+    p = env_setup
+    base = _paths.base_for(p, 1, "change-a")
+    _write_state(p, [{"seq": 1, "change_id": "change-a", "status": "archived",
+                      "base": str(base), "phases": {}}])
+    _write_events(base, [_fix_done(1, cats="validation", notes="ok")])
+    lp = p.run_dir / "lessons.md"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_bytes(b"\xff\xfe corrupt lessons\n")
+
+    res = _lessons.extract_and_append(p, 1)  # 不得抛栈
+    assert res["ok"] is False
+    assert res["error"] == "lessons-write-failed"
+    assert res["change_id"] == "change-a"
+
+
+def test_non_utf8_state_json_record_structured_error(env_setup):
+    """state.json 含非法 UTF-8 字节时，read_state 的 json.load 文本解码抛 UnicodeDecodeError
+    （非 json.JSONDecodeError 也非 OSError）。record 路径必须兜成 state-invalid，不抛栈。"""
+    p = env_setup
+    _write_state(p, [{"seq": 1, "change_id": "change-a", "status": "archived", "phases": {}}])
+    p.state_json.write_bytes(b"\xff\xfe not utf-8 state\n")
+
+    res = _lessons.extract_and_append(p, 1)  # 不得抛栈
+    assert res["ok"] is False
+    assert res["error"] == "state-invalid"
+
+
+def test_non_utf8_state_json_gate_structured_error(env_setup):
+    """gate 只读路径同样兜 state.json 非法 UTF-8：gate_candidates 与 apply_gate_decision
+    都返回 state-invalid，不抛栈。"""
+    p = env_setup
+    _write_state(p, [{"seq": 1, "change_id": "c0", "status": "archived", "dag_layer": 0, "phases": {}}])
+    p.state_json.write_bytes(b"\xff\xfe not utf-8 state\n")
+
+    res = _lessons.gate_candidates(p, 0)
+    assert res["ok"] is False and res["error"] == "state-invalid"
+
+    res2 = _lessons.apply_gate_decision(p, 0, [], "skip-rewrite")
+    assert res2["ok"] is False and res2["error"] == "state-invalid"
+
+
+def test_non_utf8_lessons_md_gate_does_not_crash(env_setup):
+    """gate 路径 _entry_count 读 lessons.md：含非法 UTF-8 时不抛栈，退化为 0 条目
+    （has_candidates=False，无新增可判定）。"""
+    p = env_setup
+    _gate_state(p, lessons_entries=0, cursor=0)
+    lp = p.run_dir / "lessons.md"
+    lp.parent.mkdir(parents=True, exist_ok=True)
+    lp.write_bytes(b"\xff\xfe corrupt\n")
+
+    res = _lessons.gate_candidates(p, 0)  # 不得抛栈
+    assert res["ok"] is True
+    assert res["total_entries"] == 0
+    assert res["has_candidates"] is False
+
+
 def test_entries_appended_recorded_in_state(env_setup):
     p = env_setup
     base = _paths.base_for(p, 1, "change-a")

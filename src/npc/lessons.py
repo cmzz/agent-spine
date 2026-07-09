@@ -51,7 +51,9 @@ def _entry_change_ids(lessons_path: Path) -> list[str]:
         return []
     try:
         text = lessons_path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # 损坏 lessons.md（IO 失败或非法 UTF-8 字节）按「无可识别条目」降级，
+        # 不抛栈——UnicodeDecodeError 是 ValueError 子类，不属 OSError，必须显式列出。
         return []
     out: list[str] = []
     for line in text.splitlines():
@@ -121,7 +123,13 @@ def _parse_fix_done_events(events_path: Path) -> list[dict]:
     MUST NOT 打开任何 reviewer 产出文件。
     """
     rounds: dict[int, dict] = {}
-    text = events_path.read_text(encoding="utf-8")  # OSError 由调用方兜底
+    try:
+        text = events_path.read_text(encoding="utf-8")  # OSError 由调用方兜底
+    except UnicodeDecodeError as e:
+        # 非法 UTF-8 字节属「损坏 events.jsonl」，与 malformed json 同类——UnicodeDecodeError
+        # 是 ValueError 子类而非 OSError，会在逐行 JSON 解析之前逃逸，故在此显式映射为
+        # EventsInvalidError，由调用方兜成 {ok:false, error:"events-invalid"}。
+        raise EventsInvalidError(f"non-utf8 bytes in events.jsonl: {e}") from e
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -221,7 +229,10 @@ def extract_and_append(p: _paths.Paths, seq: int) -> dict:
             state = _state.read_state(p.state_json)
         except FileNotFoundError:
             return {"ok": False, "error": "state-missing"}
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # state.json 含非法 UTF-8 字节时 json.load 的文本解码会抛 UnicodeDecodeError
+            # （ValueError 子类，非 json.JSONDecodeError 也非 OSError）——同属「损坏 state」，
+            # 一并兜成结构化 state-invalid，best-effort 不抛栈。
             return {"ok": False, "error": "state-invalid", "detail": str(e)}
 
         progress = state.get("progress") or []
@@ -280,7 +291,9 @@ def extract_and_append(p: _paths.Paths, seq: int) -> dict:
             # 段落之间留一个空行分隔
             sep = "" if (not existing or existing.endswith("\n\n")) else ("\n" if existing.endswith("\n") else "\n\n")
             lessons_path.write_text(existing + sep + md, encoding="utf-8")
-        except OSError as e:
+        except (OSError, UnicodeDecodeError) as e:
+            # 读回既有 lessons.md 时若其含非法 UTF-8 字节（UnicodeDecodeError，非 OSError），
+            # 无法安全 append —— best-effort 返回结构化错误而非抛栈。
             return {"ok": False, "error": "lessons-write-failed", "detail": str(e), "change_id": change_id}
 
         # 落 state.lessons.entries_appended（同锁内，避免重复 record）
@@ -318,7 +331,10 @@ def gate_candidates(p: _paths.Paths, layer_idx: int) -> dict:
         state = _state.read_state(p.state_json)
     except FileNotFoundError:
         return {"ok": False, "error": "state-missing"}
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        # state.json 含非法 UTF-8 字节时 json.load 的文本解码会抛 UnicodeDecodeError
+        # （ValueError 子类，非 json.JSONDecodeError 也非 OSError）——同属「损坏 state」，
+        # 一并兜成结构化 state-invalid，best-effort 不抛栈。
         return {"ok": False, "error": "state-invalid", "detail": str(e)}
 
     progress = state.get("progress") or []
@@ -371,7 +387,10 @@ def apply_gate_decision(
             state = _state.read_state(p.state_json)
         except FileNotFoundError:
             return {"ok": False, "error": "state-missing"}
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            # state.json 含非法 UTF-8 字节时 json.load 的文本解码会抛 UnicodeDecodeError
+            # （ValueError 子类，非 json.JSONDecodeError 也非 OSError）——同属「损坏 state」，
+            # 一并兜成结构化 state-invalid，best-effort 不抛栈。
             return {"ok": False, "error": "state-invalid", "detail": str(e)}
 
         progress = state.get("progress") or []
