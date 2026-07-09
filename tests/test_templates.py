@@ -92,6 +92,36 @@ def test_render_fixer_commit_format_includes_change_id_and_round():
     assert 'fix(change-x): review round 7' in text
 
 
+def test_render_implementer_includes_atomic_add_discipline():
+    text = templates.render_implementer("c", "/b", "/r")
+    assert "git add -A" in text
+    assert "git add ." in text
+    assert "git diff --cached --name-only" in text
+    assert "git restore --staged" in text
+    assert "git stash" in text
+    # commit 清单 ↔ summary.md 一致的自报口径
+    assert "Files Modified" in text
+
+
+def test_render_fixer_includes_atomic_add_discipline():
+    text = templates.render_fixer(
+        "c", 1, "abc", "/b", "/r", "F1\n", ["validation"], [3]
+    )
+    assert "git add -A" in text
+    assert "git add ." in text
+    assert "git diff --cached --name-only" in text
+    assert "git restore --staged" in text
+    assert "git stash" in text
+
+
+def test_atomic_add_discipline_shared_constant_single_source():
+    # 两个入口引用同一常量，文案完全一致，防止漂移
+    impl = templates.render_implementer("c", "/b", "/r")
+    fix = templates.render_fixer("c", 1, "abc", "/b", "/r", "F1\n", [], [])
+    assert templates.ATOMIC_ADD_DISCIPLINE_MD in impl
+    assert templates.ATOMIC_ADD_DISCIPLINE_MD in fix
+
+
 def test_render_spawn_prompt_implement_minimal():
     s = templates.render_spawn_prompt(
         phase="implement",

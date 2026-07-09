@@ -62,6 +62,9 @@ RESULT: commit=- tasks=<已完成数> tests=fail summary=<路径或-> notes=<关
 
 - **先 Read prompt 文件再动手**，不要凭引导语猜任务。
 - **改动最小、聚焦当前 change**；不顺手重构无关代码。
+- **原子 `git add` 纪律**：只 `git add` 自己明确改动的文件，逐一枚举文件路径；**禁止** `git add -A` / `git add .` / 任何隐式匹配未审视文件的通配 add——本 worktree 内可能并存 npc 写入的 telemetry/state 等无关文件，通配 add 会误卷入 commit。**禁止** `git stash` / `git reset --hard` / 任何丢弃未提交改动的 `git checkout` / `git restore` 破坏性操作。commit 前 MUST 用 `git diff --cached --name-only` 核验 index；发现无法归因给本次任务的 staged 条目，只许**非破坏性 unstage**（`git restore --staged <path>` / `git reset -- <path>`，只改 index）后重新核验，MUST NOT 用破坏性手段清理。若某文件的未暂存改动里混入无法归因的 hunk，MUST NOT 整文件 `git add`，只能在能精确核验前提下做 hunk 级暂存，否则按下面失败路径停止。
+- **commit 文件清单 ↔ summary.md 一致（自报口径）**：本次 commit 实际改动的文件集合必须与 summary.md 逐文件改动清单（"改了什么" / "Files Modified"）一致，无遗漏、无多余。这是可被 reviewer / 人工核验的自报口径，不是 npc 确定性 gate。
+- **无法归因就停止并按既有失败态 RESULT 上报**：遇到无法归因给本次任务的工作区 / index 改动或冲突文件，以致无法只暂存明确改动的文件、也无法通过非破坏性 unstage 达成干净边界时，MUST NOT 继续提交、MUST NOT 静默忽略——停止提交流程，用本阶段既有的失败态 RESULT schema（key 集合不变，不新增/删除/改写任何 key）上报，`notes` 只写一行阻塞原因，完整文件路径清单与逐项状态写入 summary.md，交由 reviewer / 编排者 / 人工处理。
 - **禁止以 stub / 占位实现充数勾选 task**：空函数体、恒定返回值、未覆盖核心逻辑的简化分支都不算完成——task 只有在核心逻辑真正实现后才能勾 `[x]`，宁可如实报未完成也不用占位实现假装干完。
 - **禁止删除、注释掉或 skip 任何既有测试来换取 `tests=pass`**，也禁止以放宽断言范围、移除关键覆盖点、跳过关键分支等方式弱化既有测试——既有测试是既有正确性的证据，测试挡路时修实现而非删/弱化测试；测试确需变更时在 summary.md 说明理由。
 - **commit 与 summary.md 缺一不可**——主 session 的 `npc implement record` / `npc fix record` 会校验两者存在，缺了会判你失败。
