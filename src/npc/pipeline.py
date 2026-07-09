@@ -581,6 +581,74 @@ def _render_focus(
     return text, src, fixed_count
 
 
+def _execute_review_pass(
+    *,
+    selected_engine: str,
+    review_cfg,
+    repo_root: Path,
+    schema_path: Path,
+    focus_text: str,
+    review_out: Path,
+    events_out: Path,
+    timeout_sec: int,
+    engine_bin: str,
+    pt: Path,
+    attempts: int,
+) -> tuple[dict | None, str | None]:
+    """执行单个 review pass 的引擎调用（含重试）。返回 ``(review_data, last_error)``。
+
+    ``review_data is None`` 表示重试预算耗尽仍未产出合法 JSON。纯粹的执行 + 解析，
+    不做 phase/telemetry 副作用——供 pass1 与 round-0 对抗式 pass2 共用（见 change
+    review-r0-adversarial-pass D7 顺序执行）。
+    """
+    review_data: dict | None = None
+    last_error: str | None = None
+    for _attempt in range(attempts):
+        if review_out.exists():
+            review_out.unlink()
+        if events_out.exists():
+            events_out.unlink()
+        if selected_engine == "codex":
+            rc = _codex_exec(
+                repo_root=repo_root,
+                schema_path=schema_path,
+                focus_text=focus_text,
+                review_out=review_out,
+                events_out=events_out,
+                timeout_sec=timeout_sec,
+                codex_bin=engine_bin,
+                portable_timeout=pt,
+            )
+        else:
+            rc = _claude_exec(
+                repo_root=repo_root,
+                schema_path=schema_path,
+                focus_text=focus_text,
+                review_out=review_out,
+                events_out=events_out,
+                timeout_sec=timeout_sec,
+                claude_bin=engine_bin,
+                portable_timeout=pt,
+                model=review_cfg.claude_model,
+                extra_args=review_cfg.claude_extra_args,
+            )
+        if rc == 0 and review_out.is_file():
+            raw = review_out.read_text(encoding="utf-8")
+            try:
+                review_data = json.loads(raw)
+                break
+            except json.JSONDecodeError as e:
+                last_error = _classify_bad_review_output(raw, e)
+                review_data = None
+        else:
+            last_error = (
+                f"exit_code={rc}"
+                if rc != 0
+                else "review_json_missing_after_engine_exit_0"
+            )
+    return review_data, last_error
+
+
 def run_review_round(
     p: _paths.Paths,
     seq: int,
@@ -650,55 +718,35 @@ def run_review_round(
         engine_bin = _find_codex_bin(codex_bin or review_cfg.codex_bin)
     else:
         engine_bin = _find_claude_bin(review_cfg.claude_bin)
+    # 最终归一化产物路径恒为 round-{n}.review.json（下游硬编码，见 D3）。
     review_path = base / f"round-{round_n}.review.json"
     events_path = base / f"round-{round_n}.events.jsonl"
 
-    review_data: dict | None = None
-    last_error: str | None = None
+    # round-0 双通道判定：round_n==0 且配置开启时，pass1 原始产物落 pass1.json，
+    # 合并结果写 round-0.review.json；否则 pass1 直接写最终路径（单通道，行为不变）。
+    is_adversarial_round0 = round_n == 0 and review_cfg.adversarial_round0 is True
+    pass1_review_path = (
+        base / "round-0.review.pass1.json" if is_adversarial_round0 else review_path
+    )
+
     attempts = retries + 1
-    for attempt in range(attempts):
-        if review_path.exists():
-            review_path.unlink()
-        if events_path.exists():
-            events_path.unlink()
-        if selected_engine == "codex":
-            rc = _codex_exec(
-                repo_root=p.repo_root,
-                schema_path=p.schema_path,
-                focus_text=focus_text,
-                review_out=review_path,
-                events_out=events_path,
-                timeout_sec=timeout_sec,
-                codex_bin=engine_bin,
-                portable_timeout=pt,
-            )
-        else:
-            rc = _claude_exec(
-                repo_root=p.repo_root,
-                schema_path=p.schema_path,
-                focus_text=focus_text,
-                review_out=review_path,
-                events_out=events_path,
-                timeout_sec=timeout_sec,
-                claude_bin=engine_bin,
-                portable_timeout=pt,
-                model=review_cfg.claude_model,
-                extra_args=review_cfg.claude_extra_args,
-            )
-        if rc == 0 and review_path.is_file():
-            raw = review_path.read_text(encoding="utf-8")
-            try:
-                review_data = json.loads(raw)
-                break
-            except json.JSONDecodeError as e:
-                last_error = _classify_bad_review_output(raw, e)
-                review_data = None
-        else:
-            last_error = (
-                f"exit_code={rc}"
-                if rc != 0
-                else "review_json_missing_after_engine_exit_0"
-            )
+    # telemetry 对抗字段：默认 False/None（覆盖情形 2/3/4/5，见 D6）。
+    adversarial_pass_ran = False
+    adversarial_blocking_count: int | None = None
+
+    review_data, last_error = _execute_review_pass(
+        selected_engine=selected_engine,
+        review_cfg=review_cfg,
+        repo_root=p.repo_root,
+        schema_path=p.schema_path,
+        focus_text=focus_text,
+        review_out=pass1_review_path,
+        events_out=events_path,
+        timeout_sec=timeout_sec,
+        engine_bin=engine_bin,
+        pt=pt,
+        attempts=attempts,
+    )
 
     if review_data is None:
         error_code = f"{selected_engine}-exec-failed"
@@ -728,6 +776,8 @@ def run_review_round(
             outcome_reason=error_code,
             state_json=p.state_json,
             run_events=p.run_events,
+            adversarial_pass_ran=False,
+            adversarial_blocking_count=None,
         )
         return {
             "ok": False,
@@ -739,6 +789,41 @@ def run_review_round(
             "attempts": attempts,
             "events_path": str(events_path),
         }
+
+    # 3b. round-0 对抗式 pass2（仅在 pass1 成功后顺序执行；见 D6/D7）
+    if is_adversarial_round0:
+        adv_focus_text = _focus._adversarial_round_0_template(change_id)
+        (base / "round-0.adversarial.focus.md").write_text(
+            adv_focus_text, encoding="utf-8"
+        )
+        adv_review_path = base / "round-0.review.pass2.adversarial.json"
+        adv_events_path = base / "round-0.adversarial.events.jsonl"
+        pass2_data, _pass2_err = _execute_review_pass(
+            selected_engine=selected_engine,
+            review_cfg=review_cfg,
+            repo_root=p.repo_root,
+            schema_path=p.schema_path,
+            focus_text=adv_focus_text,
+            review_out=adv_review_path,
+            events_out=adv_events_path,
+            timeout_sec=timeout_sec,
+            engine_bin=engine_bin,
+            pt=pt,
+            attempts=attempts,
+        )
+        if pass2_data is not None:
+            # 情形 1：双 pass 成功 → 合并，adversarial_pass_ran=True，count 取 side-channel
+            merged, stats = _review.merge_review_passes(review_data, pass2_data)
+            adversarial_pass_ran = True
+            adversarial_blocking_count = stats["adversarial_blocking_count"]
+        else:
+            # 情形 2：pass2 失败降级 → 以空 findings 替身参与合并，等价 pass1-only；
+            # adversarial_pass_ran 保持 False、count 保持 None（D6）
+            merged, _stats = _review.merge_review_passes(review_data, {"findings": []})
+        review_path.write_text(
+            json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        review_data = merged
 
     # 4. parse
     try:
@@ -770,6 +855,8 @@ def run_review_round(
             outcome_reason="invalid_review_schema",
             state_json=p.state_json,
             run_events=p.run_events,
+            adversarial_pass_ran=adversarial_pass_ran,
+            adversarial_blocking_count=adversarial_blocking_count,
         )
         return {
             "ok": False,
@@ -807,6 +894,8 @@ def run_review_round(
         outcome_reason=None,
         state_json=p.state_json,
         run_events=p.run_events,
+        adversarial_pass_ran=adversarial_pass_ran,
+        adversarial_blocking_count=adversarial_blocking_count,
     )
 
     # 6. fixer findings 自动渲染（下一轮 fix 用），仅在 blocking>0 时

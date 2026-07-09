@@ -69,6 +69,7 @@ EMIT_FIELD_CONTRACT: dict[str, frozenset[str]] = {
         "phase", "round", "status", "duration_ms", "verdict", "blocking_count",
         "blocking_categories", "engine", "retry_count", "outcome_reason",
         "tokens", "pointer", "spec_attribution_counts",
+        "adversarial_pass_ran", "adversarial_blocking_count",
     }),
     "archive.done": frozenset({
         "proj_key", "canonical_proj_key", "run_ts", "change_seq", "change_id",
@@ -956,8 +957,17 @@ def emit_review_round(
     state_json: Path | str | None,
     run_events: Path | str | None,
     spec_attribution_counts: dict[str, int] | None = None,
+    adversarial_pass_ran: bool = False,
+    adversarial_blocking_count: int | None = None,
 ) -> None:
-    """review-rN 一轮结束（成功 / 失败都调用一次）。"""
+    """review-rN 一轮结束（成功 / 失败都调用一次）。
+
+    ``adversarial_pass_ran``：round-0 对抗式 pass 是否真正运行并产出合法 JSON。
+    任何情况下都是 ``bool``（False，不是 None）；仅 round-0 双 pass 均成功时为 True。
+    ``adversarial_blocking_count``：当且仅当 ``adversarial_pass_ran`` 为 True 时为
+    非 None 的 int（来源 pass2 且未被去重的 blocking finding 数），其余情形恒为 None。
+    见 change review-r0-adversarial-pass design.md D6 状态矩阵。
+    """
     base_p = Path(base)
     focus_md = base_p / f"round-{round_n}.focus.md"
     review_json = base_p / f"round-{round_n}.review.json"
@@ -980,6 +990,8 @@ def emit_review_round(
         "outcome_reason": outcome_reason,
         "tokens": _build_tokens(focus_md, review_json),
         "spec_attribution_counts": spec_attribution_counts,
+        "adversarial_pass_ran": adversarial_pass_ran,
+        "adversarial_blocking_count": adversarial_blocking_count,
         "pointer": _build_pointer(
             state_json=state_json,
             run_events=run_events,

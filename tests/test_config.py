@@ -204,3 +204,31 @@ def test_verify_rerun_tests_non_bool_rejected(tmp_path):
     repo = _write_cfg(tmp_path, '[verify]\nrerun_tests = "yes"\n')
     with pytest.raises(ConfigError, match="bool"):
         load_config(repo)
+
+
+# ============================================================
+# [review].adversarial_round0（change review-r0-adversarial-pass task 1.2）
+# ============================================================
+
+
+def test_adversarial_round0_default_true(tmp_path):
+    """缺省默认 True（开启新行为）。"""
+    from npc.config import load_config
+    cfg = load_config(tmp_path)
+    assert cfg.review.adversarial_round0 is True
+
+
+def test_adversarial_round0_false_parsed(tmp_path):
+    """[review].adversarial_round0 = false → False。"""
+    from npc.config import load_config
+    repo = _write_cfg(tmp_path, '[review]\nadversarial_round0 = false\n')
+    cfg = load_config(repo)
+    assert cfg.review.adversarial_round0 is False
+
+
+def test_adversarial_round0_non_bool_rejected(tmp_path):
+    """非法类型（非 bool）→ ConfigError。"""
+    from npc.config import load_config, ConfigError
+    repo = _write_cfg(tmp_path, '[review]\nadversarial_round0 = "yes"\n')
+    with pytest.raises(ConfigError, match="adversarial_round0"):
+        load_config(repo)

@@ -162,6 +162,77 @@ def test_round_0_and_round_n_both_include_spec_attribution_contract(
             assert value in text
 
 
+# ============================================================
+# 对抗式 round-0 模板（change review-r0-adversarial-pass）
+# ============================================================
+
+_ADVERSARIAL_FORBIDDEN = [
+    "proposal.md",
+    "tasks.md",
+    "specs/",
+    "design.md",
+    "openspec/project.md",
+    "CLAUDE.md",
+]
+
+
+def test_adversarial_template_no_spec_file_refs():
+    """负向测试（task 2.5）：对抗式模板 MUST NOT 含任何 spec 文件引用字样。"""
+    text = _focus._adversarial_round_0_template("add-foo")
+    for forbidden in _ADVERSARIAL_FORBIDDEN:
+        assert forbidden not in text, f"对抗式模板不应含 {forbidden!r}"
+
+
+def test_adversarial_template_no_authority_disclaimer():
+    """task 2.4：pass2 变体 MUST NOT 含"与 tasks.md / design.md 决策一致"免责条款。"""
+    text = _focus._adversarial_round_0_template("add-foo")
+    assert "决策一致" not in text
+    assert "权威决策" not in text
+
+
+def test_adversarial_template_has_diff_command_and_change_id():
+    text = _focus._adversarial_round_0_template("add-foo")
+    assert "add-foo" in text
+    assert "git --no-pager diff HEAD~1..HEAD" in text
+    # 不得用裸 git diff（clean worktree 为空）：所有 "git " + "diff" 都必须带 --no-pager
+    assert "git diff" not in text  # 裸 git diff 不出现
+
+
+def test_adversarial_template_has_four_focus_points():
+    """task 2.2 / spec Scenario：四个审查重点关键词齐备。"""
+    text = _focus._adversarial_round_0_template("add-foo")
+    assert "资源释放" in text or "double-free" in text
+    assert "边界" in text
+    assert "急切求值" in text or "短路" in text
+    assert "并发" in text or "生命周期" in text
+
+
+def test_adversarial_template_fixed_attribution_and_in_scope_instructions():
+    """task 2.3 / D5：固定指令 spec-silent + in_scope 默认 true。"""
+    text = _focus._adversarial_round_0_template("add-foo")
+    assert "spec-silent" in text
+    assert "in_scope=true" in text
+
+
+def test_adversarial_template_retains_schema_output_and_spec_attribution_semantics():
+    """task 2.4：pass2 仍保留 JSON schema 输出要求与 spec_attribution 四值语义。"""
+    text = _focus._adversarial_round_0_template("add-foo")
+    assert "output-schema" in text
+    for value in _SPEC_ATTRIBUTION_ENUM_VALUES:
+        assert value in text
+
+
+def test_output_requirements_block_disclaimer_toggle():
+    """参数化单一来源：True 保留免责条款（现文案），False 去除且不含 tasks/design 字样。"""
+    with_disclaimer = _focus._output_requirements_block(authority_disclaimer=True)
+    without = _focus._output_requirements_block(authority_disclaimer=False)
+    assert "与 tasks.md / design.md 决策一致的实现不作为 finding 报告" in with_disclaimer
+    assert "tasks.md" not in without
+    assert "design.md" not in without
+    # 默认参数保持 pass1/round-N 现文案不变
+    assert _focus._output_requirements_block() == with_disclaimer
+
+
 def test_render_round_n_includes_history_hints(env_setup, capsys, make_args, tmp_path):
     out = tmp_path / "f.md"
     _focus.render(

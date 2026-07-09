@@ -620,6 +620,16 @@ PROMPT_TEXT=$(printf '%s' "$SPAWN" | jq -r '.prompt')
 7. **一次 `update_state`** 完成：`phase exit review-rN done`（带 metrics）+ update_trend + categories_seen 合并
 8. blocking>0 时自动渲染下一轮 fix.findings：`<base>/round-(N+1).fix.findings.md`
 
+**round-0 双 pass 对抗式评审**（`round_n == 0` 且 `[review].adversarial_round0 = true`，默认开）：
+
+在既有 compliance pass（pass1）成功产出后，顺序追加一个 **diff-only 对抗式 pass2**——pass2 的 focus 模板不注入 project context、不指示读 proposal/tasks/specs/design/project.md/CLAUDE.md，只指示 `git --no-pager diff HEAD~1..HEAD` 并以「假设 diff 必有 bug」框架排查四个重点（资源释放/double-free、边界与符号处理、急切求值/短路语义、并发与生命周期）。两 pass 沿用同一 `--engine` 与 `--retries`。两份 findings 按 `(file, line_range, category)` 精确去重（pass1 优先）、重编号 `F1..Fn`、重算 verdict 后写入既有 `round-0.review.json`（路径不变，下游零改动）。
+
+- 新增产物文件：`round-0.review.pass1.json`（pass1 原始）、`round-0.adversarial.focus.md`（pass2 focus）、`round-0.review.pass2.adversarial.json`（pass2 原始）、`round-0.adversarial.events.jsonl`（pass2 events）。
+- **降级**：pass2 重试耗尽仍未产出合法 JSON 时不拖垮整轮——以空 findings 替身参与合并（等价 pass1-only），round-0 仍 `ok=true`，telemetry 标记 `adversarial_pass_ran=false`。pass1 自身失败仍按既有行为使整轮失败，pass2 不执行。
+- `round >= 1` 或 `adversarial_round0 = false`：保持单通道，恰调一次引擎，不产出任何 `*.adversarial.*` 文件。
+
+**配置项** `[review].adversarial_round0`（bool，默认 `true`）：显式 `false` 关闭对抗式 pass2，回退 round-0 单通道（成本敏感场景；对抗 pass 是一次额外完整引擎调用）。
+
 **stdout（成功）**：
 
 ```json
@@ -820,6 +830,8 @@ RESULT: commit=<hash> fixed=<n> tests=<pass|fail> summary=<path> categories_scan
 | `engine` | string | review.round / spec_review.round 专用：`codex` / `claude` |
 | `retry_count` | int | review codex 重试次数 |
 | `outcome_reason` | string \| null | failed 时的 reason |
+| `adversarial_pass_ran` | bool | review.round 专用：round-0 对抗式 pass2 是否真正运行并产出合法 JSON。任何情况下都是 `true`/`false`（绝不为 `null`）；仅 round-0 双 pass 均成功时为 `true`，pass2 失败降级 / pass1 失败 / `adversarial_round0=false` / `round>=1` 均为 `false` |
+| `adversarial_blocking_count` | int \| null | review.round 专用：当且仅当 `adversarial_pass_ran=true` 时为非 null 的 int（来源 pass2 且未被去重的 in_scope blocking finding 数），其余情形恒为 `null` |
 | `gate_failed`, `gate_skipped`, `gate_rule_hits` | spec_review.round 专用 | 门失败标识 / 门是否跳过 / gate_cmd stdout 的 `rule_hits` 原样透传 |
 | `archive_commit`, `total_rounds` | archive.done 专用 | |
 | `pointer` | object | `{state_json, run_events, per_change_events, summary_md, review_json, spec_review_json, focus_md, prompt_md}` 绝对路径 |

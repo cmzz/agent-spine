@@ -185,21 +185,61 @@ def load_project_context(
 SPEC_ATTRIBUTION_ENUM_SEMANTICS = """spec_attribution 四选一，用于判断该 finding 的根因是否可归因于 spec 文档本身：spec-silent = spec 未规定该行为；spec-ambiguous = spec 有规定但存在多种合理解读；spec-contradicted = 实现与 spec 明文相悖；impl-deviation = spec 明确无歧义，实现未照做。"""
 
 
-def _output_requirements_block() -> str:
-    """Round 0 与 Round N 共享的「输出要求」文案，含 spec_attribution 四值语义。
+def _output_requirements_block(authority_disclaimer: bool = True) -> str:
+    """「输出要求」文案的参数化单一来源，含 spec_attribution 四值语义。
 
-    单一来源，避免两份模板各自维护导致 Round N 的 reviewer 提示漂移/缺失
+    单一来源，避免多份模板各自维护导致 reviewer 提示漂移/缺失
     spec_attribution 字段说明（见 fix round 1 finding F1）。
+
+    ``authority_disclaimer``：
+    - ``True``（默认，pass1 / round-N compliance 变体）：保留「与 tasks.md /
+      design.md 决策一致的实现不作为 finding 报告」免责条款，现文案不变。
+    - ``False``（pass2 对抗式变体）：MUST NOT 含该免责条款及任何
+      tasks.md / design.md 字样——对抗式 pass 刻意不引用项目权威决策，
+      避免"这是故意的"压制真实 bug（见 change review-r0-adversarial-pass D1）。
     """
+    disclaimer_line = (
+        "\n- 与 tasks.md / design.md 决策一致的实现不作为 finding 报告。"
+        if authority_disclaimer
+        else ""
+    )
     return f"""**输出要求（极重要）**：
 - 你的最终消息必须是**且仅是**一个合法的 JSON 对象，符合本次调用提供的 output-schema。
 - 字段含义：
   - verdict: "approve" = 无任何 in_scope blocking 且无 advisory；"passed-with-advisory" = 无 in_scope blocking 但有 advisory；"changes-requested" = 至少 1 个 in_scope blocking。
   - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope / spec_attribution。
   - in_scope=true 表示与本 change diff 直接相关；diff 之外的既有问题或越界建议必须 in_scope=false，不计入 blocking。
-  - {SPEC_ATTRIBUTION_ENUM_SEMANTICS}
-- 与 tasks.md / design.md 决策一致的实现不作为 finding 报告。
+  - {SPEC_ATTRIBUTION_ENUM_SEMANTICS}{disclaimer_line}
 - 不要返回 markdown 包裹、不要返回散文、不要返回额外字段。"""
+
+
+def _adversarial_round_0_template(change_id: str) -> str:
+    """round-0 对抗式（pass2）focus 模板：不注入 project context、不指示读
+    proposal/tasks/specs/design/project.md/CLAUDE.md，只看 diff、假设必有 bug。
+
+    见 change review-r0-adversarial-pass D1/D5：唯一输入是
+    ``git --no-pager diff HEAD~1..HEAD``，唯一任务是证伪式找 bug。
+    """
+    return f"""本次审查的是 OpenSpec change `{change_id}` 引入的代码 diff。这是一次纯对抗式（找 bug）评审。
+
+请在仓库内运行：
+    git --no-pager diff HEAD~1..HEAD
+这是你唯一需要查看的输入——只看这段 diff，不要去读任何需求、规格、设计或项目约定类文档。
+
+**对抗式框架（极重要）**：请假设这段 diff **一定隐藏着至少一个 bug**，你唯一的任务就是把它找出来。不要试图确认它是对的；默认它是错的，然后去证明错在哪里。
+
+审查重点（四个方向，逐一排查）：
+1. 资源释放 / double-free：资源是否被重复释放、释放后仍被使用、异常路径漏释放（泄漏）、锁是否在异常路径未释放。
+2. 边界与符号处理：off-by-one、空集合 / 零值 / 负值 / 极大值、负数或符号位在截断 / 取整 / 移位时的处理。
+3. 急切求值 / 短路语义：本应惰性求值的表达式被急切求值（默认值在取用前就已计算并产生副作用 / 异常）、`||` `or` `unwrap_or` 一类短路语义被误用。
+4. 并发与生命周期：竞态、共享可变状态、初始化顺序、对象在被引用期间被销毁 / 移动、迭代过程中修改容器。
+
+填写约定（本次不读规格文档，据此诚实填写）：
+- 无法判断某 finding 与规格的关系时，`spec_attribution` 一律填 `spec-silent`。
+- 审查范围就是这段 diff 本身，findings 默认 `in_scope=true`；仅当讨论的是 diff 之外未修改的既有代码时才填 `false`。
+
+{_output_requirements_block(authority_disclaimer=False)}
+"""
 
 
 def _round_0_template(change_id: str, project_context: str) -> str:

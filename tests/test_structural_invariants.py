@@ -192,6 +192,38 @@ def test_emit_review_round_produces_all_contract_fields(isolate_telemetry, monke
     assert captured[0]["spec_attribution_counts"] == {
         "spec-silent": 1, "impl-deviation": 0, "unknown": 0,
     }
+    # change review-r0-adversarial-pass：两个新字段登记 + 默认 False/None
+    assert "adversarial_pass_ran" in captured[0]
+    assert "adversarial_blocking_count" in captured[0]
+    assert captured[0]["adversarial_pass_ran"] is False
+    assert captured[0]["adversarial_blocking_count"] is None
+
+
+def test_emit_review_round_adversarial_fields_bool_not_none(isolate_telemetry, monkeypatch):
+    """情形 1 vs 情形 3/4/5：adversarial_pass_ran 恒为 bool 字面量，绝不为 None。"""
+    captured: list[dict] = []
+    monkeypatch.setattr(
+        _telemetry, "emit_event", lambda record, **kw: (captured.append(record), True)[1]
+    )
+    _telemetry.emit_review_round(
+        proj_key="demo", run_ts="2026-01-01-0000", change_seq=1, change_id="add-foo",
+        round_n=0, base="/tmp/base", ok=True, engine="codex", verdict="changes-requested",
+        blocking_count=2, blocking_categories=["concurrency"], duration_ms=10, retry_count=0,
+        outcome_reason=None, state_json=None, run_events=None,
+        adversarial_pass_ran=True, adversarial_blocking_count=1,
+    )
+    assert captured[0]["adversarial_pass_ran"] is True
+    assert captured[0]["adversarial_blocking_count"] == 1
+    # 情形 3/4/5 默认省略参数 → False / None（不是 None 的 pass_ran）
+    captured.clear()
+    _telemetry.emit_review_round(
+        proj_key="demo", run_ts="2026-01-01-0000", change_seq=1, change_id="add-foo",
+        round_n=2, base="/tmp/base", ok=True, engine="codex", verdict="approve",
+        blocking_count=0, blocking_categories=[], duration_ms=10, retry_count=0,
+        outcome_reason=None, state_json=None, run_events=None,
+    )
+    assert captured[0]["adversarial_pass_ran"] is False
+    assert captured[0]["adversarial_blocking_count"] is None
 
 
 def test_emit_archive_done_produces_all_contract_fields(isolate_telemetry, monkeypatch):

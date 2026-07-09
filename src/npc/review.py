@@ -69,6 +69,70 @@ def parse_review(review_json: dict) -> dict:
     }
 
 
+def _recompute_verdict(findings: list[dict]) -> str:
+    """按 REVIEW_SCHEMA verdict 语义在 findings 全集上重算 verdict。纯函数。
+
+    存在 in_scope blocking → changes-requested；否则非空 → passed-with-advisory；
+    否则 approve。
+    """
+    has_blocking = any(
+        f.get("severity") in BLOCKING_SEVERITIES and bool(f.get("in_scope"))
+        for f in findings
+    )
+    if has_blocking:
+        return "changes-requested"
+    if findings:
+        return "passed-with-advisory"
+    return "approve"
+
+
+def merge_review_passes(pass1: dict, pass2: dict) -> tuple[dict, dict]:
+    """合并两个 review pass 的 findings（compliance pass1 + adversarial pass2）。纯函数。
+
+    见 change review-r0-adversarial-pass D4：
+    1. 去重键 ``(file, line_range, category)`` 精确匹配；pass2 中与 pass1 同键的
+       finding 被丢弃（pass1 优先）。
+    2. 合并顺序：pass1 全量（原序）→ pass2 去重后剩余（原序）。
+    3. 按最终顺序重新分配 ``id`` 为 ``F1..Fn``（丢弃引擎自报的原始 id）。
+    4. ``verdict`` 在合并后 findings 全集上按 REVIEW_SCHEMA 语义重算，
+       不采信任一 pass 自报的 verdict。
+    5. 返回 ``(merged, stats)``；``stats["adversarial_blocking_count"]`` 是来源于
+       pass2、未被去重丢弃、且 ``severity ∈ BLOCKING_SEVERITIES and in_scope`` 的
+       finding 数（在重编号之前、来源尚可区分时统计的 side-channel）。
+
+    ``pass2`` 允许为空 findings 替身 ``{"findings": []}``（pass2 失败降级路径），
+    此时等价于仅用 pass1，``adversarial_blocking_count`` 计为 0。
+    """
+    p1_findings = pass1.get("findings") or []
+    p2_findings = pass2.get("findings") or []
+    if not isinstance(p1_findings, list) or not isinstance(p2_findings, list):
+        raise ValueError("review.findings 必须是数组")
+
+    def _key(f: dict) -> tuple:
+        return (f.get("file"), f.get("line_range"), f.get("category"))
+
+    pass1_keys = {_key(f) for f in p1_findings}
+
+    merged: list[dict] = list(p1_findings)
+    adversarial_blocking_count = 0
+    for f in p2_findings:
+        if _key(f) in pass1_keys:
+            continue
+        merged.append(f)
+        if f.get("severity") in BLOCKING_SEVERITIES and bool(f.get("in_scope")):
+            adversarial_blocking_count += 1
+
+    # 重新编号（immutable：构造新 dict，不改原对象）
+    renumbered = [{**f, "id": f"F{i}"} for i, f in enumerate(merged, start=1)]
+
+    merged_review = {
+        "verdict": _recompute_verdict(renumbered),
+        "findings": renumbered,
+    }
+    stats = {"adversarial_blocking_count": adversarial_blocking_count}
+    return merged_review, stats
+
+
 def parse(args: argparse.Namespace) -> None:
     """review parse <review.json>。"""
     path = Path(args.review_json)

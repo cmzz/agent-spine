@@ -384,6 +384,200 @@ def test_run_review_round_rejects_unknown_engine(
 
 
 # ============================================================
+# round-0 双 pass 对抗式评审（change review-r0-adversarial-pass）
+# ============================================================
+
+
+def _stub_dispatch_by_path(pass1_payload: dict, pass2_payload: dict | None = None,
+                           pass2_fail: bool = False):
+    """按 review_out 文件名分派 pass1 / pass2 的 fake codex 调用。返回 (fake, calls)。"""
+    calls = {"count": 0, "names": []}
+
+    def fake(*, repo_root, schema_path, focus_text, review_out, events_out,
+             timeout_sec, codex_bin, portable_timeout):
+        calls["count"] += 1
+        calls["names"].append(review_out.name)
+        events_out.parent.mkdir(parents=True, exist_ok=True)
+        events_out.write_text("ev\n", encoding="utf-8")
+        if "pass2.adversarial" in review_out.name:
+            if pass2_fail:
+                return 1
+            review_out.write_text(json.dumps(pass2_payload), encoding="utf-8")
+            return 0
+        review_out.write_text(json.dumps(pass1_payload), encoding="utf-8")
+        return 0
+
+    return fake, calls
+
+
+def _capture_emit_review_round(monkeypatch):
+    captured: list[dict] = []
+    real = _pipeline._telemetry.emit_review_round
+
+    def wrapper(**kwargs):
+        captured.append(kwargs)
+        return real(**kwargs)
+
+    monkeypatch.setattr(_pipeline._telemetry, "emit_review_round", wrapper)
+    return captured
+
+
+def _adv_finding(sev="high", cat="concurrency", file="b.py", line="5"):
+    return {
+        "id": "F1", "severity": sev, "category": cat, "title": "t",
+        "file": file, "line_range": line, "detail": "d", "recommendation": "r",
+        "in_scope": True, "spec_attribution": "spec-silent",
+    }
+
+
+def _set_implement_commit(state_json: Path, commit: str = "deadbeef") -> None:
+    s = json.loads(state_json.read_text())
+    entry = s["progress"][0]
+    entry.setdefault("phases", {})["implement"] = {"commit": commit}
+    state_json.write_text(json.dumps(s), encoding="utf-8")
+
+
+def test_run_review_round0_double_pass_success(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """情形 1：双 pass 成功 → 合并、adversarial_pass_ran=True、count=pass2 blocking 数。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    fake, calls = _stub_dispatch_by_path(
+        {"verdict": "approve", "findings": []},
+        {"verdict": "changes-requested", "findings": [_adv_finding()]},
+    )
+    monkeypatch.setattr(_pipeline, "_codex_exec", fake)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(_pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt"))
+    captured = _capture_emit_review_round(monkeypatch)
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p_with_repo, 1, 0)
+
+    assert result["ok"] is True
+    assert result["blocking"] == 1
+    assert result["verdict"] == "changes-requested"
+    assert calls["count"] == 2
+    base = Path(result["review_json"]).parent
+    assert (base / "round-0.review.pass1.json").is_file()
+    assert (base / "round-0.review.pass2.adversarial.json").is_file()
+    assert (base / "round-0.adversarial.focus.md").is_file()
+    merged = json.loads((base / "round-0.review.json").read_text())
+    assert len(merged["findings"]) == 1
+    # telemetry
+    assert captured[-1]["adversarial_pass_ran"] is True
+    assert captured[-1]["adversarial_blocking_count"] == 1
+
+
+def test_run_review_round0_pass2_fail_degrades(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """情形 2：pass2 重试耗尽 → 降级 pass1-only、ok=True、adversarial_pass_ran=False/count=None。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    fake, calls = _stub_dispatch_by_path(
+        {"verdict": "changes-requested", "findings": [_adv_finding(file="a.py", cat="validation")]},
+        pass2_fail=True,
+    )
+    monkeypatch.setattr(_pipeline, "_codex_exec", fake)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(_pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt"))
+    captured = _capture_emit_review_round(monkeypatch)
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, retries=1)
+
+    assert result["ok"] is True
+    assert result["blocking"] == 1  # 等价 pass1-only
+    base = Path(result["review_json"]).parent
+    # pass2 失败未落盘
+    assert not (base / "round-0.review.pass2.adversarial.json").exists()
+    merged = json.loads((base / "round-0.review.json").read_text())
+    assert len(merged["findings"]) == 1
+    assert captured[-1]["adversarial_pass_ran"] is False
+    assert captured[-1]["adversarial_blocking_count"] is None
+
+
+def test_run_review_round0_pass1_fail_no_pass2(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """情形 3：pass1 失败 → 整轮失败、pass2 不执行、adversarial_pass_ran=False/count=None。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    names: list[str] = []
+
+    def fail_pass1(**kwargs):
+        names.append(kwargs["review_out"].name)
+        return 1
+
+    monkeypatch.setattr(_pipeline, "_codex_exec", fail_pass1)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(_pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt"))
+    captured = _capture_emit_review_round(monkeypatch)
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, retries=1)
+
+    assert result["ok"] is False
+    assert all("pass2.adversarial" not in n for n in names)  # pass2 从未执行
+    assert captured[-1]["adversarial_pass_ran"] is False
+    assert captured[-1]["adversarial_blocking_count"] is None
+
+
+def test_run_review_round0_disabled_single_call(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """情形 4：adversarial_round0=false → round-0 只调一次引擎、无 adversarial 产物。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    cfg_path = tmp_path / "no-adv.toml"
+    cfg_path.write_text('[review]\nadversarial_round0 = false\n', encoding="utf-8")
+    fake, calls = _stub_dispatch_by_path({"verdict": "approve", "findings": []})
+    monkeypatch.setattr(_pipeline, "_codex_exec", fake)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(_pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt"))
+    captured = _capture_emit_review_round(monkeypatch)
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+
+    assert result["ok"] is True
+    assert calls["count"] == 1
+    base = Path(result["review_json"]).parent
+    assert not (base / "round-0.review.pass2.adversarial.json").exists()
+    assert not (base / "round-0.adversarial.focus.md").exists()
+    assert not (base / "round-0.review.pass1.json").exists()  # 单通道直写最终路径
+    assert captured[-1]["adversarial_pass_ran"] is False
+    assert captured[-1]["adversarial_blocking_count"] is None
+
+
+def test_run_review_round1_single_call_no_adversarial(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """情形 5：round>=1 → 只调一次引擎、无 adversarial 产物、字段 False/None。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _set_implement_commit(env_setup.state_json)
+    fake, calls = _stub_dispatch_by_path({"verdict": "approve", "findings": []})
+    monkeypatch.setattr(_pipeline, "_codex_exec", fake)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(_pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt"))
+    captured = _capture_emit_review_round(monkeypatch)
+
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p_with_repo, 1, 1)
+
+    assert result["ok"] is True
+    assert calls["count"] == 1
+    assert all("adversarial" not in n for n in calls["names"])
+    base = Path(result["review_json"]).parent
+    assert not list(base.glob("*.adversarial.*"))
+    assert captured[-1]["adversarial_pass_ran"] is False
+    assert captured[-1]["adversarial_blocking_count"] is None
+
+
+# ============================================================
 # implement record
 # ============================================================
 

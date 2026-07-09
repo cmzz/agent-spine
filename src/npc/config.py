@@ -64,6 +64,10 @@ class ReviewEngineConfig:
     complexity_files_threshold: int = 10
     # max_rounds_large：large change 的 review-fix 循环上限（普通 change 由调用方自行设默认值）
     max_rounds_large: int = 30
+    # adversarial_round0：round-0 是否在既有 compliance pass 之外追加 diff-only 对抗式 pass。
+    # 默认 True（开启新行为）；显式关闭可回退到 round-0 单通道（成本敏感场景）。
+    # round_n != 0 时该配置无效（round>=1 恒单通道）。
+    adversarial_round0: bool = True
 
     def __post_init__(self) -> None:
         if self.engine not in SUPPORTED_ENGINES:
@@ -81,6 +85,10 @@ class ReviewEngineConfig:
         if not isinstance(self.max_rounds_large, int) or self.max_rounds_large < 1:
             raise ConfigError(
                 f"[review].max_rounds_large 必须是整数 ≥1，得到：{self.max_rounds_large!r}"
+            )
+        if not isinstance(self.adversarial_round0, bool):
+            raise ConfigError(
+                f"[review].adversarial_round0 必须是 bool，得到：{self.adversarial_round0!r}"
             )
 
 
@@ -443,6 +451,9 @@ def _build(data: dict, source: str) -> Config:
         raise ConfigError(f"[review].complexity_files_threshold 必须是整数（{source}）")
     if not isinstance(max_rounds_large_raw, int):
         raise ConfigError(f"[review].max_rounds_large 必须是整数（{source}）")
+    adversarial_round0_raw = review_raw.get("adversarial_round0", True)
+    if not isinstance(adversarial_round0_raw, bool):
+        raise ConfigError(f"[review].adversarial_round0 必须是 bool（{source}）")
 
     return Config(
         review=ReviewEngineConfig(
@@ -454,6 +465,7 @@ def _build(data: dict, source: str) -> Config:
             complexity_breadth_threshold=complexity_breadth_raw,
             complexity_files_threshold=complexity_files_raw,
             max_rounds_large=max_rounds_large_raw,
+            adversarial_round0=adversarial_round0_raw,
         ),
         coder=CoderConfig(
             backend=backend,
