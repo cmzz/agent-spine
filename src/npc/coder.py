@@ -232,6 +232,21 @@ def _mimo_env(cfg: Config) -> dict[str, str]:
 # ============================================================
 
 
+def _resolve_lessons_path(p: _paths.Paths) -> str | None:
+    """run 级 lessons.md 存在且非空 → 返回其绝对路径字符串，否则 None。
+
+    条件严格为「存在且文件大小 > 0」（design D3）：不存在或空文件都视同不存在，
+    render_implementer 不渲染 lessons 指针段落，prompt 与现状逐字等价。
+    """
+    lessons_path = p.run_dir / "lessons.md"
+    try:
+        if lessons_path.is_file() and lessons_path.stat().st_size > 0:
+            return str(lessons_path.resolve())
+    except OSError:
+        return None
+    return None
+
+
 def _render_prompt_file(
     p: _paths.Paths,
     seq: int,
@@ -249,7 +264,10 @@ def _render_prompt_file(
     if phase == "implement":
         prompt_file = base / "implement.prompt.md"
         text = templates.render_implementer(
-            change_id=change_id, base=str(base), repo_root=str(p.repo_root)
+            change_id=change_id,
+            base=str(base),
+            repo_root=str(p.repo_root),
+            lessons_path=_resolve_lessons_path(p),
         )
     else:  # fix
         if round_n is None:

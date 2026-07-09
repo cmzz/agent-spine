@@ -94,9 +94,23 @@ def render_implementer(
     change_id: str,
     base: str,
     repo_root: str,
+    lessons_path: str | None = None,
 ) -> str:
-    """渲染 Implementer prompt（对应历史 skill 的 §A 段）。"""
+    """渲染 Implementer prompt（对应历史 skill 的 §A 段）。
+
+    ``lessons_path``：run 级 ``lessons.md`` 绝对路径。非 None 时在「必读输入」追加一条
+    指针 bullet + 限定语（仅供参考、不改变 tasks/spec 验收标准）。为 None 时不渲染该
+    条目，此时 prompt 与历史行为逐字等价——**只注入指针，不内联 lessons 内容**
+    （coder 自行 Read）。守核心不变量 1：lessons.md 只含 fixer 自报字段，不含 reviewer 产出。
+    """
     summary_path = f"{base}/implement.summary.md"
+    lessons_bullet = (
+        f"\n- {lessons_path}"
+        "（同 run 前置 change 的失败模式参考；**仅供参考，不改变 tasks/spec 的验收标准**——"
+        "验收依据仍以本 change 的 spec.md Requirements/Scenarios 为唯一准绳）"
+        if lessons_path
+        else ""
+    )
     return f"""你是 OpenSpec change 实施专家。请完整实施 change `{change_id}`。
 
 ## Runtime Variables（npc 已注入；prompt 内引用变量名）
@@ -112,7 +126,7 @@ def render_implementer(
 - openspec/changes/{change_id}/specs/ 下所有 spec.md（如存在）
 - openspec/changes/{change_id}/design.md（如存在）
 - openspec/AGENTS.md / openspec/project.md
-- 项目根 CLAUDE.md
+- 项目根 CLAUDE.md{lessons_bullet}
 
 ## 实施约束
 
@@ -292,6 +306,7 @@ def render_spec_writer(
     base: str,
     repo_root: str,
     goal: str | None = None,
+    lessons_path: str | None = None,
 ) -> str:
     """渲染 spec writer 的 write 轮 prompt（对应 change ``spine-spec-writer``）。
 
@@ -303,6 +318,11 @@ def render_spec_writer(
     不做任何改写/摘要。为 ``None``（或空串）时表示调用方走的是"已存在
     change-id 补全/修复"分支，没有自由目标文本可传，此时不渲染该段落
     （不得伪造/编造目标文本）。
+
+    ``lessons_path``：run 级 ``lessons.md`` 绝对路径（pilot-rewrite-gate 回写场景注入）。
+    非 None 时渲染一个**独立于 ``goal`` 的**参考段落（同 run 前置 change 的失败模式，
+    参考、非强制），与目标段落并列、互不覆盖；不改变"生成侧不得预知本轮评判标准"边界
+    （lessons.md 只含 fixer 自报字段，不含任何 reviewer 产出）。为 None 时不渲染。
     """
     summary_path = f"{base}/spec-write.summary.md"
     goal_section = (
@@ -314,6 +334,19 @@ def render_spec_writer(
         if goal
         else ""
     )
+    lessons_section = (
+        f"""
+## 同 run 前置 change 失败模式（参考，非强制；不是评审标准）
+
+同一 run 内已完成的前置 change 暴露的失败模式已确定性汇总在下述文件（每条均为
+fixer 自报字段，不含任何 reviewer 产出）。**仅供参考**：你可自行判断哪些与本 change
+相关并据此收紧 tasks/design，也可判断全部无关而不改。它不构成新的验收标准。
+
+- {lessons_path}
+"""
+        if lessons_path
+        else ""
+    )
     return f"""你是 OpenSpec change 撰写专家。请为 change `{change_id}` 撰写 / 完善 artifact（proposal.md / design.md / tasks.md / specs/**/spec.md）。
 
 ## Runtime Variables（npc 已注入；prompt 内引用变量名）
@@ -322,7 +355,7 @@ def render_spec_writer(
 - LOG_BASE={base}
 - CHANGE_ID={change_id}
 - SUMMARY_PATH={summary_path}
-{goal_section}
+{goal_section}{lessons_section}
 ## 必读输入（按需自取）
 
 - openspec/changes/{change_id}/ 下已存在的任何草稿（如有）

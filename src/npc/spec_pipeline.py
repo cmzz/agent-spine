@@ -307,10 +307,15 @@ def spec_write_run(
     *,
     config_path: Path | None = None,
     goal: str | None = None,
+    lessons_path: str | None = None,
 ) -> dict:
     """``goal``：来自 ``/spine-spec`` 的用户一句话原始目标（原文透传给
     ``render_spec_writer``）。为 ``None``/空串时不渲染目标段落（已存在
-    change-id 补全/修复分支）。"""
+    change-id 补全/修复分支）。
+
+    ``lessons_path``：pilot-rewrite-gate 回写场景注入的 run 级 ``lessons.md`` 绝对路径
+    （独立于 ``goal`` 的参考段落，二者并列不覆盖）。为 ``None``/空串时不渲染，prompt
+    与现状逐字等价。"""
     try:
         cfg = load_config(p.repo_root, override_path=config_path)
     except ConfigError as e:
@@ -326,7 +331,11 @@ def spec_write_run(
 
     prompt_file = base / "spec-write.prompt.md"
     text = templates.render_spec_writer(
-        change_id=change_id, base=str(base), repo_root=str(p.repo_root), goal=goal
+        change_id=change_id,
+        base=str(base),
+        repo_root=str(p.repo_root),
+        goal=goal,
+        lessons_path=lessons_path or None,
     )
     prompt_file.write_text(text, encoding="utf-8")
 
@@ -951,6 +960,7 @@ def cli_spec_write_run(args: argparse.Namespace) -> None:
             args.change_id,
             config_path=Path(args.config) if getattr(args, "config", None) else None,
             goal=getattr(args, "goal", None),
+            lessons_path=getattr(args, "lessons_path", None),
         )
     except ValueError as e:
         _io.emit_error("invalid_args", str(e), exit_code=2)

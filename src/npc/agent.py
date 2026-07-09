@@ -38,6 +38,17 @@ def _compute_budget(retries: int, base: int, mult: float, max_sec: int) -> int:
     return int(min(raw, max_sec))
 
 
+def _resolve_implement_lessons_path(p: _paths.Paths) -> str | None:
+    """run 级 lessons.md 存在且非空 → 返回绝对路径；否则 None（条件同 coder 侧，design D3）。"""
+    lessons_path = p.run_dir / "lessons.md"
+    try:
+        if lessons_path.is_file() and lessons_path.stat().st_size > 0:
+            return str(lessons_path.resolve())
+    except OSError:
+        return None
+    return None
+
+
 def _exhausted(retries: int) -> bool:
     return retries >= TIMEOUT_EXHAUSTED_AT_RETRIES
 
@@ -176,6 +187,7 @@ def prompt_render(args: argparse.Namespace) -> None:
             change_id=args.change_id,
             base=str(base),
             repo_root=str(p.repo_root),
+            lessons_path=_resolve_implement_lessons_path(p),
         )
         meta_extra: dict = {}
     else:  # fix

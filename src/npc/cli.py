@@ -427,6 +427,15 @@ def _build_parser() -> argparse.ArgumentParser:
             "write prompt 作为语义锚点；已存在 change-id 补全/修复场景可省略"
         ),
     )
+    p_sw_run.add_argument(
+        "--lessons-path",
+        dest="lessons_path",
+        default=None,
+        help=(
+            "run 级 lessons.md 绝对路径（pilot-rewrite-gate 回写场景）；注入独立于 --goal 的"
+            "「同 run 前置 change 失败模式（参考，非强制）」段落，省略时 prompt 与现状逐字等价"
+        ),
+    )
     p_sw_run.add_argument("--config", default=None, help="显式 TOML 配置路径")
     p_sw_run.set_defaults(
         handler=_make_handler("spec_pipeline", "cli_spec_write_run"), _cmd_path="spec write run"
@@ -827,6 +836,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p_spec_rep_render.add_argument("--seq", type=int, required=True)
     p_spec_rep_render.set_defaults(
         handler=_make_handler("spec_report", "render"), _cmd_path="spec-report render"
+    )
+
+    # ===== lessons（run 级失败模式前馈） =====
+    p_lessons = sub.add_parser(
+        "lessons",
+        help="run 级失败模式前馈（archive 后确定性提炼 lessons.md + DAG 层屏障回写闸口）",
+    )
+    sub_lessons = p_lessons.add_subparsers(dest="lessons_cmd", required=True)
+    p_lessons_rec = sub_lessons.add_parser(
+        "record",
+        help="从 change[seq] 的 events.jsonl 提炼 fixer 自报字段追加到 run 级 lessons.md（best-effort）",
+    )
+    p_lessons_rec.add_argument("--seq", type=int, required=True)
+    p_lessons_rec.set_defaults(
+        handler=_make_handler("lessons", "record"), _cmd_path="lessons record"
+    )
+    p_lessons_gate = sub_lessons.add_parser(
+        "gate",
+        help="DAG 层屏障后的只读候选判定（--apply 时落决策 + 推进游标）",
+    )
+    p_lessons_gate.add_argument("--layer-idx", dest="layer_idx", type=int, required=True)
+    p_lessons_gate.add_argument(
+        "--apply", action="store_true", help="落盘本次闸口决策并推进游标（需 --decision）"
+    )
+    p_lessons_gate.add_argument(
+        "--targets", default=None, help="逗号分隔的下游 change-id（--decision rewrite 时校验为候选集子集）"
+    )
+    p_lessons_gate.add_argument(
+        "--decision", choices=["rewrite", "skip-rewrite"], default=None,
+        help="--apply 时的决策；rewrite 需 targets 全属候选集",
+    )
+    p_lessons_gate.set_defaults(
+        handler=_make_handler("lessons", "gate"), _cmd_path="lessons gate"
     )
 
     return parser

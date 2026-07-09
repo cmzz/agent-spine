@@ -1684,6 +1684,7 @@ def record_fix(
             "summary": summary_path,
             "categories_scanned": parsed.get("categories_scanned", ""),
             "regressions_added": parsed.get("regressions_added", ""),
+            "notes": parsed.get("notes", ""),
             "tests_verified": tests_verified,
         },
         progress_updates={"status": "in-fix-loop"},
