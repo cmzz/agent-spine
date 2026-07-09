@@ -1,0 +1,3 @@
+# spec-writer-pattern-interrogation
+
+为 spec 生成加「盘问先于序列化」与「结构化落点清单」两道机制（Bun 的 PORTING.md / LIFETIMES.tsv 精神）：(1) spine-spec-writer 在撰写 artifact 之前，MUST 先产出一个「模式盘问」中间产物：枚举仓库内与本次改动最近似的 analog 实现（文件+函数级引用）、列出关键假设与开放问题；交互档由 /spine-spec 主 session 用 AskUserQuestion 把开放问题摆给用户裁决，auto 档则把假设与开放问题序列化进 design.md 的 Pattern Mapping / Assumptions 段供 reviewer 攻击。(2) 对多落点 change（改动涉及 N 处调用点或 N 个文件），tasks.md 的落点清单 MUST 由确定性枚举（grep/结构化搜索命令，命令本身写入 artifact 以便复核）派生，而非凭印象罗列，使覆盖率判据从「reviewer 觉得全了」变为「清单逐条勾完」。硬约束：盘问产物与 tasks 清单 MUST NOT 引用本次 spec review 的 rubric/category 措辞（不变量 1）。依据 docs/optimization-proposals/2026-07-09-bun-migration-lessons.md「文档先行」小点 1+2。
