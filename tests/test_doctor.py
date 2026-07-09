@@ -48,13 +48,19 @@ def _make_home(tmp_path: Path, *, mimo: bool = False, schema: bool = False) -> P
     return home
 
 
-def _make_repo(tmp_path: Path, *, principles: bool = False) -> Path:
+def _make_repo(
+    tmp_path: Path, *, principles: bool = False, project_md: bool = False
+) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir(exist_ok=True)
     if principles:
         p = repo / "docs" / "principles.md"
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("# principles\n", encoding="utf-8")
+    if project_md:
+        pm = repo / "openspec" / "project.md"
+        pm.parent.mkdir(parents=True, exist_ok=True)
+        pm.write_text("# project\n\n## 项目级技术约定\n\n内容\n", encoding="utf-8")
     return repo
 
 
@@ -99,6 +105,7 @@ def test_gather_checks_covers_all_items(tmp_path: Path):
         "mimo.env",
         "config",
         "principles.md",
+        "openspec/project.md",
     }
     assert expected <= names
 
@@ -120,7 +127,7 @@ def test_only_git_is_required(tmp_path: Path):
 
 def test_all_green(tmp_path: Path):
     home = _make_home(tmp_path, mimo=True, schema=True)
-    repo = _make_repo(tmp_path, principles=True)
+    repo = _make_repo(tmp_path, principles=True, project_md=True)
     checks = doctor.gather_checks(
         home=home, repo_root=repo, which=_which_factory(ALL_BINS)
     )
@@ -555,3 +562,127 @@ def test_run_repo_root_undetectable_still_runs(tmp_path: Path, monkeypatch, caps
     by = {c["name"]: c for c in report["checks"]}
     assert by["principles.md"]["status"] == "warn"
     assert report["ok"] is True
+
+
+# ============================================================
+# _check_shared_context：openspec/project.md 结构性体检
+# ============================================================
+
+
+def _write_project_md(repo: Path, content: str) -> Path:
+    pm = repo / "openspec" / "project.md"
+    pm.parent.mkdir(parents=True, exist_ok=True)
+    pm.write_text(content, encoding="utf-8")
+    return pm
+
+
+def test_shared_context_missing_is_warn(tmp_path: Path):
+    # 1.1 无 openspec/project.md → warn，required False，detail 提及路径
+    repo = _make_repo(tmp_path)
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["name"] == "openspec/project.md"
+    assert c["status"] == "warn"
+    assert c["required"] is False
+    assert "openspec/project.md" in c["detail"]
+
+
+def test_shared_context_empty_is_warn(tmp_path: Path):
+    # 1.2 存在但 strip 后为空（仅空白/换行）→ warn
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "   \n\n  \t\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "warn"
+
+
+def test_shared_context_no_convention_heading_is_warn(tmp_path: Path):
+    # 1.3 非空但无约定类 1~2 级标题 → warn
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目说明\n\n## 目录结构\n\n一些内容\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "warn"
+
+
+def test_shared_context_chinese_convention_heading_is_ok(tmp_path: Path):
+    # 1.4 含 `## 项目级技术约定` → ok
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目\n\n## 项目级技术约定\n\n约定内容\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "ok"
+
+
+def test_shared_context_convention_in_body_not_counted(tmp_path: Path):
+    # 1.5 约定关键词在正文而非标题 → warn（只匹配标题行）
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目\n\n## 说明\n\n我们约定不做 XX 这件事。\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "warn"
+
+
+def test_shared_context_h3_convention_not_counted(tmp_path: Path):
+    # 1.6 约定关键词在 3 级标题 → warn（只扫 1~2 级）
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目\n\n## 段落\n\n### 约定\n\n细节\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "warn"
+
+
+def test_shared_context_english_convention_case_insensitive_ok(tmp_path: Path):
+    # 1.7 英文 `## Technical Conventions` 大小写不敏感 → ok
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# Project\n\n## Technical Conventions\n\nstuff\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "ok"
+
+
+def test_shared_context_repo_root_none_is_warn(tmp_path: Path):
+    # 1.8a repo_root=None → warn，不抛异常
+    c = doctor._check_shared_context(repo_root=None)
+    assert c["status"] == "warn"
+    assert c["required"] is False
+
+
+def test_shared_context_oserror_downgrades_to_warn(tmp_path: Path, monkeypatch):
+    # 1.8b 读取抛 OSError（权限）→ warn，不抛未捕获异常
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目\n\n## 技术约定\n\nx\n")
+
+    def _boom(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(doctor.Path, "read_text", _boom)
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "warn"
+    assert c["required"] is False
+
+
+def test_shared_context_does_not_judge_content_quality(tmp_path: Path):
+    # 4.3 含约定标题但正文是占位文本（TBD）→ 仍 ok（止步于结构层）
+    repo = _make_repo(tmp_path)
+    _write_project_md(repo, "# 项目\n\n## 技术约定\n\nTBD\n")
+    c = doctor._check_shared_context(repo_root=repo)
+    assert c["status"] == "ok"
+
+
+def test_shared_context_in_gather_checks(tmp_path: Path):
+    # 2.1 gather_checks 含 name == "openspec/project.md" 一项
+    home = _make_home(tmp_path)
+    repo = _make_repo(tmp_path)
+    checks = doctor.gather_checks(
+        home=home, repo_root=repo, which=_which_factory(ALL_BINS)
+    )
+    by = _by_name(checks)
+    assert "openspec/project.md" in by
+    assert by["openspec/project.md"]["required"] is False
+
+
+def test_shared_context_warn_does_not_break_report_ok(tmp_path: Path):
+    # 2.3 缺 project.md（warn）时 report.ok 仍 True，missing_required 不含该项
+    home = _make_home(tmp_path, mimo=True, schema=True)
+    repo = _make_repo(tmp_path, principles=True)  # 无 project.md → warn
+    checks = doctor.gather_checks(
+        home=home, repo_root=repo, which=_which_factory(ALL_BINS)
+    )
+    report = doctor.build_report(checks)
+    assert report["ok"] is True
+    assert "openspec/project.md" not in report["summary"]["missing_required"]
+    assert _by_name(checks)["openspec/project.md"]["status"] == "warn"

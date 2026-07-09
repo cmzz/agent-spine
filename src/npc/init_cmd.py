@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from . import _io, paths as _paths, schema, session, resume, git_chain as _git_chain, state as _state
+from . import doctor as _doctor
 from . import settings_auth as _settings_auth
 from . import git_ops as _git_ops
 
@@ -480,6 +481,14 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             _io.warn(f"state_drift 扫描失败：{e}")
             state_drift = None
 
+    # 11b. 共读上下文体检（openspec/project.md）：复用 doctor 的同一检查函数，
+    #      避免两处逻辑漂移。ok → null；warn → detail 字符串。该字段纯观察性、
+    #      非阻断；检查函数内部已捕获 OSError 降级 warn，不会抛未捕获异常。
+    _sc_check = _doctor._check_shared_context(repo_root=p.repo_root)
+    shared_context_warning = (
+        None if _sc_check["status"] == "ok" else _sc_check["detail"]
+    )
+
     payload = {
         "repo_root": str(p.repo_root),
         "proj_key": p.proj_key,
@@ -499,6 +508,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         "needs_resume": needs_resume,
         "resume_state_json": str(resume_state_json) if resume_state_json else None,
         "state_drift": state_drift,
+        "shared_context_warning": shared_context_warning,
         "mode": mode,
         "fresh": bool(args.fresh),
         "auto_auth": auto_auth,

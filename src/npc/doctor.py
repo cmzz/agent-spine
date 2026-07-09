@@ -7,7 +7,8 @@
 - 跨项目共享的 review schema 是否已自举；
 - 成本路由 ``mimo.env`` 是否就绪（缺失只降级 warn，不视为 missing）；
 - npc 配置是否能正常加载（失败降级 warn，不阻塞）；
-- 工程级 ``docs/principles.md`` 是否在（warn 级）。
+- 工程级 ``docs/principles.md`` 是否在（warn 级）；
+- 共读上下文 ``openspec/project.md`` 的结构性健康（存在/非空/含约定段落，warn 级）。
 
 设计成"纯函数核 + 薄 handler"：:func:`gather_checks` 不做任何 I/O 输出、可注入
 ``which`` / ``home`` / ``repo_root``，便于单测；:func:`run` 只负责探测 repo_root、
@@ -190,6 +191,89 @@ def _check_principles(*, repo_root: Path | None) -> dict:
     }
 
 
+# 约定类段落标题词表：标题文本含任一子串（大小写不敏感）即命中。
+# 中文 "约定" 大小写无关；英文 "convention" 覆盖 Convention/Conventions。
+_CONVENTION_TITLE_SUBSTRINGS: tuple[str, ...] = ("约定", "convention")
+
+
+def _has_convention_heading(text: str) -> bool:
+    """扫描 1~2 级 Markdown 标题行，任一标题文本含约定类子串即命中。
+
+    仅匹配 ``#`` / ``##`` 起始的整行标题（3 级及以下、正文行不计入），
+    子串大小写不敏感。
+    """
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        # 仅 1~2 级标题：# 或 ## 后跟空白与标题文本；### 及以上被排除
+        if not (line.startswith("# ") or line.startswith("## ")):
+            continue
+        title = line.lstrip("#").strip().lower()
+        if any(sub in title for sub in _CONVENTION_TITLE_SUBSTRINGS):
+            return True
+    return False
+
+
+def _check_shared_context(*, repo_root: Path | None) -> dict:
+    """共读上下文文档 openspec/project.md 的结构性体检（warn 级，永不阻断）。
+
+    三层结构检查：存在性 / 非空 / 含约定类段落标题。任一不满足 → warn。
+    仅做结构判断，MUST NOT 校验业务内容质量。读取抛 OSError 时降级 warn，
+    绝不抛未捕获异常。``required`` 恒为 ``False``。
+    """
+    name = "openspec/project.md"
+    if repo_root is None:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": "无法定位 repo_root，跳过 openspec/project.md 检查",
+            "required": False,
+        }
+    project_md = repo_root / "openspec" / "project.md"
+    try:
+        if not project_md.is_file():
+            return {
+                "name": name,
+                "status": "warn",
+                "detail": (
+                    f"共读上下文文档缺失：{project_md}；"
+                    "建议补一份项目级技术约定文档，供所有 worker 共读"
+                ),
+                "required": False,
+            }
+        text = project_md.read_text(encoding="utf-8")
+    except OSError as e:
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"读取 openspec/project.md 失败（降级 warn，不阻断）：[{type(e).__name__}] {e}",
+            "required": False,
+        }
+    if not text.strip():
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": f"共读上下文文档为空：{project_md}；补充项目级技术约定内容",
+            "required": False,
+        }
+    if not _has_convention_heading(text):
+        return {
+            "name": name,
+            "status": "warn",
+            "detail": (
+                f"共读上下文文档 {project_md} 未含约定类段落标题"
+                "（1~2 级标题含「约定」或 Convention/Conventions）；"
+                "建议补一个专门的约定段落"
+            ),
+            "required": False,
+        }
+    return {
+        "name": name,
+        "status": "ok",
+        "detail": f"已存在且含约定段落：{project_md}",
+        "required": False,
+    }
+
+
 def gather_checks(
     *,
     home: Path,
@@ -212,6 +296,7 @@ def gather_checks(
     cfg_root = repo_root if repo_root is not None else Path.cwd()
     checks.append(_check_config(home=home, repo_root=cfg_root))
     checks.append(_check_principles(repo_root=repo_root))
+    checks.append(_check_shared_context(repo_root=repo_root))
     return checks
 
 

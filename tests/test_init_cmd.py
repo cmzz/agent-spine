@@ -457,3 +457,71 @@ def test_init_worktree_ignores_canonical_task_log_in_progress(worktree_env, caps
     assert payload["run_ts"] == branch_run_ts, (
         f"worktree 模式 run_ts({payload['run_ts']}) 应与 spine_branch 后缀({branch_run_ts})一致"
     )
+
+
+# ============================================================
+# shared_context_warning：透出 openspec/project.md 体检结果
+# ============================================================
+
+
+def _write_project_md(repo: Path, content: str) -> None:
+    pm = repo / "openspec" / "project.md"
+    pm.parent.mkdir(parents=True, exist_ok=True)
+    pm.write_text(content, encoding="utf-8")
+
+
+def test_init_shared_context_missing_warns(init_env, capsys, make_args):
+    # 3.1 无 openspec/project.md → shared_context_warning 为非空字符串
+    repo, _ = init_env
+    args = make_args(auto=False, fresh=False, shell_exports=False, no_worktree=True)
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert "shared_context_warning" in payload
+    assert isinstance(payload["shared_context_warning"], str)
+    assert payload["shared_context_warning"]
+
+
+def test_init_shared_context_healthy_is_null(init_env, capsys, make_args):
+    # 3.2 存在且含约定段落 → shared_context_warning == None
+    repo, _ = init_env
+    _write_project_md(repo, "# 项目\n\n## 技术约定\n\n内容\n")
+    args = make_args(auto=False, fresh=False, shell_exports=False, no_worktree=True)
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["shared_context_warning"] is None
+
+
+def test_init_shared_context_matches_doctor(init_env, capsys, make_args):
+    # 3.3 两处调用点结果一致：warn 时值 == doctor detail；ok 时 == None
+    from npc import doctor as _doctor
+
+    repo, _ = init_env
+    # warn 分支（无 project.md）
+    args = make_args(auto=False, fresh=False, shell_exports=False, no_worktree=True)
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    check = _doctor._check_shared_context(repo_root=Path(payload["repo_root"]))
+    assert check["status"] == "warn"
+    assert payload["shared_context_warning"] == check["detail"]
+
+
+def test_init_shared_context_oserror_does_not_crash(
+    init_env, capsys, make_args, monkeypatch
+):
+    # 3.5 读取抛 OSError → init 不崩溃，shared_context_warning 降级为非空提示
+    repo, _ = init_env
+    _write_project_md(repo, "# 项目\n\n## 技术约定\n\nx\n")
+
+    _orig_read_text = Path.read_text
+
+    def _boom(self, *a, **k):
+        if self.name == "project.md" and self.parent.name == "openspec":
+            raise PermissionError("denied")
+        return _orig_read_text(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+    args = make_args(auto=False, fresh=False, shell_exports=False, no_worktree=True)
+    _init.run(args)  # 不抛未捕获异常
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert isinstance(payload["shared_context_warning"], str)
+    assert payload["shared_context_warning"]
