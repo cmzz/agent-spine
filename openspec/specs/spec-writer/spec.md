@@ -173,6 +173,8 @@ spec fix 循环 MUST 以固定的最大 **fix 次数**上限终止。`[spec_revi
 
 `spine-spec-writer` 撰写的 `pattern-interrogation.md` 与 `tasks.md` 的落点清单，正文 MUST NOT 引用 `SPEC_REVIEW_SCHEMA` 的任一 `category` 枚举值（`ambiguity`/`missing-scenario`/`implementation-leak`/`untestable`/`deferred-decision`/`contradiction`/`scope-creep`），MUST NOT 引用任何 `round-*.spec-review.json` 的 findings 原文。
 
+`npc spec fix run --change <id> --round N`（`N >= 1`）在渲染任何 fix prompt 之前，MUST 先完成 `run-stale-review-guard` 能力定义的新鲜度校验（扫描该 change 目录下所有 `round-*.spec-review.json`，取轮次号最大值 `max_round`；若 `max_round` 大于 `N-1`，判定为过期输入并以 `stale_review_input` 拒绝，不渲染任何 prompt）。该校验通过之后，才轮到本条要求所约束的"prompt 只含上一轮已签发 findings、不含更晚轮次内容"的正向注入语义——过期输入场景下从一开始就不产出 prompt 文件，故不适用本条的注入语义（不存在的文件不含任何内容，也就无所谓泄漏）。
+
 #### Scenario: 负向断言——write 轮 prompt 不含 rubric
 - **GIVEN** `openspec/changes/<id>/pattern-interrogation.md` 已存在，且含 `## Analogs`、`## Assumptions`、`## Open Questions` 三个 H2 标题
 - **WHEN** 执行 `npc spec write run --change <id>` 并读取渲染出的 prompt 文件全文
@@ -181,15 +183,15 @@ spec fix 循环 MUST 以固定的最大 **fix 次数**上限终止。`[spec_revi
 - **AND** MUST NOT 含任何 `spec-review.json` 的 findings 原文
 
 #### Scenario: fix 轮 prompt 可含上一轮已签发 findings
-- **GIVEN** `round-0.spec-review.json` 已产出，含一条 `category == "ambiguity"` 的 blocking finding
+- **GIVEN** `round-0.spec-review.json` 已产出，含一条 `category == "ambiguity"` 的 blocking finding，且磁盘上不存在轮次号大于 0 的其它 `round-*.spec-review.json`
 - **WHEN** 执行 `npc spec fix run --change <id> --round 1` 并读取渲染出的 prompt 文件
 - **THEN** 其文本含该 finding 的 `detail` 原文
 
-#### Scenario: fix 轮 prompt 不含当轮 review 内容
+#### Scenario: 存在更高轮次 review 时拒绝渲染而非过滤内容
 - **GIVEN** 磁盘上同时存在 `round-0.spec-review.json` 与 `round-1.spec-review.json`，两者 findings 的 `detail` 互不相同
-- **WHEN** 执行 `npc spec fix run --change <id> --round 1` 并读取渲染出的 prompt 文件
-- **THEN** 其文本含 `round-0.spec-review.json` 的 finding `detail` 原文
-- **AND** MUST NOT 含 `round-1.spec-review.json` 的 finding `detail` 原文
+- **WHEN** 执行 `npc spec fix run --change <id> --round 1`
+- **THEN** 返回 `.ok == false`，错误标识 `stale_review_input`
+- **AND** `round-1.spec-fix.prompt.md` 未被写出——不存在部分渲染、内容过滤后放行的中间状态
 
 #### Scenario: 上一轮 review 未落盘时 fix 拒绝渲染
 - **GIVEN** `round-0.spec-review.json` 不存在
