@@ -52,6 +52,14 @@ def _real_commit(fake_repo: Path, fname: str = "f.txt", content: str = "x") -> s
     ).stdout.strip()
 
 
+def _write_prev_review(base: Path, round_n: int) -> None:
+    """在 base 目录写一份最小 round-<round_n>.review.json（fix 输入新鲜度校验的前置产物）。"""
+    base.mkdir(parents=True, exist_ok=True)
+    (base / f"round-{round_n}.review.json").write_text(
+        json.dumps({"verdict": "approve", "findings": []}), encoding="utf-8"
+    )
+
+
 def _fake_runner(stdout: str, exit_code: int = 0):
     """构造假 runner，记录被调用的 argv/cwd/env，返回预设 stdout。"""
     calls: list[dict] = []
@@ -257,6 +265,7 @@ def test_run_fix_success(env_setup, make_args, capsys, fake_repo: Path):
     fix_commit = _real_commit(fake_repo, "fix.txt", "z")
     base = p.run_dir / "001-add-foo"
     base.mkdir(parents=True, exist_ok=True)
+    _write_prev_review(base, 0)  # round-1 fix 消费 round-0.review.json
     summary = base / "round-1.fix.summary.md"
     summary.write_text("# fix summary\n")
 
@@ -387,6 +396,7 @@ def test_run_fix_timeout_lands_failed(env_setup, make_args, capsys, fake_repo: P
 
     _state.update_state(p.state_json, p.state_md, mutate)
 
+    _write_prev_review(p.run_dir / "001-add-foo", 0)
     runner = _raising_runner(subprocess.TimeoutExpired(cmd="claude", timeout=1))
     # dispatch=headless 强制走子进程路径，确保 timeout 真正触发
     result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", dispatch="headless", runner=runner)
@@ -437,6 +447,7 @@ def test_run_fix_no_result_line_fails(env_setup, make_args, capsys, fake_repo: P
 
     _state.update_state(p.state_json, p.state_md, mutate)
 
+    _write_prev_review(p.run_dir / "001-add-foo", 0)
     runner = _fake_runner("fixer chatter, no result line\n", exit_code=0)
     result = _coder.run_fix(pr, 1, "add-foo", 1, backend="claude", dispatch="headless", runner=runner)
 
@@ -481,6 +492,7 @@ def test_cli_fix_run_missing_claude_bin(
 
     _state.update_state(p.state_json, p.state_md, mutate)
 
+    _write_prev_review(p.run_dir / "001-add-foo", 0)  # render 通过后才触发 backend 查找
     monkeypatch.setattr(_coder.shutil, "which", lambda name: None)
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
@@ -516,6 +528,7 @@ def test_cli_fix_run_codex_not_implemented_exit_2(
 ):
     p = env_setup
     _bootstrap_run(make_args, capsys, "add-foo", p=p)
+    _write_prev_review(p.run_dir / "001-add-foo", 0)  # render 通过后才触发 codex not-implemented
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
     args = make_args(seq=1, change_id="add-foo", round_n=1, backend="codex", timeout=None, config=None)

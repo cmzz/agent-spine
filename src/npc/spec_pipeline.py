@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -606,6 +607,21 @@ def spec_write_record(p: _paths.Paths, change_id: str, result_line: str) -> dict
 # npc spec fix run|record
 # ============================================================
 
+_SPEC_REVIEW_ROUND_RE = re.compile(r"^round-(\d+)\.spec-review\.json$")
+
+
+def _max_spec_review_round(base: Path) -> int | None:
+    """扫描 change 目录下所有 ``round-*.spec-review.json``，返回最大轮次号。
+
+    文件名不匹配 ``round-<int>.spec-review.json`` 的忽略；无匹配文件时返回 None。
+    """
+    rounds: list[int] = []
+    for f in base.glob("round-*.spec-review.json"):
+        m = _SPEC_REVIEW_ROUND_RE.match(f.name)
+        if m:
+            rounds.append(int(m.group(1)))
+    return max(rounds) if rounds else None
+
 
 def spec_fix_run(
     p: _paths.Paths, change_id: str, round_n: int, *, config_path: Path | None = None
@@ -631,6 +647,24 @@ def spec_fix_run(
             "round": round_n,
             "error": "prev_spec_review_missing",
             "detail": f"{prev_review_path} 不存在（fix 轮 {round_n} 需要 round-{prev_round}.spec-review.json）",
+        }
+
+    # 新鲜度校验：基线文件存在后，扫描该 change 目录下所有 round-*.spec-review.json，
+    # 若已存在轮次号更高的 review 文件，说明本次 fix 消费的是过期输入——结构化拒绝，
+    # 不渲染任何 prompt、不写 marker。
+    max_round = _max_spec_review_round(base)
+    if max_round is not None and max_round > prev_round:
+        return {
+            "ok": False,
+            "change": change_id,
+            "round": round_n,
+            "error": "stale_review_input",
+            "detail": (
+                f"消费的 round-{prev_round}.spec-review.json 已过期："
+                f"该 change 目录下存在更高轮次 round-{max_round}.spec-review.json"
+                f"（fix 轮 {round_n} 应消费最新一轮 review 输入）"
+            ),
+            "max_round": max_round,
         }
 
     try:

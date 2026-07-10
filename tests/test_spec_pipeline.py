@@ -742,7 +742,13 @@ def test_spec_fix_prompt_contains_prev_round_finding_detail(env_setup, fake_repo
     assert "UNIQUE_DETAIL_TEXT_ROUND0" in text
 
 
-def test_spec_fix_prompt_does_not_contain_current_round_finding(env_setup, fake_repo):
+def test_spec_fix_run_rejects_stale_review_when_higher_round_exists(env_setup, fake_repo):
+    """run-stale-review-guard：round-0 与 round-1 同时存在时 fix --round 1 消费的是过期输入。
+
+    改写自旧「fix 轮 prompt 不含当轮 review 内容」负向断言场景（render-but-filter）——
+    本 change 的 spec-writer MODIFIED Requirement 把该场景收紧为整体拒绝：连 prompt 文件都
+    不产出，自然不存在泄漏当轮 review 内容的可能（比过滤逻辑更强的不变量 1 保护）。
+    """
     _make_change_dir(fake_repo, "add-foo")
     p = _with_repo(env_setup, fake_repo)
     base = _sp._spec_base(p, "add-foo")
@@ -768,9 +774,11 @@ def test_spec_fix_prompt_does_not_contain_current_round_finding(env_setup, fake_
         })
     )
     result = _sp.spec_fix_run(p, "add-foo", 1)
-    text = Path(result["prompt_file"]).read_text(encoding="utf-8")
-    assert "ROUND0_ONLY_DETAIL" in text
-    assert "ROUND1_ONLY_DETAIL" not in text
+    assert result["ok"] is False
+    assert result["error"] == "stale_review_input"
+    # 不存在部分渲染 / 内容过滤后放行的中间状态：prompt 与 marker 均未落盘
+    assert not (base / "round-1.spec-fix.prompt.md").exists()
+    assert not (base / "pre_head.fix-r1.txt").exists()
 
 
 def test_spec_fix_run_missing_prev_review_rejected(env_setup, fake_repo):
@@ -779,6 +787,40 @@ def test_spec_fix_run_missing_prev_review_rejected(env_setup, fake_repo):
     result = _sp.spec_fix_run(p, "add-foo", 1)
     assert result["ok"] is False
     assert result["error"] == "prev_spec_review_missing"
+
+
+def test_spec_fix_run_no_higher_round_renders_normally(env_setup, fake_repo):
+    """run-stale-review-guard 1.3：max_round == round_n-1（无更高轮次）时行为不变，正常渲染。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    base = _sp._spec_base(p, "add-foo")
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "round-0.spec-review.json").write_text(
+        json.dumps({"verdict": "approve", "findings": []})
+    )
+    result = _sp.spec_fix_run(p, "add-foo", 1)
+    assert result["ok"] is True
+    assert result.get("deferred") is True
+    assert (base / "round-1.spec-fix.prompt.md").is_file()
+
+
+def test_spec_fix_run_missing_prev_takes_precedence_over_stale(env_setup, fake_repo):
+    """run-stale-review-guard 1.5：round-0 缺失但存在更高轮次 round-1 时，
+
+    仍优先返回 prev_spec_review_missing，不被 stale 分支抢先判定。
+    """
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    base = _sp._spec_base(p, "add-foo")
+    base.mkdir(parents=True, exist_ok=True)
+    # 只写 round-1，不写 round-0（基线文件缺失）
+    (base / "round-1.spec-review.json").write_text(
+        json.dumps({"verdict": "approve", "findings": []})
+    )
+    result = _sp.spec_fix_run(p, "add-foo", 1)
+    assert result["ok"] is False
+    assert result["error"] == "prev_spec_review_missing"
+    assert not (base / "round-1.spec-fix.prompt.md").exists()
 
 
 def test_implement_prompt_does_not_leak_spec_review_content(env_setup, fake_repo, make_args, capsys, monkeypatch):

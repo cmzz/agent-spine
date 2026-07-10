@@ -270,10 +270,30 @@ def _make_paths_and_state_for_fix(
     return p
 
 
+def _write_prev_review(p: _paths.Paths, round_n: int, detail: str = "") -> Path:
+    """在该 seq 的 base 目录写一份 round-<round_n>.review.json（fix 输入新鲜度校验的前置产物）。"""
+    state = json.loads(p.state_json.read_text())
+    base = Path(state["progress"][0]["base"])
+    base.mkdir(parents=True, exist_ok=True)
+    findings = (
+        [{"id": "F1", "severity": "blocking", "category": "correctness",
+          "in_scope": True, "detail": detail}]
+        if detail
+        else []
+    )
+    (base / f"round-{round_n}.review.json").write_text(
+        json.dumps({"verdict": "changes-requested" if detail else "approve",
+                    "findings": findings}),
+        encoding="utf-8",
+    )
+    return base
+
+
 def test_fix_in_session_returns_deferred_with_round(tmp_path: Path, fake_repo: Path):
     """Scenario: fix in-session 返回 deferred 指令，含 round 字段。"""
     impl_commit = _real_commit(fake_repo, "impl.txt", "i")
     p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 0)  # round-1 fix 消费 round-0.review.json
 
     result = _coder.run_fix(
         p,
@@ -299,6 +319,7 @@ def test_fix_in_session_prompt_file_named_correctly(tmp_path: Path, fake_repo: P
     """fix in-session prompt 文件名形如 round-N.fix.prompt.md。"""
     impl_commit = _real_commit(fake_repo, "impl2.txt", "i2")
     p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 1)  # round-2 fix 消费 round-1.review.json
 
     result = _coder.run_fix(
         p,
@@ -319,6 +340,7 @@ def test_fix_in_session_not_recorded(tmp_path: Path, fake_repo: Path):
     """fix in-session 不 record：phase 留在 in-progress。"""
     impl_commit = _real_commit(fake_repo, "impl3.txt", "i3")
     p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 0)
 
     _coder.run_fix(
         p,
@@ -578,3 +600,129 @@ def test_implement_mimo_headless_still_works(tmp_path: Path, fake_repo: Path):
     assert len(runner.calls) == 1, "mimo headless 应调用 runner"
     assert result.get("ok") is True
     assert not result.get("deferred", False)
+
+
+# ============================================================
+# run-stale-review-guard（code 侧 fix 输入新鲜度 + missing 结构化拒绝）
+# ============================================================
+
+
+def _prog_status(p: _paths.Paths) -> str:
+    return json.loads(p.state_json.read_text())["progress"][0]["status"]
+
+
+def _fix_prompt_path(p: _paths.Paths, round_n: int) -> Path:
+    base = Path(json.loads(p.state_json.read_text())["progress"][0]["base"])
+    return base / f"round-{round_n}.fix.prompt.md"
+
+
+def test_fix_stale_review_rejected_headless(tmp_path: Path, fake_repo: Path):
+    """stale（子进程分发）：round-0 与 round-1 同存 → fix --round 1 拒绝，runner 不被调用。"""
+    impl_commit = _real_commit(fake_repo, "impl_stale.txt", "s")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 0)
+    _write_prev_review(p, 1)  # 更高轮次存在 → 过期输入
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="headless", runner=_never_called_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "stale_review_input"
+    assert not _fix_prompt_path(p, 1).exists()
+    assert _prog_status(p) == "needs-user-decision"
+
+
+def test_fix_stale_review_rejected_in_session(tmp_path: Path, fake_repo: Path):
+    """stale（in-session 分发）：拒绝且返回体 MUST NOT 含 deferred==true。"""
+    impl_commit = _real_commit(fake_repo, "impl_stale2.txt", "s2")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 0)
+    _write_prev_review(p, 1)
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="in-session", runner=_never_called_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "stale_review_input"
+    assert result.get("deferred") is not True
+    assert not _fix_prompt_path(p, 1).exists()
+    assert _prog_status(p) == "needs-user-decision"
+
+
+def test_fix_missing_review_rejected_headless(tmp_path: Path, fake_repo: Path):
+    """missing（子进程分发）：round-0 缺失 → prev_review_missing，runner 不被调用。"""
+    impl_commit = _real_commit(fake_repo, "impl_miss.txt", "m")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    # 不写任何 review 文件
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="headless", runner=_never_called_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "prev_review_missing"
+    assert not _fix_prompt_path(p, 1).exists()
+    assert _prog_status(p) == "needs-user-decision"
+
+
+def test_fix_missing_review_rejected_in_session(tmp_path: Path, fake_repo: Path):
+    """missing（in-session 分发）：拒绝且返回体 MUST NOT 含 deferred==true。"""
+    impl_commit = _real_commit(fake_repo, "impl_miss2.txt", "m2")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="in-session", runner=_never_called_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "prev_review_missing"
+    assert result.get("deferred") is not True
+    assert _prog_status(p) == "needs-user-decision"
+
+
+def test_fix_missing_takes_precedence_over_stale(tmp_path: Path, fake_repo: Path):
+    """2.3a：round-0 缺失但存在更高轮次 round-1 → 返回 prev_review_missing 而非 stale_review_input。"""
+    impl_commit = _real_commit(fake_repo, "impl_prec.txt", "p")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    _write_prev_review(p, 1)  # 只有更高轮次，基线 round-0 缺失
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="headless", runner=_never_called_runner,
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "prev_review_missing"
+    assert not _fix_prompt_path(p, 1).exists()
+
+
+def test_fix_no_higher_round_renders_headless(tmp_path: Path, fake_repo: Path):
+    """无更高轮次（子进程分发）：round-0 存在且无更高轮次 → 正常渲染并调用 runner。"""
+    impl_commit = _real_commit(fake_repo, "impl_ok.txt", "o")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    base = _write_prev_review(p, 0)
+
+    fix_commit = _real_commit(fake_repo, "fix_ok.txt", "f")
+    summary = base / "round-1.fix.summary.md"
+    summary.write_text("# fix summary\n")
+    stdout = (
+        f"RESULT: commit={fix_commit} fixed=1 tests=pass summary={summary} "
+        f"categories_scanned=- regressions_added=- notes=-\n"
+    )
+    runner = _fake_runner(stdout, exit_code=0)
+
+    result = _coder.run_fix(
+        p, 1, "foo-change", 1,
+        backend="claude", dispatch="headless", runner=runner,
+    )
+
+    # render 未被 stale/missing 拦截：runner 被调用、prompt 落盘、record 成功
+    assert len(runner.calls) == 1
+    assert _fix_prompt_path(p, 1).exists()
+    assert result["ok"] is True

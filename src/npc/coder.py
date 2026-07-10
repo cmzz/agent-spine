@@ -19,6 +19,7 @@ review（验证闸门）绝不路由到与 coder 同源的后端。
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -247,6 +248,39 @@ def _resolve_lessons_path(p: _paths.Paths) -> str | None:
     return None
 
 
+class FixReviewInputError(Exception):
+    """fix 渲染前的 review 输入校验失败（缺失 / 过期）。
+
+    携带稳定错误标识（``prev_review_missing`` / ``stale_review_input``）与诊断
+    detail，由 ``run_fix`` 的两个分发分支捕获后转成结构化 ``{"ok": False, ...}``，
+    并把 phase 收尾为 ``needs-user-decision`` / ``coder-setup-error``。
+    """
+
+    def __init__(self, *, error: str, round_n: int, detail: str) -> None:
+        self.error = error
+        self.round_n = round_n
+        self.detail = detail
+        super().__init__(detail)
+
+
+_REVIEW_ROUND_RE = re.compile(r"^round-(\d+)\.review\.json$")
+
+
+def _max_review_round(base: Path) -> int | None:
+    """扫描 change 目录下所有 ``round-*.review.json``，返回最大轮次号。
+
+    文件名不匹配 ``round-<int>.review.json`` 的忽略；无匹配文件时返回 None。
+    与 spec 侧 ``spec_pipeline._max_spec_review_round`` 同构但不跨模块共享，
+    避免为两行逻辑在两条本就独立的 fix 流水线间引入新的模块耦合。
+    """
+    rounds: list[int] = []
+    for f in base.glob("round-*.review.json"):
+        m = _REVIEW_ROUND_RE.match(f.name)
+        if m:
+            rounds.append(int(m.group(1)))
+    return max(rounds) if rounds else None
+
+
 def _render_prompt_file(
     p: _paths.Paths,
     seq: int,
@@ -273,7 +307,32 @@ def _render_prompt_file(
         if round_n is None:
             raise ValueError("fix 阶段必须提供 round")
         prompt_file = base / f"round-{round_n}.fix.prompt.md"
-        review_path = base / f"round-{round_n - 1}.review.json"
+        prev_round = round_n - 1
+        review_path = base / f"round-{prev_round}.review.json"
+        # missing-review 存在性检查 MUST 先于 stale 扫描：基线文件缺失时结构化拒绝
+        # （对齐 spec 侧 prev_spec_review_missing），MUST NOT 静默渲染空 findings。
+        if not review_path.is_file():
+            raise FixReviewInputError(
+                error="prev_review_missing",
+                round_n=round_n,
+                detail=(
+                    f"{review_path} 不存在"
+                    f"（fix 轮 {round_n} 需要 round-{prev_round}.review.json）"
+                ),
+            )
+        # 新鲜度校验：基线文件存在后才扫描；若已存在轮次号更高的 review 文件，
+        # 说明本次 fix 消费的是过期输入——结构化拒绝，不渲染任何 prompt。
+        max_round = _max_review_round(base)
+        if max_round is not None and max_round > prev_round:
+            raise FixReviewInputError(
+                error="stale_review_input",
+                round_n=round_n,
+                detail=(
+                    f"消费的 round-{prev_round}.review.json 已过期："
+                    f"该 change 目录下存在更高轮次 round-{max_round}.review.json"
+                    f"（fix 轮 {round_n} 应消费最新一轮 review 输入）"
+                ),
+            )
         findings_md = ""
         categories_seen: list[str] = []
         blocking_trend: list[int] = []
@@ -281,15 +340,15 @@ def _render_prompt_file(
         entry = state.get("progress", [{}])[seq - 1] if state.get("progress") else {}
         categories_seen = entry.get("categories_seen") or []
         blocking_trend = entry.get("blocking_trend") or []
-        if review_path.is_file():
-            import json
 
-            from .fixer import render_findings
-            from .review import parse_review
+        import json
 
-            review_data = json.loads(review_path.read_text(encoding="utf-8"))
-            parsed = parse_review(review_data)
-            findings_md = render_findings(parsed["blocking_findings"])
+        from .fixer import render_findings
+        from .review import parse_review
+
+        review_data = json.loads(review_path.read_text(encoding="utf-8"))
+        parsed = parse_review(review_data)
+        findings_md = render_findings(parsed["blocking_findings"])
         text = templates.render_fixer(
             change_id=change_id,
             round_n=round_n,
@@ -550,6 +609,35 @@ def _fail_phase(
     }
 
 
+def _reject_fix_input(
+    p: _paths.Paths,
+    seq: int,
+    phase: str,
+    selected: str,
+    err: FixReviewInputError,
+) -> dict:
+    """fix 输入校验失败（stale/missing）的统一收尾。
+
+    复用 coder-setup-error 收尾语义：phase 落 failed、progress 置 needs-user-decision，
+    对 in-session 与子进程两种分发模式同等生效（不留悬挂 phase）。返回结构化错误 dict，
+    携带稳定错误标识（``stale_review_input`` / ``prev_review_missing``）。
+    """
+    _pipeline._do_phase_exit(
+        p, seq, phase, status="failed",
+        extra={"reason": "coder-setup-error", "error": err.detail[:2000]},
+        progress_updates={"status": "needs-user-decision", "reason": "coder-setup-error"},
+    )
+    return {
+        "ok": False,
+        "seq": seq,
+        "error": err.error,
+        "round": err.round_n,
+        "reason": "coder-setup-error",
+        "detail": err.detail[:2000],
+        "backend": selected,
+    }
+
+
 def run_fix(
     p: _paths.Paths,
     seq: int,
@@ -578,13 +666,20 @@ def run_fix(
 
     _pipeline._do_phase_enter(p, seq, phase)
 
+    # in-session 分支不被下方 subprocess try/except 覆盖，但 fix 输入校验（stale/missing）
+    # 在渲染阶段就会触发——两种分发模式都必须走同一条收尾路径，不留悬挂 phase。
     if dispatch_mode == "in-session":
-        return _do_fix_in_session(p, seq, change_id, round_n, selected)
+        try:
+            return _do_fix_in_session(p, seq, change_id, round_n, selected)
+        except FixReviewInputError as e:
+            return _reject_fix_input(p, seq, phase, selected, e)
 
     try:
         return _do_fix_body(
             p, seq, change_id, round_n, cfg, selected, runner=runner, timeout=timeout
         )
+    except FixReviewInputError as e:
+        return _reject_fix_input(p, seq, phase, selected, e)
     except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
         return _fail_phase(
             p, seq, phase, selected,
