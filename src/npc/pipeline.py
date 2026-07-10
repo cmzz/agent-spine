@@ -982,6 +982,34 @@ def _git_head(repo_root: Path) -> str:
     return out.stdout.strip()
 
 
+def _archive_effect_happened(repo_root: Path, change_id: str) -> bool:
+    """独立核验 `openspec archive` 是否真的产生了归档副作用。
+
+    不采信子进程 returncode，转而核对文件系统真实状态（对齐
+    `git_chain.check_chain` 确立的"不信子进程返回码"先例）。判定口径为双重
+    确定性检查，两条同时满足才算归档已发生：
+
+    (a) `openspec/changes/<change_id>/` 目录已不再存在（change 被移出原位）；
+    (b) `openspec/changes/archive/` 下存在一个以 `-<change_id>` 结尾的目录
+        （真实 `openspec archive` 会加 `YYYY-MM-DD-` 日期前缀）。
+
+    后缀匹配用 `name.endswith(f"-{change_id}")`，不假设固定日期前缀字符长度，
+    对非标准长度前缀（如 `2026-1-1-<change_id>`）仍能正确匹配。`archive/`
+    目录本身不存在（全新仓库从未归档过）时返回 False，不抛异常。
+    """
+    change_dir = repo_root / "openspec" / "changes" / change_id
+    if change_dir.exists():
+        return False
+    archive_dir = repo_root / "openspec" / "changes" / "archive"
+    if not archive_dir.is_dir():
+        return False
+    suffix = f"-{change_id}"
+    for child in archive_dir.iterdir():
+        if child.is_dir() and child.name.endswith(suffix):
+            return True
+    return False
+
+
 def run_archive(
     p: _paths.Paths,
     seq: int,
@@ -1135,6 +1163,27 @@ def run_archive(
             "change_id": change_id,
             "error": "openspec-archive-failed",
             "stderr_tail": arc.stderr.strip()[-1000:],
+        }
+
+    # 3b. 核验归档副作用（仅 returncode == 0 时触发；与上面的
+    # openspec-archive-failed 分支短路互斥）。`openspec archive` 可能在 abort
+    # 场景下把 "Aborted. No files were changed." 打到 stdout 却仍 exit 0——
+    # 若归档目录实际未搬迁，视为静默 abort，短路返回，不继续 git 操作。
+    if not _archive_effect_happened(p.repo_root, change_id):
+        _do_phase_exit(
+            p,
+            seq,
+            "archive",
+            status="failed",
+            extra={"reason": "openspec-archive-aborted", "stdout": arc.stdout.strip()[:2000]},
+            progress_updates={"status": "failed", "reason": "openspec-archive-aborted"},
+        )
+        return {
+            "ok": False,
+            "seq": seq,
+            "change_id": change_id,
+            "error": "openspec-archive-aborted",
+            "stdout_tail": arc.stdout.strip()[-1000:],
         }
 
     # 4. git add + commit
