@@ -35,6 +35,11 @@ The system SHALL use Codex as the unconfigured default coder and spec writer ins
 - **WHEN** a coder backend or dispatch is explicitly supplied by CLI or project configuration
 - **THEN** the existing CLI and configuration precedence remains authoritative
 
+#### Scenario: Unsatisfiable explicit spec writer is rejected
+- **WHEN** a Codex runtime has an explicit spec writer backend configured to a non-Codex value
+- **THEN** spec pipeline entrypoints report a spec routing violation identifying the host mismatch
+- **AND** the configured value is not silently ignored or rewritten
+
 #### Scenario: Claude default is unchanged
 - **WHEN** an implement or fix phase runs in a Claude runtime without explicit routing
 - **THEN** backend and dispatch resolve exactly as they did before Codex runtime support

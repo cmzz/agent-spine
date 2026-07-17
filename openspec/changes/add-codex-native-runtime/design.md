@@ -44,7 +44,7 @@ spec writer 恒为 in-session；未显式配置时，其生成身份取 runtime 
 
 **D4：实际生成身份进入 phase/spec routing，Codex 生成时 review 默认强制为 Claude。**
 
-code coder 进入 implement/fix phase 时记录 `generator_backend`，phase exit 保留该字段。review round 从对应 implement/fix phase 读取实际生成身份；旧 state 缺字段时回退到原配置解析。spec 没有 code state phase，因此由 `spec_writer.backend` 显式值或 `runtime_host` 解析其生成身份。
+code coder 进入 implement/fix phase 时记录 `generator_backend`，phase exit 保留该字段。review round 从对应 implement/fix phase 读取实际生成身份；旧 state 缺字段时回退到原配置解析。spec 没有 code state phase，且 spec writer 恒为宿主内 agent——Codex runtime 下其实际生成身份必为 Codex，Claude runtime 保持既有 `spec_writer.backend` 解析。Codex runtime 下显式配置 `[spec_writer].backend` 为非 codex 值无法兑现，不静默忽略也不静默改写，而是以 `spec_writer_host_mismatch` violation 显式拒绝（与显式 `--engine codex` 交给同源守卫拒绝同一原则：路由错误可观察）。
 
 若实际生成身份为 Codex：未传 `--engine` 时选择 Claude，不采用历史默认 Codex；显式 `--engine codex` 仍由同源路由守卫拒绝。其他生成 backend 继续使用既有 review 配置和默认。路由校验函数接受“本次实际生成身份”覆盖值，但 `npc verify routing` 无运行上下文时保持原有配置级输出。
 

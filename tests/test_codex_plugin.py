@@ -78,3 +78,41 @@ def test_session_start_hook_indexes_codex_common_payload(tmp_path: Path):
         "codex-session",
         str(transcript),
     )
+
+
+def test_session_start_hook_indexes_symlinked_cwd_under_both_keys(tmp_path: Path):
+    """symlink cwd 下 raw / resolved 两个 proj_key 都要能命中缓存。
+
+    npc 的 ``proj_key_for(repo_root)`` 不解析 symlink，而宿主传来的 cwd 可能是
+    链接路径——hook 必须双键落盘，detect_via_hook 用任一 key 都能解析。
+    """
+    home = tmp_path / "home"
+    real = tmp_path / "real-repo"
+    link = tmp_path / "link-repo"
+    transcript = tmp_path / "codex-session.jsonl"
+    home.mkdir()
+    real.mkdir()
+    link.symlink_to(real)
+    transcript.write_text("{}\n", encoding="utf-8")
+    payload = {
+        "session_id": "codex-session",
+        "transcript_path": str(transcript),
+        "cwd": str(link),
+    }
+    env = {**os.environ, "HOME": str(home)}
+    proc = subprocess.run(
+        ["bash", str(PLUGIN_ROOT / "hooks" / "index-session.sh")],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        env=env,
+    )
+    assert proc.returncode == 0
+    raw_key = str(link).replace("/", "-")
+    resolved_key = str(link.resolve()).replace("/", "-")
+    assert raw_key != resolved_key
+    for key in (raw_key, resolved_key):
+        assert _session.detect_via_hook(key, home) == (
+            "codex-session",
+            str(transcript),
+        )

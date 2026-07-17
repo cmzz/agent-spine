@@ -128,10 +128,19 @@ class CoderConfig:
                 return be
         return self.backend
 
-    def dispatch_for_phase(self, phase: str, backend: str, cli_override: str | None = None) -> str:
+    def dispatch_for_phase(
+        self,
+        phase: str,
+        backend: str,
+        cli_override: str | None = None,
+        *,
+        default_override: str | None = None,
+    ) -> str:
         """解析某 phase 的 dispatch 值。
 
         优先级：CLI override → per-phase → 全局 → 内置默认（按 backend）。
+        ``default_override`` 仅替换最后一级内置默认（如 codex runtime 的
+        in-session 默认），不影响任何显式配置的优先级。
         """
         if cli_override:
             return cli_override
@@ -140,7 +149,7 @@ class CoderConfig:
                 return dp
         if self.dispatch is not None:
             return self.dispatch
-        return DISPATCH_DEFAULTS.get(backend, "headless")
+        return default_override or DISPATCH_DEFAULTS.get(backend, "headless")
 
     def __post_init__(self) -> None:
         if self.backend is not None and self.backend not in SUPPORTED_CODER_BACKENDS:

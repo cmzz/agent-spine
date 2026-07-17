@@ -340,6 +340,45 @@ def test_codex_runtime_spec_review_rejects_explicit_codex(
     )
 
 
+def test_codex_runtime_rejects_explicit_non_codex_spec_writer(
+    env_setup, fake_repo, tmp_path
+):
+    """codex runtime 下显式 [spec_writer].backend != codex 不可静默忽略，必须报 violation。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "codex"})
+    cfg_path = tmp_path / "writer-mismatch.toml"
+    cfg_path.write_text('[spec_writer]\nbackend = "claude"\n', encoding="utf-8")
+    result = _sp.spec_review_run(p, "add-foo", 0, config_path=cfg_path)
+    assert result["ok"] is False
+    assert result["error"] == "spec_routing_violation"
+    assert any(
+        v["rule"] == "spec_writer_host_mismatch" for v in result["violations"]
+    )
+
+
+def test_codex_runtime_explicit_codex_spec_writer_has_no_violation(env_setup):
+    """显式 backend=codex 与宿主一致，不得误报 host mismatch。"""
+    p = type(env_setup)(**{**env_setup.__dict__, "runtime_host": "codex"})
+    cfg = _config.Config(
+        spec_writer=_config.SpecWriterConfig(backend="codex"),
+        spec_review=_config.SpecReviewConfig(engine="claude"),
+    )
+    assert _sp._spec_routing_violations(cfg, p) == []
+
+
+def test_claude_runtime_spec_writer_config_never_host_mismatches(env_setup):
+    """claude runtime 不引入 host mismatch 规则——既有解析语义不变。"""
+    cfg = _config.Config(
+        spec_writer=_config.SpecWriterConfig(backend="codex"),
+        spec_review=_config.SpecReviewConfig(engine="claude"),
+    )
+    rules = {
+        v["rule"] for v in _sp._spec_routing_violations(cfg, env_setup)
+    }
+    assert "spec_writer_host_mismatch" not in rules
+
+
 def test_spec_review_run_gate_cmd_invalid_json_is_gate_failure(env_setup, fake_repo, monkeypatch):
     _make_change_dir(fake_repo, "add-foo")
     npc_dir = fake_repo / ".npc"

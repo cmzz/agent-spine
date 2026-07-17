@@ -171,6 +171,9 @@ def _effective_spec_routing(
     spec writer 恒为宿主内 agent，因此 Codex runtime 的 writer 身份必为 Codex；
     Claude runtime 保持现有 ``[spec_writer]`` 解析。Codex writer 未显式覆盖 review
     时强制选 Claude，显式 ``--engine codex`` 则保留并由同源守卫拒绝。
+
+    显式 ``[spec_writer].backend`` 与 Codex 宿主冲突时不在此静默改写——由
+    ``_spec_routing_violations`` 的 host-mismatch 规则报错，保持路由错误可观察。
     """
     writer_backend = (
         "codex" if p.runtime_host == "codex" else cfg.spec_writer.effective_backend
@@ -202,13 +205,33 @@ def _spec_routing_violations(
     effective_cfg, writer_backend, _ = _effective_spec_routing(
         cfg, p, engine_name=engine_name
     )
-    return [
+    violations: list[dict] = []
+    # spec writer 恒 in-session：Codex 宿主下无法兑现非 codex 的显式 writer 配置，
+    # 静默忽略会让配置与实际身份漂移——按既有"路由错误可观察"原则显式拒绝。
+    explicit_writer = cfg.spec_writer.backend
+    if (
+        p.runtime_host == "codex"
+        and explicit_writer is not None
+        and explicit_writer != "codex"
+    ):
+        violations.append(
+            {
+                "rule": "spec_writer_host_mismatch",
+                "detail": (
+                    f"[spec_writer].backend={explicit_writer!r} 无法在 codex "
+                    "runtime 兑现：spec writer 恒为宿主内 agent（实际身份 codex）。"
+                    "移除该显式配置或改回 claude runtime。"
+                ),
+            }
+        )
+    violations.extend(
         v
         for v in check_routing(
             effective_cfg, spec_writer_backend_override=writer_backend
         )
         if v.get("rule", "").startswith("spec_")
-    ]
+    )
+    return violations
 
 
 # ============================================================

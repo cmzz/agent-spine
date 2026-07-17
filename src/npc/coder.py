@@ -80,18 +80,15 @@ def resolve_dispatch(
     1. ``cli_override``（CLI ``--dispatch``）
     2. per-phase 覆盖 ``[coder].dispatch_phase.<phase>``
     3. 全局 ``[coder].dispatch``
-    4. 内置默认表（claude ⇒ in-session，mimo/codex ⇒ headless）
+    4. 内置默认表（claude ⇒ in-session，mimo/codex ⇒ headless）；仅 codex
+       runtime 下的 codex backend 例外——未配置默认为 in-session（宿主内 agent）
     """
-    if cli_override:
-        return cli_override
-    for ph, value in cfg.coder.phase_dispatches:
-        if ph == phase:
-            return value
-    if cfg.coder.dispatch is not None:
-        return cfg.coder.dispatch
-    if runtime_host == "codex" and backend == "codex":
-        return "in-session"
-    return cfg.coder.dispatch_for_phase(phase, backend)
+    default_override = (
+        "in-session" if runtime_host == "codex" and backend == "codex" else None
+    )
+    return cfg.coder.dispatch_for_phase(
+        phase, backend, cli_override, default_override=default_override
+    )
 
 
 def resolve_backend(

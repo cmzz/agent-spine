@@ -39,7 +39,7 @@ from . import (
     trend as _trend,
     verify as _verify,
 )
-from .config import Config, ConfigError, load_config
+from .config import Config, ConfigError, SUPPORTED_CODER_BACKENDS, load_config
 from .engines import (
     ClaudeEngine,
     CodexEngine,
@@ -746,7 +746,7 @@ def run_review_round(
     phase_name = "implement" if round_n == 0 else f"fix-r{round_n}"
     phase_record = (entry.get("phases") or {}).get(phase_name) or {}
     generator_backend = phase_record.get("generator_backend")
-    if generator_backend not in ("claude", "mimo", "codex"):
+    if generator_backend not in SUPPORTED_CODER_BACKENDS:
         config_phase = "implement" if round_n == 0 else "fix"
         generator_backend = (
             cfg.coder.backend_for_phase(config_phase) or p.runtime_host
