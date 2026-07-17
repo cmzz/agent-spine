@@ -70,6 +70,9 @@ class Paths:
     # 运行模式（"auto" | "interactive"），由 npc init 落盘到 run.json，
     # record 阶段用于 _should_rerun_tests 缺省值判断。
     mode: str = "interactive"
+    # 主 session 运行载体。旧 run / 环境变量兼容路径恒降级为 claude，确保既有
+    # Claude Code 语义不因新增 Codex 宿主而改变。
+    runtime_host: str = "claude"
 
     def to_env(self) -> dict[str, str]:
         """投影为环境变量字典（仅供 ``--shell-exports`` 兼容路径使用）。"""
@@ -84,6 +87,7 @@ class Paths:
             "NPC_INDEX_FILE": str(self.index_file),
             "NPC_SCHEMA_PATH": str(self.schema_path),
             "NPC_RUN_EVENTS": str(self.run_events),
+            "NPC_RUNTIME_HOST": self.runtime_host,
         }
 
     def to_run_json_dict(self) -> dict:
@@ -115,6 +119,7 @@ class Paths:
             d["spine_branch"] = self.spine_branch
         # mode 永远写入（缺失时 read_run_json 降级为 "interactive"）
         d["mode"] = self.mode
+        d["runtime_host"] = self.runtime_host
         return d
 
 
@@ -313,6 +318,9 @@ def read_run_json(run_json_path: Path) -> Paths:
     mode_raw = data.get("mode", "interactive")
     if mode_raw not in ("auto", "interactive"):
         mode_raw = "interactive"
+    runtime_host_raw = data.get("runtime_host", "claude")
+    if runtime_host_raw not in ("claude", "codex"):
+        runtime_host_raw = "claude"
     return Paths(
         repo_root=Path(data["repo_root"]),
         proj_key=data["proj_key"],
@@ -329,6 +337,7 @@ def read_run_json(run_json_path: Path) -> Paths:
         base_branch=base_branch_raw if base_branch_raw else None,
         spine_branch=spine_branch_raw if spine_branch_raw else None,
         mode=mode_raw,
+        runtime_host=runtime_host_raw,
     )
 
 
@@ -404,6 +413,9 @@ def _load_from_env() -> Paths | None:
         index_file=Path(os.environ["NPC_INDEX_FILE"]),
         schema_path=Path(os.environ["NPC_SCHEMA_PATH"]),
         run_events=Path(os.environ["NPC_RUN_EVENTS"]),
+        runtime_host=os.environ.get("NPC_RUNTIME_HOST", "claude")
+        if os.environ.get("NPC_RUNTIME_HOST") in ("claude", "codex")
+        else "claude",
     )
 
 
@@ -488,18 +500,9 @@ def load_paths(args: argparse.Namespace | None = None) -> Paths:
 
     # 应用 --state-json 覆盖
     if state_json_override:
-        paths = Paths(
-            repo_root=paths.repo_root,
-            proj_key=paths.proj_key,
-            task_log_dir=paths.task_log_dir,
-            run_ts=paths.run_ts,
-            run_dir=paths.run_dir,
-            state_json=Path(state_json_override),
-            state_md=paths.state_md,
-            index_file=paths.index_file,
-            schema_path=paths.schema_path,
-            run_events=paths.run_events,
-        )
+        from dataclasses import replace
+
+        paths = replace(paths, state_json=Path(state_json_override))
 
     # 标记来源到模块级，便于子命令做 telemetry / debug
     load_paths.last_source = source  # type: ignore[attr-defined]
@@ -543,18 +546,9 @@ def load_paths_from_env(state_json_override: str | None = None) -> Paths:
             f"缺少环境变量 {missing}；v0.2 起推荐使用 `npc init`（自动落 run.json）"
         )
     if state_json_override:
-        env_paths = Paths(
-            repo_root=env_paths.repo_root,
-            proj_key=env_paths.proj_key,
-            task_log_dir=env_paths.task_log_dir,
-            run_ts=env_paths.run_ts,
-            run_dir=env_paths.run_dir,
-            state_json=Path(state_json_override),
-            state_md=env_paths.state_md,
-            index_file=env_paths.index_file,
-            schema_path=env_paths.schema_path,
-            run_events=env_paths.run_events,
-        )
+        from dataclasses import replace
+
+        env_paths = replace(env_paths, state_json=Path(state_json_override))
     return env_paths
 
 

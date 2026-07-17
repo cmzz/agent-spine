@@ -211,7 +211,12 @@ def _contains_mimo(value: str | None) -> bool:
     return value is not None and "mimo" in value.lower()
 
 
-def check_routing(cfg: _config.Config) -> list[dict]:
+def check_routing(
+    cfg: _config.Config,
+    *,
+    coder_backend_override: str | None = None,
+    spec_writer_backend_override: str | None = None,
+) -> list[dict]:
     """校验路由不变量，返回 violations 列表（纯函数）。
 
     每项 ``{"rule", "detail"}``。规则：
@@ -242,7 +247,7 @@ def check_routing(cfg: _config.Config) -> list[dict]:
     violations: list[dict] = []
     coder = cfg.coder
     review = cfg.review
-    effective_backend = coder.effective_backend
+    effective_backend = coder_backend_override or coder.effective_backend
 
     # 规则 1：后端有效性（用 effective_backend，None 解析为 claude）
     if effective_backend not in _config.SUPPORTED_CODER_BACKENDS:
@@ -294,8 +299,12 @@ def check_routing(cfg: _config.Config) -> list[dict]:
     _check_mimo_in_session(cfg, violations)
 
     # 规则 5-8：spec_writer ⊥ spec_review（与上述四条同构，独立判定）
-    _check_spec_backend_engine_unsupported(cfg, violations)
-    _check_spec_gen_not_orthogonal(cfg, violations)
+    _check_spec_backend_engine_unsupported(
+        cfg, violations, effective_backend=spec_writer_backend_override
+    )
+    _check_spec_gen_not_orthogonal(
+        cfg, violations, effective_backend=spec_writer_backend_override
+    )
     _check_spec_mimo_exec_only(cfg, violations)
     _check_spec_mimo_in_session(cfg, violations)
 
@@ -328,14 +337,19 @@ def _check_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
             )
 
 
-def _check_spec_backend_engine_unsupported(cfg: _config.Config, violations: list[dict]) -> None:
+def _check_spec_backend_engine_unsupported(
+    cfg: _config.Config,
+    violations: list[dict],
+    *,
+    effective_backend: str | None = None,
+) -> None:
     """校验 spec_writer/spec_review 后端有效性（纯函数，原地追加 violation）。
 
     与既有规则 1（``backend_unsupported`` / ``engine_unsupported``）同构。
     """
     spec_writer = cfg.spec_writer
     spec_review = cfg.spec_review
-    effective_backend = spec_writer.effective_backend
+    effective_backend = effective_backend or spec_writer.effective_backend
 
     if effective_backend not in _config.SUPPORTED_CODER_BACKENDS:
         violations.append(
@@ -359,7 +373,12 @@ def _check_spec_backend_engine_unsupported(cfg: _config.Config, violations: list
         )
 
 
-def _check_spec_gen_not_orthogonal(cfg: _config.Config, violations: list[dict]) -> None:
+def _check_spec_gen_not_orthogonal(
+    cfg: _config.Config,
+    violations: list[dict],
+    *,
+    effective_backend: str | None = None,
+) -> None:
     """校验 spec_writer 与 spec_review 是否解析到同一执行身份（纯函数）。
 
     与既有规则 2（``gen_not_orthogonal``）同构，覆盖三种同源形态：
@@ -367,7 +386,7 @@ def _check_spec_gen_not_orthogonal(cfg: _config.Config, violations: list[dict]) 
     """
     spec_writer = cfg.spec_writer
     spec_review = cfg.spec_review
-    effective_backend = spec_writer.effective_backend
+    effective_backend = effective_backend or spec_writer.effective_backend
 
     same_claude_identity = (
         effective_backend == "claude"

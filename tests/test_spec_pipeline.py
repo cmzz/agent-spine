@@ -291,6 +291,55 @@ def test_spec_review_run_gate_cmd_unconfigured_skips_and_calls_llm(env_setup, fa
     assert len(engine_calls) == 1
 
 
+def test_codex_runtime_spec_review_defaults_to_claude(
+    env_setup, fake_repo, monkeypatch
+):
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "codex"})
+    monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+    monkeypatch.setattr(_sp, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
+    )
+    engine_calls: list[dict] = []
+
+    def fake_engine(**kw):
+        engine_calls.append(kw)
+        kw["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kw["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kw["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_sp, "_spec_engine_exec", fake_engine)
+    result = _sp.spec_review_run(
+        p,
+        "add-foo",
+        0,
+        validate_runner=_fake_validate_runner(returncode=0),
+        gate_runner=subprocess.run,
+    )
+    assert result["ok"] is True
+    assert engine_calls[0]["engine_name"] == "claude"
+
+
+def test_codex_runtime_spec_review_rejects_explicit_codex(
+    env_setup, fake_repo
+):
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "codex"})
+    result = _sp.spec_review_run(p, "add-foo", 0, engine_name="codex")
+    assert result["ok"] is False
+    assert result["error"] == "spec_routing_violation"
+    assert any(
+        v["rule"] == "spec_gen_not_orthogonal" for v in result["violations"]
+    )
+
+
 def test_spec_review_run_gate_cmd_invalid_json_is_gate_failure(env_setup, fake_repo, monkeypatch):
     _make_change_dir(fake_repo, "add-foo")
     npc_dir = fake_repo / ".npc"

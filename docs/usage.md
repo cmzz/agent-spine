@@ -4,7 +4,7 @@
 
 ---
 
-## 层 1：装 `npc` CLI（机器级，所有 Claude Code session 共享）
+## 层 1：装 `npc` CLI（机器级，所有 Claude Code / Codex session 共享）
 
 `npc` 内置在本仓库（`src/npc`），直接从仓库根安装：
 
@@ -30,6 +30,16 @@ npc --version          # 应输出当前版本（见 pyproject.toml）
 装完得到 5 个能力：commands `/spine-run`、`/spine-spec`、`/spine-analyze` + agents `spine-coder`、`spine-spec-writer`。
 
 > CLI 与 plugin 版本应保持一致；升级 CLI（`uv tool upgrade npc`，tool 名是 npc）后建议同步 `/plugin update agent-spine@agent-spine`。
+
+Codex 使用同一个 plugin root 的原生 manifest/skills：
+
+```bash
+codex plugin marketplace add /absolute/path/to/agent-spine
+codex plugin add agent-spine@agent-spine
+codex --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
+```
+
+对应入口为 `$agent-spine:spine-run`、`$agent-spine:spine-spec`、`$agent-spine:spine-analyze`。Codex 作为生成者时，代码与 spec 的 LLM review 强制由 Claude 执行；缺少 Claude CLI 时流程停止，不同源降级。
 
 ---
 

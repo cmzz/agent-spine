@@ -1,6 +1,6 @@
 # agent-spine plugin
 
-本地自主 **harness**，跑在 Claude Code 进程内——无服务、无容器、无常驻进程。把"长时运行 + 自主决策 + 反复 review 打磨"的编排做成纯 markdown plugin commands，确定性动作全部委托给 [`npc` CLI](https://github.com/winewei/agent-spine)。
+本地自主 **harness**，原生运行在 Claude Code 或 Codex 进程内——无服务、无容器、无常驻进程。两种宿主共享同一套 workflow 知识，确定性动作全部委托给 [`npc` CLI](https://github.com/winewei/agent-spine)。
 
 ## 三层职责
 
@@ -42,6 +42,16 @@
 /spine-spec "给认证模块加限流"           # 只产 spec：撰写 + 强制语义评审，产出喂给 /spine-run
 /spine-analyze                          # 跑几个 run 后分析、迭代 harness 自身
 ```
+
+Codex 安装与调用：
+
+```bash
+codex plugin marketplace add /absolute/path/to/agent-spine
+codex plugin add agent-spine@agent-spine
+codex --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
+```
+
+在 Codex 中调用 `$agent-spine:spine-run`、`$agent-spine:spine-spec`、`$agent-spine:spine-analyze`。Codex 负责 coding/spec writing 时，review 固定交给 Claude；Claude review 失败不会回退为 Codex 自审。
 
 ## 两种运行档
 

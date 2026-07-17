@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -69,6 +71,13 @@ def test_to_env_roundtrip(computed_paths: _paths.Paths, monkeypatch):
     assert p2.state_json == computed_paths.state_json
 
 
+def test_codex_runtime_env_roundtrip(computed_paths: _paths.Paths, monkeypatch):
+    codex_paths = replace(computed_paths, runtime_host="codex")
+    for key, value in codex_paths.to_env().items():
+        monkeypatch.setenv(key, value)
+    assert _paths.load_paths_from_env().runtime_host == "codex"
+
+
 def test_load_paths_missing_env(monkeypatch):
     for k in (
         "NPC_REPO_ROOT",
@@ -105,6 +114,21 @@ def test_write_and_read_run_json(computed_paths: _paths.Paths):
     assert target.is_file()
     restored = _paths.read_run_json(target)
     assert restored == computed_paths
+
+
+def test_run_json_codex_runtime_roundtrip(computed_paths: _paths.Paths):
+    codex_paths = replace(computed_paths, runtime_host="codex")
+    target = _paths.write_run_json(codex_paths)
+    assert json.loads(target.read_text(encoding="utf-8"))["runtime_host"] == "codex"
+    assert _paths.read_run_json(target).runtime_host == "codex"
+
+
+def test_legacy_run_json_defaults_runtime_host_to_claude(computed_paths: _paths.Paths):
+    target = _paths.write_run_json(computed_paths)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload.pop("runtime_host")
+    target.write_text(json.dumps(payload), encoding="utf-8")
+    assert _paths.read_run_json(target).runtime_host == "claude"
 
 
 def test_read_run_json_missing_field(tmp_path: Path):
@@ -174,6 +198,7 @@ def test_load_paths_state_json_override(computed_paths: _paths.Paths, monkeypatc
     )
     p = _paths.load_paths(args)
     assert p.state_json == override
+    assert p.runtime_host == computed_paths.runtime_host
     # 其它字段保持不变
     assert p.run_dir == computed_paths.run_dir
 

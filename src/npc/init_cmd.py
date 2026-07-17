@@ -105,6 +105,7 @@ def _emit_shell_exports(payload: dict) -> None:
         ("NPC_NEEDS_RESUME", "true" if payload["needs_resume"] else "false"),
         ("NPC_RESUME_STATE_JSON", payload.get("resume_state_json") or ""),
         ("NPC_MODE", payload["mode"]),
+        ("NPC_RUNTIME_HOST", payload["runtime_host"]),
         ("NPC_FRESH", "true" if payload["fresh"] else "false"),
     ]
     out_lines = [f"export {k}='{v}'" for k, v in key_map]
@@ -447,7 +448,8 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
 
     # 5b. 把 mode 落入 Paths（run.json 持久化后 record 阶段可读，无需 NPC_MODE env）
     _init_mode = "auto" if args.auto else "interactive"
-    p = _dc_replace(p, mode=_init_mode)
+    _runtime_host = getattr(args, "runtime_host", "claude")
+    p = _dc_replace(p, mode=_init_mode, runtime_host=_runtime_host)
 
     # 6. 确保目录
     _paths.ensure_dirs(p)
@@ -553,6 +555,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         "state_drift": state_drift,
         "shared_context_warning": shared_context_warning,
         "mode": mode,
+        "runtime_host": p.runtime_host,
         "fresh": bool(args.fresh),
         "auto_auth": auto_auth,
         "auto_local_dirs": auto_local,

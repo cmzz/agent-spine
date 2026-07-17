@@ -45,6 +45,7 @@
 | `NPC_INDEX_FILE` | `$NPC_TASK_LOG_DIR/index.jsonl` |
 | `NPC_SCHEMA_PATH` | `~/task_log/.new-plan-review-schema.json` |
 | `NPC_RUN_EVENTS` | `$NPC_RUN_DIR/run.events.jsonl` |
+| `NPC_RUNTIME_HOST` | 主 session 载体（`claude` / `codex`；缺省和旧环境为 `claude`） |
 
 ### 0.3 全局参数
 
@@ -58,7 +59,7 @@
 
 ## 1. 初始化与续跑
 
-### `npc init [--auto] [--fresh] [--shell-exports]`
+### `npc init [--auto] [--fresh] [--runtime-host claude|codex] [--shell-exports]`
 
 初始化本次 run 的运行环境。
 
@@ -79,6 +80,7 @@
 
 - `--auto` 标记 auto 模式（写进后续 STATE_JSON 的 `mode` 字段时使用）
 - `--fresh` 忽略任何 in-progress 旧 run，强制新建
+- `--runtime-host` 记录主 session 运行载体；默认 `claude`。Codex 原生 skill 传 `codex`，该字段随 run.json 持久化并参与未配置的 in-session coder/spec writer 与异源 review 路由
 - `--shell-exports` [**Deprecated 0.2**] 输出格式从 JSON 改为 `export KEY=VALUE` 行；调用方仍可 `eval`，但 0.2+ 子命令已自包含，不再需要。该模式触发时会向 stderr 打 deprecation warning
 
 **stdout（默认 JSON 模式）**：

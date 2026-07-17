@@ -17,6 +17,26 @@ set -euo pipefail
 # ── 1. Read stdin ────────────────────────────────────────────────────────────
 INPUT="$(cat)"
 
+# Codex SubagentStop exposes a smaller common payload and may omit Claude's
+# last_assistant_message field entirely. In that case this compatibility hook
+# cannot inspect prose and must release; npc implement/fix record still applies
+# the authoritative RESULT schema, commit ancestry, and test gates.
+HAS_LAST_MESSAGE=""
+if command -v jq >/dev/null 2>&1; then
+    HAS_LAST_MESSAGE="$(printf '%s' "$INPUT" | jq -r 'has("last_assistant_message")' 2>/dev/null || true)"
+else
+    HAS_LAST_MESSAGE="$(echo "$INPUT" | python3 -c "
+import sys, json
+try:
+    print('true' if 'last_assistant_message' in json.load(sys.stdin) else 'false')
+except Exception:
+    print('false')
+" 2>/dev/null || true)"
+fi
+if [ "$HAS_LAST_MESSAGE" != "true" ]; then
+    exit 0
+fi
+
 # ── 2. Identify agent (spine-coder only) ───────────────────────────────────
 # Prefer agent_type field (set when spawned with subagent_type=spine-coder).
 # Fall back to checking transcript path or last message pattern.

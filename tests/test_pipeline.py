@@ -168,6 +168,79 @@ def test_run_review_round_success(
     assert entry["blocking_trend"] == [0]
 
 
+def test_codex_generated_code_defaults_to_claude_review(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "codex",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    cfg_path = tmp_path / "single-pass.toml"
+    cfg_path.write_text(
+        "[review]\nadversarial_round0 = false\n", encoding="utf-8"
+    )
+    calls: list[str] = []
+
+    def fake_claude(**kwargs):
+        calls.append("claude")
+        kwargs["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kwargs["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_pipeline, "_claude_exec", fake_claude)
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _pipeline,
+        "_portable_timeout_bin",
+        lambda override=None: Path("/fake/portable-timeout"),
+    )
+    p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert calls == ["claude"]
+
+
+def test_codex_generated_code_rejects_explicit_codex_review(
+    env_setup, make_args, capsys, fake_repo: Path
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "codex",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+    p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    with pytest.raises(SystemExit):
+        _pipeline.run_review_round(p, 1, 0, engine_name="codex")
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["error"] == "routing-violation"
+    assert any(v["rule"] == "gen_not_orthogonal" for v in payload["violations"])
+
+
+def test_fix_phase_exit_retains_generator_backend(
+    env_setup, make_args, capsys
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _pipeline._do_phase_enter(
+        env_setup, 1, "fix-r1", extra={"generator_backend": "codex"}
+    )
+    _pipeline._do_phase_exit(env_setup, 1, "fix-r1", status="done")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    phase = state["progress"][0]["phases"]["fix-r1"]
+    assert phase["status"] == "done"
+    assert phase["generator_backend"] == "codex"
+
+
 def test_run_review_round_with_blocking_renders_findings(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path
 ):

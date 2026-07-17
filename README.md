@@ -1,6 +1,6 @@
 # agent-spine
 
-> 人驾驭的自主 harness（跑在 Claude Code 进程内）——从 spec 到结果交付。
+> 人驾驭的自主 harness（原生运行于 Claude Code 或 Codex）——从 spec 到结果交付。
 >
 > 主 session 调度、spine-coder 执行、确定性动作委托给内置的 `npc` 执行层（`src/npc`）。
 
@@ -26,6 +26,10 @@ npc --version          # 应输出当前版本（见 pyproject.toml）
 # 2) 装 harness plugin（Claude Code 内）
 #   /plugin marketplace add <本仓库路径或 winewei/agent-spine>
 #   /plugin install agent-spine@agent-spine
+
+# 或装到 Codex
+codex plugin marketplace add "$(pwd)"
+codex plugin add agent-spine@agent-spine
 ```
 
 > **推荐三层配置**（CLI + plugin + CLAUDE.md 片段）见 [docs/usage.md](docs/usage.md)。`npc` 完整契约见 [docs/cli.md](docs/cli.md)。
@@ -48,6 +52,19 @@ uv tool install --force --from . npc && claude plugin marketplace add "$(pwd)" &
 
 装完得到 `/spine-run`、`/spine-spec`、`/spine-analyze` 三个 command 与 `spine-coder`、`spine-spec-writer` 两个 agent（**重启 Claude Code 后生效**）。Plugin 升级 `/plugin update agent-spine@agent-spine`。
 
+### Codex Plugin 安装
+
+```bash
+# 在 agent-spine 仓库根：注册本地/ Git marketplace，然后安装 plugin
+codex plugin marketplace add "$(pwd)"
+codex plugin add agent-spine@agent-spine
+
+# agent-spine 的 worktree 和轨迹在当前工程之外，需显式给 Codex scoped write access
+codex --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
+```
+
+Codex 中使用 `$agent-spine:spine-run`、`$agent-spine:spine-spec`、`$agent-spine:spine-analyze`。Codex skill 只映射宿主工具，完整阶段逻辑仍读取同一份 Claude command workflow；`npc init --runtime-host codex` 会记录载体身份。Codex 写出的 code/spec 默认且强制交给 Claude review，Claude 不可用时停止并报告依赖错误，不降级为 Codex 自审。
+
 > npc CLI（内置 `src/npc`）与 plugin 相互独立：CLI 机器级装一次，plugin 用户级装一次。`npc` 的命令速查/契约见 [docs/cli.md](docs/cli.md)。
 
 ### 系统依赖
@@ -55,7 +72,7 @@ uv tool install --force --from . npc && claude plugin marketplace add "$(pwd)" &
 - Python ≥ 3.11
 - `git`（必需）
 - `jq`（推荐；`npc state get` 输出 JSON 时下游 shell 经常需要 jq 取字段）
-- `codex` CLI（默认 review 引擎，`npc review run` 需要；可经 `.npc/config.toml` 切到 `claude` 引擎，二选一）
+- `codex` / `claude` CLI（按生成来源选择 review；Codex 生成必须由 Claude review）
 - `openspec` CLI（仅 `npc archive run` 需要）
 - `portable-timeout`（自动安装到 `~/.local/bin/`，跨平台 timeout wrapper；首次 `npc init` 时自举）
 

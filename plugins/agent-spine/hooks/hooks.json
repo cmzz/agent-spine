@@ -1,12 +1,23 @@
 {
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/index-session.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "SubagentStop": [
       {
         "matcher": "spine-coder",
         "hooks": [
           {
             "type": "command",
-            "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/verify-subagent-result.sh",
+            "command": "bash ${PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT}}/hooks/verify-subagent-result.sh",
             "timeout": 15
           }
         ]

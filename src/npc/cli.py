@@ -75,6 +75,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--auto", action="store_true", help="标记 auto 模式")
     p_init.add_argument("--fresh", action="store_true", help="忽略 in-progress 旧 run")
     p_init.add_argument(
+        "--runtime-host",
+        choices=["claude", "codex"],
+        default="claude",
+        help="主 session 运行载体（默认 claude；Codex skill 传 codex）",
+    )
+    p_init.add_argument(
         "--shell-exports",
         action="store_true",
         help="输出 export KEY=VALUE 行供 eval 注入环境",

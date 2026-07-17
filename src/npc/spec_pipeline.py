@@ -160,9 +160,55 @@ def parse_spec_review(review_json: dict) -> dict:
 # ============================================================
 
 
-def _spec_routing_violations(cfg: Config) -> list[dict]:
-    """只取 ``check_routing`` 里以 ``spec_`` 开头的 violation（路由真相源唯一）。"""
-    return [v for v in check_routing(cfg) if v.get("rule", "").startswith("spec_")]
+def _effective_spec_routing(
+    cfg: Config,
+    p: _paths.Paths,
+    *,
+    engine_name: str | None = None,
+) -> tuple[Config, str, str]:
+    """返回（有效配置、实际 writer、实际 reviewer）。
+
+    spec writer 恒为宿主内 agent，因此 Codex runtime 的 writer 身份必为 Codex；
+    Claude runtime 保持现有 ``[spec_writer]`` 解析。Codex writer 未显式覆盖 review
+    时强制选 Claude，显式 ``--engine codex`` 则保留并由同源守卫拒绝。
+    """
+    writer_backend = (
+        "codex" if p.runtime_host == "codex" else cfg.spec_writer.effective_backend
+    )
+    default_engine = (
+        "claude"
+        if p.runtime_host == "codex" and writer_backend == "codex"
+        else cfg.spec_review.engine
+    )
+    selected_engine = (engine_name or default_engine).lower()
+    effective_cfg = cfg
+    if selected_engine != cfg.spec_review.engine.lower():
+        effective_cfg = dataclasses.replace(
+            cfg,
+            spec_review=dataclasses.replace(
+                cfg.spec_review, engine=selected_engine
+            ),
+        )
+    return effective_cfg, writer_backend, selected_engine
+
+
+def _spec_routing_violations(
+    cfg: Config,
+    p: _paths.Paths,
+    *,
+    engine_name: str | None = None,
+) -> list[dict]:
+    """只取 spec violation；实际宿主身份参与同源判定。"""
+    effective_cfg, writer_backend, _ = _effective_spec_routing(
+        cfg, p, engine_name=engine_name
+    )
+    return [
+        v
+        for v in check_routing(
+            effective_cfg, spec_writer_backend_override=writer_backend
+        )
+        if v.get("rule", "").startswith("spec_")
+    ]
 
 
 # ============================================================
@@ -387,7 +433,7 @@ def spec_interrogate_run(
     except ConfigError as e:
         raise ValueError(str(e)) from e
 
-    violations = _spec_routing_violations(cfg)
+    violations = _spec_routing_violations(cfg, p)
     if violations:
         return {"ok": False, "error": "spec_routing_violation", "violations": violations}
 
@@ -525,7 +571,7 @@ def spec_write_run(
     except ConfigError as e:
         raise ValueError(str(e)) from e
 
-    violations = _spec_routing_violations(cfg)
+    violations = _spec_routing_violations(cfg, p)
     if violations:
         return {"ok": False, "error": "spec_routing_violation", "violations": violations}
 
@@ -631,7 +677,7 @@ def spec_fix_run(
     except ConfigError as e:
         raise ValueError(str(e)) from e
 
-    violations = _spec_routing_violations(cfg)
+    violations = _spec_routing_violations(cfg, p)
     if violations:
         return {"ok": False, "error": "spec_routing_violation", "violations": violations}
 
@@ -856,18 +902,15 @@ def spec_review_run(
     spec_review_cfg = cfg.spec_review
     if engine_name and engine_name not in ("codex", "claude"):
         raise ValueError(f"未知 spec_review engine：{engine_name!r}（仅支持 codex / claude）")
-    selected_engine = (engine_name or spec_review_cfg.engine).lower()
+    _effective_cfg, _writer_backend, selected_engine = _effective_spec_routing(
+        cfg, p, engine_name=engine_name
+    )
 
     # 不变量 5/6 强制：路由校验必须校验实际将执行的 engine，而非配置文件原始值。
     # 若 CLI --engine 覆盖了 [spec_review].engine，需用覆盖后的值构造 effective config
     # 再喂给 check_routing，否则会出现"按旧 engine 通过校验、按新 engine 实际执行"的
     # 漏洞（与 pipeline.py:review_run 的既有处理同构）。
-    if engine_name and engine_name.lower() != spec_review_cfg.engine.lower():
-        effective_spec_review_cfg = dataclasses.replace(spec_review_cfg, engine=selected_engine)
-        effective_cfg = dataclasses.replace(cfg, spec_review=effective_spec_review_cfg)
-    else:
-        effective_cfg = cfg
-    violations = _spec_routing_violations(effective_cfg)
+    violations = _spec_routing_violations(cfg, p, engine_name=selected_engine)
     if violations:
         return {"ok": False, "error": "spec_routing_violation", "violations": violations}
 

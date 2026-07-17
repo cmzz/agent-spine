@@ -67,7 +67,12 @@ def _reject_mimo_in_session(backend: str, dispatch_mode: str, phase: str) -> Non
 
 
 def resolve_dispatch(
-    cfg: Config, phase: str, backend: str, cli_override: str | None = None
+    cfg: Config,
+    phase: str,
+    backend: str,
+    cli_override: str | None = None,
+    *,
+    runtime_host: str = "claude",
 ) -> str:
     """决定某 phase 的 coder dispatch（headless | in-session）。
 
@@ -77,10 +82,25 @@ def resolve_dispatch(
     3. 全局 ``[coder].dispatch``
     4. 内置默认表（claude ⇒ in-session，mimo/codex ⇒ headless）
     """
-    return cfg.coder.dispatch_for_phase(phase, backend, cli_override)
+    if cli_override:
+        return cli_override
+    for ph, value in cfg.coder.phase_dispatches:
+        if ph == phase:
+            return value
+    if cfg.coder.dispatch is not None:
+        return cfg.coder.dispatch
+    if runtime_host == "codex" and backend == "codex":
+        return "in-session"
+    return cfg.coder.dispatch_for_phase(phase, backend)
 
 
-def resolve_backend(cfg: Config, phase: str, override: str | None = None) -> str:
+def resolve_backend(
+    cfg: Config,
+    phase: str,
+    override: str | None = None,
+    *,
+    runtime_host: str = "claude",
+) -> str:
     """决定某 phase 的 coder backend。
 
     优先级：
@@ -95,7 +115,7 @@ def resolve_backend(cfg: Config, phase: str, override: str | None = None) -> str
     """
     if override:
         return override
-    return cfg.coder.backend_for_phase(phase) or "claude"
+    return cfg.coder.backend_for_phase(phase) or runtime_host
 
 
 def _resolve_mimo_env_file(cfg: Config) -> Path:
@@ -458,13 +478,19 @@ def run_implement(
     不 record（留编排者拿 RESULT 后调 npc implement record）。
     """
     cfg = load_config(p.repo_root, override_path=config_path)
-    selected = resolve_backend(cfg, "implement", backend)
-    dispatch_mode = resolve_dispatch(cfg, "implement", selected, dispatch)
+    selected = resolve_backend(
+        cfg, "implement", backend, runtime_host=p.runtime_host
+    )
+    dispatch_mode = resolve_dispatch(
+        cfg, "implement", selected, dispatch, runtime_host=p.runtime_host
+    )
 
     # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
     _reject_mimo_in_session(selected, dispatch_mode, "implement")
 
-    _pipeline._do_phase_enter(p, seq, "implement")
+    _pipeline._do_phase_enter(
+        p, seq, "implement", extra={"generator_backend": selected}
+    )
 
     if dispatch_mode == "in-session":
         return _do_implement_in_session(p, seq, change_id, selected)
@@ -665,15 +691,19 @@ def run_fix(
     不 spawn 子进程，不 record。
     """
     cfg = load_config(p.repo_root, override_path=config_path)
-    selected = resolve_backend(cfg, "fix", backend)
-    dispatch_mode = resolve_dispatch(cfg, "fix", selected, dispatch)
+    selected = resolve_backend(cfg, "fix", backend, runtime_host=p.runtime_host)
+    dispatch_mode = resolve_dispatch(
+        cfg, "fix", selected, dispatch, runtime_host=p.runtime_host
+    )
 
     phase = f"fix-r{round_n}"
 
     # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
     _reject_mimo_in_session(selected, dispatch_mode, phase)
 
-    _pipeline._do_phase_enter(p, seq, phase)
+    _pipeline._do_phase_enter(
+        p, seq, phase, extra={"generator_backend": selected}
+    )
 
     # in-session 分支不被下方 subprocess try/except 覆盖，但 fix 输入校验（stale/missing）
     # 在渲染阶段就会触发——两种分发模式都必须走同一条收尾路径，不留悬挂 phase。

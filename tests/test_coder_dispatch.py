@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,46 @@ def test_dispatch_default_codex_is_headless():
     """codex 内置默认 headless。"""
     cfg = Config()
     assert _coder.resolve_dispatch(cfg, "implement", "codex") == "headless"
+
+
+def test_codex_runtime_default_is_codex_in_session():
+    cfg = Config()
+    backend = _coder.resolve_backend(cfg, "implement", runtime_host="codex")
+    dispatch = _coder.resolve_dispatch(
+        cfg, "implement", backend, runtime_host="codex"
+    )
+    assert backend == "codex"
+    assert dispatch == "in-session"
+
+
+def test_codex_runtime_explicit_headless_remains_authoritative():
+    cfg = Config(coder=CoderConfig(dispatch="headless"))
+    assert (
+        _coder.resolve_dispatch(
+            cfg, "implement", "codex", runtime_host="codex"
+        )
+        == "headless"
+    )
+
+
+def test_codex_runtime_explicit_backend_remains_authoritative():
+    cfg = Config(coder=CoderConfig(backend="mimo"))
+    assert _coder.resolve_backend(cfg, "implement", runtime_host="codex") == "mimo"
+
+
+def test_codex_runtime_implement_deferred_records_generator_backend(
+    tmp_path: Path, fake_repo: Path
+):
+    p, _ = _make_paths_and_state(tmp_path, fake_repo)
+    p = replace(p, runtime_host="codex")
+    result = _coder.run_implement(
+        p, 1, "foo-change", runner=_never_called_runner
+    )
+    assert result["deferred"] is True
+    assert result["backend"] == "codex"
+    state = json.loads(p.state_json.read_text(encoding="utf-8"))
+    phase = state["progress"][0]["phases"]["implement"]
+    assert phase["generator_backend"] == "codex"
 
 
 def test_dispatch_global_config_overrides_default():

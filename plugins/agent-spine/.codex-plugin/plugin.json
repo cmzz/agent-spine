@@ -1,0 +1,21 @@
+{
+  "name": "agent-spine",
+  "version": "1.8.0",
+  "description": "Native Codex carrier for the agent-spine run, spec, and analysis workflows.",
+  "author": {
+    "name": "alpha"
+  },
+  "homepage": "https://github.com/winewei/agent-spine",
+  "repository": "https://github.com/winewei/agent-spine",
+  "license": "MIT",
+  "interface": {
+    "displayName": "Agent Spine",
+    "shortDescription": "Run agent-spine workflows natively in Codex",
+    "longDescription": "Carries the existing agent-spine knowledge and deterministic npc lifecycle into Codex. Codex-generated code and specs are reviewed by Claude.",
+    "developerName": "alpha",
+    "category": "Developer Tools",
+    "defaultPrompt": "Use an Agent Spine skill to run, specify, or analyze this project.",
+    "capabilities": ["skills", "hooks", "coding", "code-review"]
+  },
+  "skills": "./skills/"
+}

@@ -1,0 +1,20 @@
+{
+  "name": "agent-spine",
+  "interface": {
+    "displayName": "Agent Spine"
+  },
+  "plugins": [
+    {
+      "name": "agent-spine",
+      "source": {
+        "source": "local",
+        "path": "./plugins/agent-spine"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Engineering"
+    }
+  ]
+}

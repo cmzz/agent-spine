@@ -208,12 +208,15 @@ def _get_entry(state: dict, seq: int) -> dict:
     return progress[seq - 1]
 
 
-def _do_phase_enter(p: _paths.Paths, seq: int, phase: str) -> dict:
+def _do_phase_enter(
+    p: _paths.Paths, seq: int, phase: str, *, extra: dict | None = None
+) -> dict:
     """phase enter 的纯内部版本。"""
     _events._validate_phase(phase)
     started_at = _io.now_iso()
     started_ms = _io.now_ms()
     captured: dict[str, Any] = {}
+    extra = extra or {}
 
     def mutate(state: dict) -> None:
         entry = _get_entry(state, seq)
@@ -226,6 +229,7 @@ def _do_phase_enter(p: _paths.Paths, seq: int, phase: str) -> dict:
             "status": "in-progress",
             "started_at": started_at,
             "started_ms": started_ms,
+            **extra,
         }
         captured["change_id"] = entry["change_id"]
         captured["base"] = entry["base"]
@@ -322,6 +326,8 @@ def _do_phase_exit(
             new_phase["started_at"] = started_at
         if started_ms is not None:
             new_phase["started_ms"] = started_ms
+        if cur.get("generator_backend"):
+            new_phase["generator_backend"] = cur["generator_backend"]
         new_phase.update(extra)
         phases[phase] = new_phase
         # progress 字段批量更新
@@ -735,25 +741,37 @@ def run_review_round(
             f"未知 review engine：{engine_name!r}（仅支持 codex / claude）"
         )
 
-    # 解析实际将执行的 review engine（engine_name CLI 参数优先于配置文件）
-    # 必须在 check_routing 之前确定，确保守卫校验的是实际执行的 engine，而非原始配置值。
-    selected_engine = (engine_name or review_cfg.engine).lower()
+    state = _state.read_state(p.state_json)
+    entry = _get_entry(state, seq)
+    phase_name = "implement" if round_n == 0 else f"fix-r{round_n}"
+    phase_record = (entry.get("phases") or {}).get(phase_name) or {}
+    generator_backend = phase_record.get("generator_backend")
+    if generator_backend not in ("claude", "mimo", "codex"):
+        config_phase = "implement" if round_n == 0 else "fix"
+        generator_backend = (
+            cfg.coder.backend_for_phase(config_phase) or p.runtime_host
+        )
+
+    # Codex 产出默认强制交给 Claude review。显式 --engine codex 不在这里静默
+    # 改写，而是交给下方同源守卫拒绝，确保路由错误可观察。
+    default_engine = "claude" if generator_backend == "codex" else review_cfg.engine
+    selected_engine = (engine_name or default_engine).lower()
 
     # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝。
     # 若 CLI 传入 engine_name 覆盖了配置中的 review.engine，需用覆盖后的值做校验，
     # 否则会出现"按旧 engine 通过校验、按新 engine 实际执行"的漏洞。
-    if engine_name and engine_name.lower() != review_cfg.engine.lower():
+    if selected_engine != review_cfg.engine.lower():
         effective_review_cfg = dataclasses.replace(review_cfg, engine=selected_engine)
         effective_cfg = dataclasses.replace(cfg, review=effective_review_cfg)
     else:
         effective_cfg = cfg
-    violations = _verify.check_routing(effective_cfg)
+    violations = _verify.check_routing(
+        effective_cfg, coder_backend_override=generator_backend
+    )
     if violations:
         _io.emit({"ok": False, "error": "routing-violation", "violations": violations})
         raise SystemExit(1)
 
-    state = _state.read_state(p.state_json)
-    entry = _get_entry(state, seq)
     change_id = entry["change_id"]
     base = Path(entry.get("base") or _paths.base_for(p, seq, change_id))
     base.mkdir(parents=True, exist_ok=True)

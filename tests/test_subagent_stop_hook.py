@@ -216,6 +216,17 @@ def test_no_agent_type_field_no_result_released() -> None:
     assert proc.returncode == 0, f"Expected exit 0\nstderr: {proc.stderr}"
 
 
+def test_codex_payload_without_last_assistant_message_released() -> None:
+    payload = {
+        "agent_type": "spine-coder",
+        "cwd": "/tmp",
+        "session_id": "codex-session",
+        "transcript_path": "/tmp/codex-session.jsonl",
+    }
+    proc = _run_hook(payload)
+    assert proc.returncode == 0, proc.stderr
+
+
 # ── Robustness: self-error / non-git-dir → exit 0 ────────────────────────────
 
 def test_non_git_dir_releases(tmp_path: Path) -> None:

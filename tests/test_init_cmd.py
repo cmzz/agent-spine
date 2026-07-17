@@ -88,6 +88,21 @@ def test_init_run_auto_mode_label(init_env, capsys, make_args):
     assert payload["mode"] == "auto"
 
 
+def test_init_codex_runtime_is_persisted(init_env, capsys, make_args):
+    args = make_args(
+        auto=False,
+        fresh=True,
+        shell_exports=False,
+        no_worktree=True,
+        runtime_host="codex",
+    )
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["runtime_host"] == "codex"
+    run_json = json.loads(Path(payload["run_json"]).read_text(encoding="utf-8"))
+    assert run_json["runtime_host"] == "codex"
+
+
 def test_init_shell_exports_format(init_env, capsys, make_args):
     args = make_args(auto=False, fresh=True, shell_exports=True, no_worktree=True)
     _init.run(args)
@@ -96,6 +111,7 @@ def test_init_shell_exports_format(init_env, capsys, make_args):
     assert "export NPC_STATE_JSON=" in out
     assert "export NPC_NEEDS_RESUME='false'" in out
     assert "export NPC_FRESH='true'" in out
+    assert "export NPC_RUNTIME_HOST='claude'" in out
 
 
 def test_init_resume_detection(init_env, capsys, make_args):
