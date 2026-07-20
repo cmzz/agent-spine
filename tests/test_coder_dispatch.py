@@ -671,7 +671,11 @@ def test_implement_mimo_headless_still_works(tmp_path: Path, fake_repo: Path):
 # ============================================================
 # F2 回归：codex/kimi headless 尚未实现 → 在 phase_enter 之前显式拒绝
 # （review add-kimi-native-runtime round 1 F2；与上面 mimo+in-session 守卫同构，
-# 但方向相反——这里是"该 backend 只许 in-session，headless 未实现"）
+# 但方向相反——这里是"该 backend 只许 in-session，headless 未实现"。
+# round 2 F1：守卫只把崩溃点提前到 phase_enter 之前，异常分类不变——仍是
+# NotImplementedError，与 spec「Explicit routing remains authoritative」的
+# not-implemented 语义保持一致，不能被提前拒绝的动作本身改写成 ValueError/
+# invalid_args。）
 # ============================================================
 
 
@@ -680,11 +684,12 @@ def test_implement_headless_unimplemented_backend_raises_before_phase_enter(
     backend: str, tmp_path: Path, fake_repo: Path
 ):
     """显式 --backend codex/kimi、默认 dispatch=headless（非对应 runtime_host）：
-    run_implement 必须在 phase_enter 之前拒绝，且 runner 完全不被调用。
+    run_implement 必须在 phase_enter 之前拒绝，且 runner 完全不被调用；异常
+    类型仍是 NotImplementedError（既有 not-implemented 语义不变）。
     """
     p, _ = _make_paths_and_state(tmp_path, fake_repo)
 
-    with pytest.raises(ValueError, match=backend):
+    with pytest.raises(NotImplementedError, match=backend):
         _coder.run_implement(
             p, 1, "foo-change", backend=backend, runner=_never_called_runner,
         )
@@ -700,11 +705,13 @@ def test_implement_headless_unimplemented_backend_raises_before_phase_enter(
 def test_fix_headless_unimplemented_backend_raises_before_phase_enter(
     backend: str, tmp_path: Path, fake_repo: Path
 ):
-    """fix 阶段同构：--backend codex/kimi + 默认 headless 必须在 phase_enter 之前拒绝。"""
+    """fix 阶段同构：--backend codex/kimi + 默认 headless 必须在 phase_enter 之前拒绝，
+    异常类型仍是 NotImplementedError。
+    """
     impl_commit = _real_commit(fake_repo, f"impl_{backend}.txt", backend)
     p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
 
-    with pytest.raises(ValueError, match=backend):
+    with pytest.raises(NotImplementedError, match=backend):
         _coder.run_fix(
             p, 1, "foo-change", 1, backend=backend, runner=_never_called_runner,
         )
@@ -722,14 +729,14 @@ def test_codex_runtime_explicit_headless_override_still_rejected(
     """即便处于 codex runtime、[coder].dispatch 显式覆盖为 headless（resolve_dispatch
     层面"remains authoritative"，见上面 test_codex_runtime_explicit_headless_
     remains_authoritative），run_implement 仍必须拒绝——headless 编排本身未实现，
-    显式配置不能让不存在的执行路径变得可用。
+    显式配置不能让不存在的执行路径变得可用；异常类型仍是 NotImplementedError。
     """
     p, _ = _make_paths_and_state(tmp_path, fake_repo)
     p = replace(p, runtime_host="codex")
     cfg_path = tmp_path / "codex_headless.toml"
     cfg_path.write_text('[coder]\ndispatch = "headless"\n')
 
-    with pytest.raises(ValueError, match="codex"):
+    with pytest.raises(NotImplementedError, match="codex"):
         _coder.run_implement(
             p, 1, "foo-change", config_path=cfg_path, runner=_never_called_runner,
         )
@@ -738,13 +745,15 @@ def test_codex_runtime_explicit_headless_override_still_rejected(
 def test_kimi_runtime_explicit_headless_override_still_rejected(
     tmp_path: Path, fake_repo: Path
 ):
-    """kimi runtime + 显式 [coder].dispatch=headless：同上，仍必须拒绝。"""
+    """kimi runtime + 显式 [coder].dispatch=headless：同上，仍必须拒绝，异常
+    类型仍是 NotImplementedError。
+    """
     p, _ = _make_paths_and_state(tmp_path, fake_repo)
     p = replace(p, runtime_host="kimi")
     cfg_path = tmp_path / "kimi_headless.toml"
     cfg_path.write_text('[coder]\ndispatch = "headless"\n')
 
-    with pytest.raises(ValueError, match="kimi"):
+    with pytest.raises(NotImplementedError, match="kimi"):
         _coder.run_implement(
             p, 1, "foo-change", config_path=cfg_path, runner=_never_called_runner,
         )

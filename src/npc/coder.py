@@ -79,14 +79,18 @@ def _reject_unimplemented_headless(backend: str, dispatch_mode: str, phase: str)
 
     没有这道守卫时，配置（CLI --backend codex/kimi 显式选择，或 [coder].dispatch
     显式 headless 覆盖）能够通过校验，却必然在执行阶段被 `_run_backend` 的
-    NotImplementedError 打断——对使用者而言是"配置合法但注定失败"的隐性陷阱。
+    NotImplementedError 打断——对使用者而言是"配置合法但注定失败"的隐性陷阱；
+    这道守卫只把该崩溃点提前到 phase_enter 之前，不改变错误的语义分类。
 
     必须在 phase_enter 之前调用，避免在 phase 悬挂后才报错（与
-    :func:`_reject_mimo_in_session` 同构）。抛 ValueError（CLI 层已将其映射为
-    exit 1 invalid-args 错误，而非更易被误读为"临时故障"的 not_implemented）。
+    :func:`_reject_mimo_in_session` 同构）。抛 NotImplementedError——spec
+    add-kimi-native-runtime「Explicit routing remains authoritative」明确要求
+    显式配置的 headless Kimi/Codex coder 报既有 not-implemented 错误（CLI 层
+    将其映射为 exit 2 not_implemented），而不是被提前拒绝的动作本身改写成
+    invalid_args；tasks.md 2.1/2.2 同样要求保留 NotImplementedError。
     """
     if backend in _HEADLESS_UNIMPLEMENTED_BACKENDS and dispatch_mode == "headless":
-        raise ValueError(
+        raise NotImplementedError(
             f"coder backend={backend!r} 的 headless exec 编排尚未实现；"
             f"phase={phase!r} 中解析出 dispatch=headless。"
             f"{backend} 目前只支持 in-session 分发（须在对应 runtime_host="
