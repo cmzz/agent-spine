@@ -790,6 +790,125 @@ def test_implement_kimi_in_session_still_deferred_no_regression(
 
 
 # ============================================================
+# F1 回归：跨宿主身份守卫——in-session 时 backend 必须与 runtime_host 一致
+# （review add-kimi-native-runtime round 3 F1：Kimi runtime 下显式
+# --backend claude 落到 in-session 默认（DISPATCH_DEFAULTS['claude']==
+# 'in-session'，不区分 runtime_host），deferred 请求实际由 Kimi 宿主内 agent
+# 承接执行，但 generator_backend 被记为 claude，绕过 kimi_review_not_claude
+# 不变量。）
+# ============================================================
+
+
+def test_implement_kimi_runtime_explicit_claude_backend_rejected_before_phase_enter(
+    tmp_path: Path, fake_repo: Path
+):
+    """Kimi runtime 下显式 --backend claude：backend(claude) != runtime_host
+    (kimi) 但 dispatch 默认解析为 in-session —— 必须在 phase_enter 之前拒绝，
+    不返回 deferred，也不记录 generator_backend=claude（不给后续 review 留下
+    错误生成身份，避免 Kimi 实际生成的代码被 Codex/默认 engine 而非 Claude
+    评审）。
+    """
+    p, _ = _make_paths_and_state(tmp_path, fake_repo)
+    p = replace(p, runtime_host="kimi")
+
+    with pytest.raises(ValueError, match="runtime_host"):
+        _coder.run_implement(
+            p, 1, "foo-change", backend="claude", runner=_never_called_runner,
+        )
+
+    s = json.loads(p.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "implement" not in phases, (
+        f"phase_enter 不应被调用（跨宿主 backend=claude 应在 enter 前被拒绝）；phases={phases}"
+    )
+
+
+def test_fix_kimi_runtime_explicit_claude_backend_rejected_before_phase_enter(
+    tmp_path: Path, fake_repo: Path
+):
+    """fix 阶段同构：Kimi runtime + 显式 --backend claude 必须在 phase_enter
+    之前拒绝，且不记录 generator_backend=claude。
+    """
+    impl_commit = _real_commit(fake_repo, "impl_kimi_claude.txt", "k")
+    p = _make_paths_and_state_for_fix(tmp_path, fake_repo, impl_commit)
+    p = replace(p, runtime_host="kimi")
+    _write_prev_review(p, 0)
+
+    with pytest.raises(ValueError, match="runtime_host"):
+        _coder.run_fix(
+            p, 1, "foo-change", 1, backend="claude", runner=_never_called_runner,
+        )
+
+    s = json.loads(p.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "fix-r1" not in phases, (
+        f"phase_enter 不应被调用（跨宿主 backend=claude 应在 enter 前被拒绝）；phases={phases}"
+    )
+
+
+def test_implement_codex_runtime_explicit_claude_backend_rejected(
+    tmp_path: Path, fake_repo: Path
+):
+    """同一不变量的另一落点：Codex runtime 下显式 --backend claude 同样必须
+    拒绝——in-session 恒由宿主真实身份承接，与声明 backend 是否为 claude
+    无关，不只 Kimi 一处会踩这个坑。
+    """
+    p, _ = _make_paths_and_state(tmp_path, fake_repo)
+    p = replace(p, runtime_host="codex")
+
+    with pytest.raises(ValueError, match="runtime_host"):
+        _coder.run_implement(
+            p, 1, "foo-change", backend="claude", runner=_never_called_runner,
+        )
+
+
+def test_implement_claude_runtime_explicit_codex_backend_in_session_rejected(
+    tmp_path: Path, fake_repo: Path
+):
+    """反向组合同样落点：Claude runtime 下显式 --backend codex + 强制
+    --dispatch in-session（CLI 覆盖默认 headless）——backend(codex) !=
+    runtime_host(claude)，即便 codex 是合法 SUPPORTED_CODER_BACKENDS 成员，
+    in-session 仍必须拒绝（codex 的宿主内 agent 只存在于 codex runtime，
+    claude session 无法真的以 codex 身份执行）。
+    """
+    p, _ = _make_paths_and_state(tmp_path, fake_repo)  # runtime_host 默认 claude
+
+    with pytest.raises(ValueError, match="runtime_host"):
+        _coder.run_implement(
+            p, 1, "foo-change",
+            backend="codex", dispatch="in-session",
+            runner=_never_called_runner,
+        )
+
+
+def test_implement_kimi_runtime_explicit_claude_backend_headless_still_valid(
+    tmp_path: Path, fake_repo: Path
+):
+    """回归护栏：Kimi runtime 下显式 --backend claude + --dispatch headless
+    是真实可执行路径（spawn 真实 claude -p 子进程），新守卫只拦截
+    dispatch=in-session 的组合，MUST NOT 误伤 headless 路径。
+    """
+    p, run_dir = _make_paths_and_state(tmp_path, fake_repo)
+    p = replace(p, runtime_host="kimi")
+
+    commit = _real_commit(fake_repo, "kimi_claude_headless.txt", "h")
+    summary = run_dir / "implement.summary.md"
+    summary.write_text("# s\n")
+    stdout = f"RESULT: commit={commit} tasks=1 tests=pass summary={summary} notes=-\n"
+    runner = _fake_runner(stdout, exit_code=0)
+
+    result = _coder.run_implement(
+        p, 1, "foo-change",
+        backend="claude", dispatch="headless",
+        runner=runner,
+    )
+
+    assert len(runner.calls) == 1, "headless 路径应调用 runner 一次"
+    assert result.get("ok") is True
+    assert not result.get("deferred", False)
+
+
+# ============================================================
 # run-stale-review-guard（code 侧 fix 输入新鲜度 + missing 结构化拒绝）
 # ============================================================
 

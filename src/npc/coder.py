@@ -99,6 +99,42 @@ def _reject_unimplemented_headless(backend: str, dispatch_mode: str, phase: str)
         )
 
 
+def _reject_host_dispatch_mismatch(
+    backend: str, dispatch_mode: str, phase: str, runtime_host: str
+) -> None:
+    """跨宿主身份守卫：dispatch=in-session 时 backend 必须与 runtime_host 一致。
+
+    dispatch=in-session 的语义是「当前 session 内的宿主 agent 执行」——执行者的
+    真实身份恒由 ``runtime_host`` 决定，与配置/CLI 声明的 ``backend`` 字符串
+    无关。若两者不一致（例如 Kimi runtime 下显式 ``--backend claude``），
+    ``DISPATCH_DEFAULTS`` 对 backend=claude 恒给出 in-session 默认（不区分
+    runtime_host），deferred 请求随后会被 Kimi 宿主内 agent 实际承接执行，
+    但 ``generator_backend`` 会被记为 claude——``pipeline.run_review_round``
+    读到错误的生成身份后，``default_engine`` 判定不会命中 codex/kimi 分支，
+    review 阶段默认 engine（如 codex）会被放行去评审实际由 Kimi 生成的代码，
+    绕过「Kimi 生成必须 Claude review」的不变量（见 review
+    add-kimi-native-runtime round 3 F1）。
+
+    必须在 phase_enter 之前调用，与 :func:`_reject_mimo_in_session` /
+    :func:`_reject_unimplemented_headless` 同构。抛 ValueError（CLI 层映射
+    exit 2 invalid-args）——非宿主 backend 只能走其真实可执行的 headless
+    路径：claude/mimo headless 已实现可正常使用；codex/kimi headless 由
+    :func:`_reject_unimplemented_headless` 单独拒绝为 not-implemented，本
+    函数只处理 dispatch=in-session 分支，不与其重叠。
+    """
+    if dispatch_mode == "in-session" and backend != runtime_host:
+        raise ValueError(
+            f"backend={backend!r} 与 runtime_host={runtime_host!r} 不一致，"
+            f"但 phase={phase!r} 解析出 dispatch=in-session：in-session 分发"
+            "恒由宿主内 agent（真实执行身份=runtime_host）承接，与声明的 "
+            "backend 无关；继续下去会让记录的 generator_backend 与实际生成者"
+            "身份错位（例如让 Kimi 实际生成的代码被记为 claude 生成，从而"
+            "绕过 kimi_review_not_claude 不变量）。请将 backend 改为与 "
+            f"runtime_host={runtime_host!r} 一致，或改用该 backend 真实可"
+            "执行的 headless 路径（--dispatch headless）。"
+        )
+
+
 def resolve_dispatch(
     cfg: Config,
     phase: str,
@@ -524,6 +560,10 @@ def run_implement(
     _reject_mimo_in_session(selected, dispatch_mode, "implement")
     # codex/kimi headless 尚未实现：同样必须在 phase_enter 之前检查
     _reject_unimplemented_headless(selected, dispatch_mode, "implement")
+    # 跨宿主身份守卫：in-session 时 backend 必须与 runtime_host 一致
+    _reject_host_dispatch_mismatch(
+        selected, dispatch_mode, "implement", p.runtime_host
+    )
 
     _pipeline._do_phase_enter(
         p, seq, "implement", extra={"generator_backend": selected}
@@ -739,6 +779,8 @@ def run_fix(
     _reject_mimo_in_session(selected, dispatch_mode, phase)
     # codex/kimi headless 尚未实现：同样必须在 phase_enter 之前检查
     _reject_unimplemented_headless(selected, dispatch_mode, phase)
+    # 跨宿主身份守卫：in-session 时 backend 必须与 runtime_host 一致
+    _reject_host_dispatch_mismatch(selected, dispatch_mode, phase, p.runtime_host)
 
     _pipeline._do_phase_enter(
         p, seq, phase, extra={"generator_backend": selected}
