@@ -1,6 +1,6 @@
 {
   "name": "agent-spine",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Native Codex carrier for the agent-spine run, spec, and analysis workflows.",
   "author": {
     "name": "alpha"
