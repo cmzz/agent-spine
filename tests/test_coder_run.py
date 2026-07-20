@@ -72,6 +72,11 @@ def _fake_runner(stdout: str, exit_code: int = 0):
     return runner
 
 
+def _never_called_runner(*, argv, cwd, env=None, timeout=None):
+    """断言 runner 完全不会被调用（用于验证守卫在 phase_enter/子进程之前拒绝）。"""
+    raise AssertionError(f"runner 不应被调用；argv={argv}")
+
+
 # ============================================================
 # resolve_backend（纯函数）
 # ============================================================
@@ -341,26 +346,46 @@ def test_cli_implement_run_success_emits_backend(
 
 
 # ============================================================
-# codex backend：留 TODO（NotImplemented → 友好退出）
+# codex/kimi backend：headless 尚未实现 → 在 phase_enter 之前显式拒绝
+# （review add-kimi-native-runtime round 1 F2：配置能通过校验却必然在执行阶段
+# 崩溃属于隐性 stub 陷阱，改为 ValueError 提前拒绝，见 test_coder_dispatch.py
+# 「F2 回归」节里 phase 未 enter 的断言）。
 # ============================================================
 
 
-def test_run_implement_codex_not_implemented(env_setup, make_args, capsys, fake_repo: Path):
+def test_run_implement_codex_headless_rejected(env_setup, make_args, capsys, fake_repo: Path):
+    """Claude 宿主下显式 --backend codex：默认 dispatch=headless，必须提前拒绝
+    而不是让 runner 被调用后才在 _run_backend 里炸 NotImplementedError。
+    """
     p = env_setup
     _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
-    runner = _fake_runner("", exit_code=0)
-    with pytest.raises(NotImplementedError, match="codex"):
+    runner = _never_called_runner
+    with pytest.raises(ValueError, match="codex"):
         _coder.run_implement(pr, 1, "add-foo", backend="codex", runner=runner)
 
+    # phase 未 enter → state 里 implement phase 记录不存在（不留悬挂 phase）
+    s = json.loads(pr.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "implement" not in phases, (
+        f"phase_enter 不应被调用（codex headless 应在 enter 前被拒绝）；phases={phases}"
+    )
 
-def test_run_implement_kimi_not_implemented(env_setup, make_args, capsys, fake_repo: Path):
+
+def test_run_implement_kimi_headless_rejected(env_setup, make_args, capsys, fake_repo: Path):
+    """Claude 宿主下显式 --backend kimi：默认 dispatch=headless，必须提前拒绝。"""
     p = env_setup
     _bootstrap_run(make_args, capsys, "add-foo", p=p)
     pr = _paths_with_repo(p, fake_repo)
-    runner = _fake_runner("", exit_code=0)
-    with pytest.raises(NotImplementedError, match="kimi"):
+    runner = _never_called_runner
+    with pytest.raises(ValueError, match="kimi"):
         _coder.run_implement(pr, 1, "add-foo", backend="kimi", runner=runner)
+
+    s = json.loads(pr.state_json.read_text())
+    phases = s["progress"][0].get("phases", {})
+    assert "implement" not in phases, (
+        f"phase_enter 不应被调用（kimi headless 应在 enter 前被拒绝）；phases={phases}"
+    )
 
 
 # ============================================================
@@ -532,12 +557,15 @@ def test_cli_fix_run_change_id_mismatch(
     assert out["error"] == "env_missing"
 
 
-def test_cli_fix_run_codex_not_implemented_exit_2(
+def test_cli_fix_run_codex_headless_rejected_exit_2(
     env_setup, make_args, capsys, fake_repo: Path, monkeypatch
 ):
+    """--backend codex（默认 dispatch=headless）：现在在 phase_enter / stale-review
+    校验之前就被 _reject_unimplemented_headless 拒绝，CLI 层映射为 invalid_args
+    （而不是旧版本的 not_implemented——那时配置能通过校验、直到 _run_backend 才炸）。
+    """
     p = env_setup
     _bootstrap_run(make_args, capsys, "add-foo", p=p)
-    _write_prev_review(p.run_dir / "001-add-foo", 0)  # render 通过后才触发 codex not-implemented
     monkeypatch.setattr(_coder._paths, "load_paths", lambda args: _paths_with_repo(p, fake_repo))
 
     args = make_args(seq=1, change_id="add-foo", round_n=1, backend="codex", timeout=None, config=None)
@@ -546,7 +574,7 @@ def test_cli_fix_run_codex_not_implemented_exit_2(
     assert ei.value.code == 2
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is False
-    assert out["error"] == "not_implemented"
+    assert out["error"] == "invalid_args"
 
 
 # ============================================================

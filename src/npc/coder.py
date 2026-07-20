@@ -66,6 +66,35 @@ def _reject_mimo_in_session(backend: str, dispatch_mode: str, phase: str) -> Non
         )
 
 
+# codex/kimi 的 headless（子进程 exec）编排尚未实现（_run_backend 对应分支
+# 只有 TODO + NotImplementedError）；这两个 backend 目前只有"宿主内 agent"
+# 一条可执行路径——生成身份（runtime_host 决定的 backend 取值）与"可执行
+# headless 后端"是两个概念，不能因为前者合法就默许后者。见
+# review add-kimi-native-runtime round 1 F2。
+_HEADLESS_UNIMPLEMENTED_BACKENDS = frozenset({"codex", "kimi"})
+
+
+def _reject_unimplemented_headless(backend: str, dispatch_mode: str, phase: str) -> None:
+    """codex/kimi headless 不变量守卫：这两个 backend 的 headless exec 编排尚未实现。
+
+    没有这道守卫时，配置（CLI --backend codex/kimi 显式选择，或 [coder].dispatch
+    显式 headless 覆盖）能够通过校验，却必然在执行阶段被 `_run_backend` 的
+    NotImplementedError 打断——对使用者而言是"配置合法但注定失败"的隐性陷阱。
+
+    必须在 phase_enter 之前调用，避免在 phase 悬挂后才报错（与
+    :func:`_reject_mimo_in_session` 同构）。抛 ValueError（CLI 层已将其映射为
+    exit 1 invalid-args 错误，而非更易被误读为"临时故障"的 not_implemented）。
+    """
+    if backend in _HEADLESS_UNIMPLEMENTED_BACKENDS and dispatch_mode == "headless":
+        raise ValueError(
+            f"coder backend={backend!r} 的 headless exec 编排尚未实现；"
+            f"phase={phase!r} 中解析出 dispatch=headless。"
+            f"{backend} 目前只支持 in-session 分发（须在对应 runtime_host="
+            f"{backend!r} 下运行，由该 runtime 的宿主内 agent 承接）；"
+            "如需 headless，请改用 claude / mimo backend。"
+        )
+
+
 def resolve_dispatch(
     cfg: Config,
     phase: str,
@@ -451,7 +480,11 @@ def _run_backend(
         return result, model
     if backend in ("codex", "kimi"):
         # TODO: codex/kimi exec 路径（参考 pipeline._codex_exec / engines.CodexEngine）。
-        # coder 经 codex/kimi 的 headless 编排尚未实现；当前明确报错而非静默退化。
+        # 正常路径下这个分支不可达：run_implement / run_fix 在 phase_enter 之前
+        # 已用 _reject_unimplemented_headless 挡掉 dispatch=headless 的
+        # codex/kimi 配置。这里保留 NotImplementedError 作为纵深防御的最后一道
+        # 兜底（例如直接调用 _do_implement_body/_do_fix_body 绕过守卫的场景），
+        # 而不是静默退化。
         raise NotImplementedError(
             f"coder backend={backend!r} 尚未实现；请使用 claude / mimo，或参考 "
             "engines.CodexEngine 补齐对应 exec 路径"
@@ -485,6 +518,8 @@ def run_implement(
 
     # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
     _reject_mimo_in_session(selected, dispatch_mode, "implement")
+    # codex/kimi headless 尚未实现：同样必须在 phase_enter 之前检查
+    _reject_unimplemented_headless(selected, dispatch_mode, "implement")
 
     _pipeline._do_phase_enter(
         p, seq, "implement", extra={"generator_backend": selected}
@@ -698,6 +733,8 @@ def run_fix(
 
     # MiMo headless 不变量：必须在 phase_enter 之前检查，避免 phase 悬挂
     _reject_mimo_in_session(selected, dispatch_mode, phase)
+    # codex/kimi headless 尚未实现：同样必须在 phase_enter 之前检查
+    _reject_unimplemented_headless(selected, dispatch_mode, phase)
 
     _pipeline._do_phase_enter(
         p, seq, phase, extra={"generator_backend": selected}
