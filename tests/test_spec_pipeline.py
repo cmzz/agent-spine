@@ -1920,3 +1920,231 @@ def test_spine_spec_writer_agent_lists_interrogate_phase():
     ).read_text(encoding="utf-8")
     assert "spec_interrogate" in text
     assert "## Analogs" in text and "## Assumptions" in text and "## Open Questions" in text
+
+
+# ============================================================
+# add-kimi-native-runtime：Native generation and review routing
+# （tasks.md 2.3/2.6/2.7/2.8/2.10）
+# ============================================================
+
+
+def test_kimi_runtime_spec_review_defaults_to_claude(env_setup, fake_repo, monkeypatch):
+    """对称于 test_codex_runtime_spec_review_defaults_to_claude。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+    monkeypatch.setattr(_sp, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
+    )
+    engine_calls: list[dict] = []
+
+    def fake_engine(**kw):
+        engine_calls.append(kw)
+        kw["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kw["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kw["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_sp, "_spec_engine_exec", fake_engine)
+    result = _sp.spec_review_run(
+        p,
+        "add-foo",
+        0,
+        validate_runner=_fake_validate_runner(returncode=0),
+        gate_runner=subprocess.run,
+    )
+    assert result["ok"] is True
+    assert engine_calls[0]["engine_name"] == "claude"
+
+
+def test_kimi_runtime_rejects_explicit_non_kimi_spec_writer(env_setup, fake_repo, tmp_path):
+    """kimi runtime 下显式 [spec_writer].backend != kimi 不可静默忽略，必须报 violation。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    cfg_path = tmp_path / "writer-mismatch-kimi.toml"
+    cfg_path.write_text('[spec_writer]\nbackend = "claude"\n', encoding="utf-8")
+    result = _sp.spec_review_run(p, "add-foo", 0, config_path=cfg_path)
+    assert result["ok"] is False
+    assert result["error"] == "spec_routing_violation"
+    assert any(
+        v["rule"] == "spec_writer_host_mismatch" for v in result["violations"]
+    )
+
+
+def test_kimi_runtime_explicit_kimi_spec_writer_has_no_violation(env_setup):
+    """显式 backend=kimi 与宿主一致，不得误报 host mismatch。"""
+    p = type(env_setup)(**{**env_setup.__dict__, "runtime_host": "kimi"})
+    cfg = _config.Config(
+        spec_writer=_config.SpecWriterConfig(backend="kimi"),
+        spec_review=_config.SpecReviewConfig(engine="claude"),
+    )
+    assert _sp._spec_routing_violations(cfg, p) == []
+
+
+def test_explicit_kimi_spec_review_engine_is_rejected(env_setup, fake_repo):
+    """round-3 F1 措辞校正：固定校验顺序第 1 步——engine 白名单拒绝，不依赖生成者身份。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    with pytest.raises(ValueError, match="未知 spec_review engine") as ei:
+        _sp.spec_review_run(p, "add-foo", 0, engine_name="kimi")
+    assert "kimi" in str(ei.value)
+
+
+def test_explicit_codex_spec_review_of_kimi_written_spec_is_rejected(
+    env_setup, fake_repo, monkeypatch
+):
+    """round-3 F1 修复：第 2 步——Kimi 写的 spec 显式请求 codex spec review 应被
+    拒绝为 spec 路由 violation，而不是被静默执行。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+
+    codex_calls: list[str] = []
+    monkeypatch.setattr(
+        _sp, "_spec_engine_exec",
+        lambda **kw: codex_calls.append("codex") or 0,
+    )
+    result = _sp.spec_review_run(p, "add-foo", 0, engine_name="codex")
+    assert result["ok"] is False
+    assert result["error"] == "spec_routing_violation"
+    assert any(
+        v["rule"] == "spec_kimi_review_not_claude" for v in result["violations"]
+    )
+    assert codex_calls == []
+
+
+def test_kimi_written_spec_review_dependency_missing_does_not_fallback(
+    env_setup, fake_repo, monkeypatch
+):
+    """round-2 F4 修复：Kimi 写的 spec，默认路由到 Claude spec review，但 Claude
+    二进制缺失——必须走既有 dependency_missing，不静默降级为 codex/kimi 自审。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+    monkeypatch.setattr(
+        _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
+    )
+
+    def raise_missing(override=None):
+        raise FileNotFoundError(
+            "未在 PATH 中找到 claude 命令；请安装 Claude Code CLI 或在 [review.claude] bin 指定"
+        )
+
+    monkeypatch.setattr(_sp, "_find_claude_bin", raise_missing)
+    codex_calls: list[str] = []
+    monkeypatch.setattr(
+        _sp, "_spec_engine_exec",
+        lambda **kw: codex_calls.append("exec") or 0,
+    )
+
+    result = _sp.spec_review_run(
+        p, "add-foo", 0,
+        validate_runner=_fake_validate_runner(returncode=0),
+        gate_runner=subprocess.run,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "dependency_missing"
+    assert codex_calls == []
+
+
+def test_kimi_written_spec_review_claude_exec_failed_does_not_fallback(
+    env_setup, fake_repo, monkeypatch
+):
+    """对称于既有 {"ok": False, "error": "claude-exec-failed"} 用例，phase 的
+    spec writer 为 kimi。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+    monkeypatch.setattr(_sp, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
+    )
+
+    def fail_engine(**kw):
+        return 65  # JSON 提取失败
+
+    monkeypatch.setattr(_sp, "_spec_engine_exec", fail_engine)
+
+    result = _sp.spec_review_run(
+        p, "add-foo", 0,
+        validate_runner=_fake_validate_runner(returncode=0),
+        gate_runner=subprocess.run,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "claude-exec-failed"
+
+
+def test_kimi_runtime_unconfigured_spec_writer_is_kimi_in_session(env_setup, fake_repo):
+    """round-3 F2 修复：未配置 [spec_writer] 时，Kimi runtime 下解析出的 writer
+    生成身份为 kimi，spec_write_run/spec_fix_run 返回 deferred=true 的 in-session
+    分发请求。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    cfg = _config.Config()
+    _effective_cfg, writer_backend, _ = _sp._effective_spec_routing(cfg, p)
+    assert writer_backend == "kimi"
+
+    write_result = _sp.spec_write_run(p, "add-foo")
+    assert write_result["ok"] is True
+    assert write_result["deferred"] is True
+
+    base = _sp._spec_base(p, "add-foo")
+    (base / "round-0.spec-review.json").write_text(
+        json.dumps({"verdict": "approve", "findings": []})
+    )
+    fix_result = _sp.spec_fix_run(p, "add-foo", 1)
+    assert fix_result["ok"] is True
+    assert fix_result["deferred"] is True
+
+
+def test_spec_write_record_kimi_writer_out_of_scope_changes_blocked(env_setup, fake_repo):
+    """round-3 F3 回归：spec_write_record 的确定性拒绝路径对 Kimi 起始的 spec
+    writer phase 同样生效。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    _sp.spec_write_run(p, "add-foo")
+
+    subprocess.run(["git", "add", "-A"], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "wip"], cwd=fake_repo, check=True)
+
+    (fake_repo / "src").mkdir(exist_ok=True)
+    (fake_repo / "src" / "npc").mkdir(exist_ok=True)
+    (fake_repo / "src" / "npc" / "cli.py").write_text("# tampered\n")
+
+    line = "RESULT: change=add-foo artifacts=proposal.md validate=pass summary=/tmp/s.md"
+    result = _sp.spec_write_record(p, "add-foo", line)
+    assert result["ok"] is False
+    assert result["error"] == "out_of_scope_changes"
+
+
+def test_spec_fix_record_kimi_writer_unexpected_commit_blocked(env_setup, fake_repo):
+    """round-3 F3 回归：spec_fix_record 的确定性拒绝路径对 Kimi 起始的 spec
+    fixer phase 同样生效。"""
+    _make_change_dir(fake_repo, "add-foo")
+    p = _with_repo(env_setup, fake_repo)
+    p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
+    base = _sp._spec_base(p, "add-foo")
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "round-0.spec-review.json").write_text(
+        json.dumps({"verdict": "approve", "findings": []})
+    )
+    result = _sp.spec_fix_run(p, "add-foo", 1)
+    assert result["ok"] is True
+
+    subprocess.run(["git", "add", "-A"], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "unexpected"], cwd=fake_repo, check=True)
+
+    line = "RESULT: change=add-foo fixed=1 validate=pass summary=/tmp/s.md"
+    result = _sp.spec_fix_record(p, "add-foo", 1, line)
+    assert result["ok"] is False
+    assert result["error"] == "unexpected_commit"

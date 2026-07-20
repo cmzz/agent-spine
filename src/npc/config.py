@@ -33,7 +33,7 @@ from pathlib import Path
 
 CONFIG_FILENAME = "config.toml"
 SUPPORTED_ENGINES = ("codex", "claude")
-SUPPORTED_CODER_BACKENDS = ("claude", "mimo", "codex")
+SUPPORTED_CODER_BACKENDS = ("claude", "mimo", "codex", "kimi")
 SUPPORTED_DISPATCH_VALUES = ("headless", "in-session")
 
 # 内置默认分发表：按 backend 决定 dispatch 默认值
@@ -41,6 +41,7 @@ DISPATCH_DEFAULTS: dict[str, str] = {
     "claude": "in-session",
     "mimo": "headless",
     "codex": "headless",
+    "kimi": "headless",
 }
 
 

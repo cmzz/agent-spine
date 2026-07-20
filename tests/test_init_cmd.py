@@ -103,6 +103,21 @@ def test_init_codex_runtime_is_persisted(init_env, capsys, make_args):
     assert run_json["runtime_host"] == "codex"
 
 
+def test_init_kimi_runtime_is_persisted(init_env, capsys, make_args):
+    args = make_args(
+        auto=False,
+        fresh=True,
+        shell_exports=False,
+        no_worktree=True,
+        runtime_host="kimi",
+    )
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["runtime_host"] == "kimi"
+    run_json = json.loads(Path(payload["run_json"]).read_text(encoding="utf-8"))
+    assert run_json["runtime_host"] == "kimi"
+
+
 def test_init_shell_exports_format(init_env, capsys, make_args):
     args = make_args(auto=False, fresh=True, shell_exports=True, no_worktree=True)
     _init.run(args)

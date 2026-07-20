@@ -115,3 +115,61 @@ def test_detect_session_prefers_mtime(tmp_path: Path):
     sid, _, src = _session.detect_session(proj_key, home=home)
     assert sid == "mtime-sid"
     assert src == "mtime-1min"
+
+
+# ============================================================
+# add-kimi-native-runtime：Kimi SessionStart 部分索引降级（tasks.md 4.1）
+# ============================================================
+
+
+def test_detect_via_hook_rejects_empty_transcript_path(tmp_path: Path):
+    """(a) Kimi 的 SessionStart 结构性永远不带 transcript_path；index-session.sh
+    放宽字段校验后仍会写入一行缓存记录，但 transcript_path 字段为空字符串。
+    detect_via_hook 对这种"部分索引"条目必须与完全无条目一视同仁，返回 None。"""
+    home = tmp_path
+    proj_key = "-repo"
+    by_cwd = home / "task_log" / ".session-cache" / "by-cwd" / f"{proj_key}.jsonl"
+    by_cwd.parent.mkdir(parents=True)
+    by_cwd.write_text(
+        json.dumps(
+            {"session_id": "kimi-sid", "transcript_path": "", "cwd": "/tmp", "runtime_host": "kimi"}
+        )
+        + "\n"
+    )
+    assert _session.detect_via_hook(proj_key, home) is None
+
+
+def test_detect_session_partial_hook_index_reports_not_found(tmp_path: Path):
+    """(b) mtime 未命中 + hook cache 只有部分索引条目（无 transcript_path）时，
+    detect_session 的公共入口必须返回 ("-", "-", "unknown")，不报错、不误判为命中。"""
+    home = tmp_path
+    proj_key = "-repo"
+    # 无 .claude/projects/<proj_key> 目录 → mtime 探测天然未命中
+    by_cwd = home / "task_log" / ".session-cache" / "by-cwd" / f"{proj_key}.jsonl"
+    by_cwd.parent.mkdir(parents=True)
+    by_cwd.write_text(
+        json.dumps({"session_id": "kimi-sid", "transcript_path": "", "cwd": "/tmp"}) + "\n"
+    )
+    sid, tx, src = _session.detect_session(proj_key, home=home)
+    assert (sid, tx, src) == ("-", "-", "unknown")
+
+
+def test_detect_via_hook_does_not_call_detect_via_mtime(tmp_path: Path, monkeypatch):
+    """(c) detect_via_hook 保持 hook-only 职责边界，不在内部调用 detect_via_mtime
+    （避免 round-3 F3 指出的"hook 内部自行回退 mtime"这种职责混淆重新引入）。"""
+    calls: list[str] = []
+    monkeypatch.setattr(
+        _session, "detect_via_mtime", lambda *a, **kw: calls.append(1) or None
+    )
+    home = tmp_path
+    proj_key = "-repo"
+    by_cwd = home / "task_log" / ".session-cache" / "by-cwd" / f"{proj_key}.jsonl"
+    by_cwd.parent.mkdir(parents=True)
+    tx_path = home / "tx.jsonl"
+    tx_path.write_text("{}\n")
+    by_cwd.write_text(
+        json.dumps({"session_id": "sid", "transcript_path": str(tx_path)}) + "\n"
+    )
+    result = _session.detect_via_hook(proj_key, home)
+    assert result is not None
+    assert calls == []

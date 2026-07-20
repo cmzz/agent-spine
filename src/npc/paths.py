@@ -319,7 +319,7 @@ def read_run_json(run_json_path: Path) -> Paths:
     if mode_raw not in ("auto", "interactive"):
         mode_raw = "interactive"
     runtime_host_raw = data.get("runtime_host", "claude")
-    if runtime_host_raw not in ("claude", "codex"):
+    if runtime_host_raw not in ("claude", "codex", "kimi"):
         runtime_host_raw = "claude"
     return Paths(
         repo_root=Path(data["repo_root"]),
@@ -414,7 +414,7 @@ def _load_from_env() -> Paths | None:
         schema_path=Path(os.environ["NPC_SCHEMA_PATH"]),
         run_events=Path(os.environ["NPC_RUN_EVENTS"]),
         runtime_host=os.environ.get("NPC_RUNTIME_HOST", "claude")
-        if os.environ.get("NPC_RUNTIME_HOST") in ("claude", "codex")
+        if os.environ.get("NPC_RUNTIME_HOST") in ("claude", "codex", "kimi")
         else "claude",
     )
 

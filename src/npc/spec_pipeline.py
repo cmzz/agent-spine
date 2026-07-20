@@ -168,19 +168,20 @@ def _effective_spec_routing(
 ) -> tuple[Config, str, str]:
     """返回（有效配置、实际 writer、实际 reviewer）。
 
-    spec writer 恒为宿主内 agent，因此 Codex runtime 的 writer 身份必为 Codex；
-    Claude runtime 保持现有 ``[spec_writer]`` 解析。Codex writer 未显式覆盖 review
-    时强制选 Claude，显式 ``--engine codex`` 则保留并由同源守卫拒绝。
+    spec writer 恒为宿主内 agent，因此非 Claude runtime（Codex/Kimi）的 writer
+    身份必为该 runtime_host 本身；Claude runtime 保持现有 ``[spec_writer]`` 解析。
+    非 Claude writer 未显式覆盖 review 时强制选 Claude，显式 ``--engine codex``
+    则保留并由同源守卫 / Kimi 路由守卫拒绝。
 
-    显式 ``[spec_writer].backend`` 与 Codex 宿主冲突时不在此静默改写——由
+    显式 ``[spec_writer].backend`` 与非 Claude 宿主冲突时不在此静默改写——由
     ``_spec_routing_violations`` 的 host-mismatch 规则报错，保持路由错误可观察。
     """
     writer_backend = (
-        "codex" if p.runtime_host == "codex" else cfg.spec_writer.effective_backend
+        p.runtime_host if p.runtime_host != "claude" else cfg.spec_writer.effective_backend
     )
     default_engine = (
         "claude"
-        if p.runtime_host == "codex" and writer_backend == "codex"
+        if p.runtime_host != "claude" and writer_backend == p.runtime_host
         else cfg.spec_review.engine
     )
     selected_engine = (engine_name or default_engine).lower()
@@ -206,21 +207,23 @@ def _spec_routing_violations(
         cfg, p, engine_name=engine_name
     )
     violations: list[dict] = []
-    # spec writer 恒 in-session：Codex 宿主下无法兑现非 codex 的显式 writer 配置，
-    # 静默忽略会让配置与实际身份漂移——按既有"路由错误可观察"原则显式拒绝。
+    # spec writer 恒 in-session：非 Claude 宿主（Codex/Kimi）下无法兑现与该
+    # runtime_host 不同的显式 writer 配置，静默忽略会让配置与实际身份漂移——
+    # 按既有"路由错误可观察"原则显式拒绝。
     explicit_writer = cfg.spec_writer.backend
     if (
-        p.runtime_host == "codex"
+        p.runtime_host != "claude"
         and explicit_writer is not None
-        and explicit_writer != "codex"
+        and explicit_writer != p.runtime_host
     ):
         violations.append(
             {
                 "rule": "spec_writer_host_mismatch",
                 "detail": (
-                    f"[spec_writer].backend={explicit_writer!r} 无法在 codex "
-                    "runtime 兑现：spec writer 恒为宿主内 agent（实际身份 codex）。"
-                    "移除该显式配置或改回 claude runtime。"
+                    f"[spec_writer].backend={explicit_writer!r} 无法在 "
+                    f"{p.runtime_host} runtime 兑现：spec writer 恒为宿主内 "
+                    f"agent（实际身份 {p.runtime_host}）。移除该显式配置或改回 "
+                    "claude runtime。"
                 ),
             }
         )

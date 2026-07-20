@@ -354,6 +354,15 @@ def test_run_implement_codex_not_implemented(env_setup, make_args, capsys, fake_
         _coder.run_implement(pr, 1, "add-foo", backend="codex", runner=runner)
 
 
+def test_run_implement_kimi_not_implemented(env_setup, make_args, capsys, fake_repo: Path):
+    p = env_setup
+    _bootstrap_run(make_args, capsys, "add-foo", p=p)
+    pr = _paths_with_repo(p, fake_repo)
+    runner = _fake_runner("", exit_code=0)
+    with pytest.raises(NotImplementedError, match="kimi"):
+        _coder.run_implement(pr, 1, "add-foo", backend="kimi", runner=runner)
+
+
 # ============================================================
 # TimeoutExpired / SubprocessError → phase failed + 不裸抛
 # ============================================================

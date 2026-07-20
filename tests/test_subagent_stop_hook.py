@@ -227,6 +227,27 @@ def test_codex_payload_without_last_assistant_message_released() -> None:
     assert proc.returncode == 0, proc.stderr
 
 
+def test_kimi_payload_without_last_assistant_message_released() -> None:
+    """round-3 F3 回归：Kimi 形态 SubagentStop payload（{agent_name, response},
+    design.md Verified Platform Facts #6 已核实不含 last_assistant_message）
+    对称于既有 Codex 用例，同样必须 fail-open（exit 0）放行。
+
+    放行不代表结果被信任——真正的拒绝闸是 record_implement/record_fix/
+    spec_write_record/spec_fix_record 的确定性校验（见 test_pipeline.py 与
+    test_spec_pipeline.py 里 generator_backend="kimi" 的回归用例），二者合起来
+    才是 spec.md Scenario "Hook fail-open never substitutes for the
+    deterministic record gate" 的完整覆盖。
+    """
+    payload = {
+        "session_id": "kimi-session",
+        "cwd": "/tmp",
+        "agent_name": "coder",
+        "response": "some kimi sub-agent output, not a Claude-shaped message",
+    }
+    proc = _run_hook(payload)
+    assert proc.returncode == 0, proc.stderr
+
+
 # ── Robustness: self-error / non-git-dir → exit 0 ────────────────────────────
 
 def test_non_git_dir_releases(tmp_path: Path) -> None:

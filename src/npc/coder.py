@@ -80,11 +80,12 @@ def resolve_dispatch(
     1. ``cli_override``（CLI ``--dispatch``）
     2. per-phase 覆盖 ``[coder].dispatch_phase.<phase>``
     3. 全局 ``[coder].dispatch``
-    4. 内置默认表（claude ⇒ in-session，mimo/codex ⇒ headless）；仅 codex
-       runtime 下的 codex backend 例外——未配置默认为 in-session（宿主内 agent）
+    4. 内置默认表（claude ⇒ in-session，mimo/codex/kimi ⇒ headless）；仅
+       runtime_host 与 backend 相同且非 claude 时例外——未配置默认为
+       in-session（宿主内 agent，Codex/Kimi runtime 下的同名 backend 均适用）
     """
     default_override = (
-        "in-session" if runtime_host == "codex" and backend == "codex" else None
+        "in-session" if runtime_host == backend and backend != "claude" else None
     )
     return cfg.coder.dispatch_for_phase(
         phase, backend, cli_override, default_override=default_override
@@ -448,12 +449,12 @@ def _run_backend(
         argv = _build_claude_argv(claude_bin, spawn_text, model)
         result = runner(argv=argv, cwd=repo_root, env=env, timeout=timeout)
         return result, model
-    if backend == "codex":
-        # TODO: codex exec 路径（参考 pipeline._codex_exec / engines.CodexEngine）。
-        # coder 经 codex 的 headless 编排尚未实现；当前明确报错而非静默退化。
+    if backend in ("codex", "kimi"):
+        # TODO: codex/kimi exec 路径（参考 pipeline._codex_exec / engines.CodexEngine）。
+        # coder 经 codex/kimi 的 headless 编排尚未实现；当前明确报错而非静默退化。
         raise NotImplementedError(
-            "coder backend=codex 尚未实现；请使用 claude / mimo，或参考 "
-            "engines.CodexEngine 补齐 codex exec 路径"
+            f"coder backend={backend!r} 尚未实现；请使用 claude / mimo，或参考 "
+            "engines.CodexEngine 补齐对应 exec 路径"
         )
     raise ValueError(f"未知 coder backend：{backend!r}")
 

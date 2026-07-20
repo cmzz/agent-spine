@@ -41,6 +41,21 @@ codex --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
 
 对应入口为 `$agent-spine:spine-run`、`$agent-spine:spine-spec`、`$agent-spine:spine-analyze`。Codex 作为生成者时，代码与 spec 的 LLM review 强制由 Claude 执行；缺少 Claude CLI 时流程停止，不同源降级。
 
+Kimi Code（`0.27.0`）也复用同一个 plugin root 的原生 manifest/skills（`.kimi-plugin/plugin.json`），但 Kimi 0.27.0 **没有** `codex plugin add` 那种 shell 级插件安装命令——需要通过 Kimi Code 自身的插件管理机制（会话内 `/plugins` 命令）启用本地/git 插件源，并授予与 Codex 相同的两个外置目录访问权限：
+
+```text
+# 在 Kimi Code 会话内，用 /plugins 启用本地插件源（Kimi 无对应 shell 命令）：
+/plugins
+# 按 Kimi 的插件管理界面添加本地路径 /absolute/path/to/agent-spine
+```
+
+```bash
+# Kimi 进程仍需能写这两个外置目录（与 Codex 相同）：
+kimi --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
+```
+
+Kimi 作为生成者时，代码与 spec 的 LLM review 同样强制由 Claude 执行（`npc init --runtime-host kimi`）；缺少 Claude CLI 或 Claude review 执行失败时流程停止，不会静默降级为 Codex/Kimi 自审。插件本身不会自动修改用户全局 Kimi 配置或凭据。
+
 ---
 
 ## 层 3：CLAUDE.md 片段（项目级，让主 session 知道何时该用 harness）

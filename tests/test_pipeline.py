@@ -2166,3 +2166,383 @@ def test_record_fix_rejects_commit_not_on_run_branch(
     result = _pipeline.record_fix(p_with_repo, 1, 1, result_line)
     assert result["ok"] is False
     assert result["error"] == "commit-not-on-run-branch"
+
+
+# ============================================================
+# add-kimi-native-runtime：Native generation and review routing
+# （tasks.md 2.1/2.3/2.6/2.7/2.8）
+# ============================================================
+
+
+def test_kimi_generated_code_defaults_to_claude_review(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """对称于 test_codex_generated_code_defaults_to_claude_review。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "kimi",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    cfg_path = tmp_path / "single-pass.toml"
+    cfg_path.write_text(
+        "[review]\nadversarial_round0 = false\n", encoding="utf-8"
+    )
+    calls: list[str] = []
+
+    def fake_claude(**kwargs):
+        calls.append("claude")
+        kwargs["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kwargs["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_pipeline, "_claude_exec", fake_claude)
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _pipeline,
+        "_portable_timeout_bin",
+        lambda override=None: Path("/fake/portable-timeout"),
+    )
+    p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert calls == ["claude"]
+
+
+def test_explicit_kimi_review_engine_is_rejected(
+    env_setup, make_args, capsys, fake_repo: Path
+):
+    """round-3 F1 措辞校正：这是固定校验顺序的第 1 步——engine 白名单拒绝，
+    在 generator_backend 是否为 kimi 之前就已经拒绝，不依赖生成者身份。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    with pytest.raises(ValueError, match="未知 review engine") as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="kimi")
+    assert "kimi" in str(ei.value)
+
+
+def test_explicit_codex_review_of_kimi_generated_code_is_rejected(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    """round-3 F1 修复：第 2 步——Kimi 生成的产物显式请求 codex engine 应被
+    拒绝为路由 violation，而不是被静默执行。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "kimi",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    p_with_repo = _make_p_with_repo(env_setup, fake_repo)
+
+    codex_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline,
+        "_codex_exec",
+        lambda **kwargs: codex_calls.append("codex") or 0,
+    )
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="codex")
+    assert ei.value.code == 1
+
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    rules = {v["rule"] for v in out["violations"]}
+    assert "kimi_review_not_claude" in rules
+    assert codex_calls == []
+
+
+def _seed_generator_backend(env_setup, phase: str, backend: str = "kimi") -> None:
+    """把某 phase 标记为已由指定 backend 起始（round-3 F3 回归用；
+    record_implement/record_fix 从不读取该字段，只是确认既有确定性拒绝
+    路径在 Kimi 起始的 phase 上同样可达）。"""
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})[phase] = {
+        "status": "running",
+        "generator_backend": backend,
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+
+def test_record_implement_kimi_backend_missing_result_line_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "implement")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    result = _pipeline.record_implement(p_with_repo, 1, "not a result line at all")
+    assert result["ok"] is False
+    assert result["error"] == "result-line-missing"
+    assert review_calls == []
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "failed"
+
+
+def test_record_implement_kimi_backend_commit_not_found_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "implement")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    summary = p.run_dir / "001-add-foo" / "implement.summary.md"
+    summary.parent.mkdir(parents=True, exist_ok=True)
+    summary.write_text("# impl summary\n")
+    bogus_commit = "0" * 40
+    result_line = f"RESULT: commit={bogus_commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+    assert result["ok"] is False
+    assert result["error"] == "commit-not-found"
+    assert review_calls == []
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "failed"
+
+
+def test_record_implement_kimi_backend_rerun_tests_failed_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "implement")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+    commit, summary = _make_commit_and_summary(fake_repo, p)
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "1 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    result_line = f"RESULT: commit={commit} tasks=3 tests=pass summary={summary} notes=ok"
+    result = _pipeline.record_implement(p_with_repo, 1, result_line)
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert review_calls == []
+    s = json.loads(p.state_json.read_text())
+    assert s["progress"][0]["status"] == "failed"
+
+
+def test_record_fix_kimi_backend_missing_result_line_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "fix-r1")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    result = _pipeline.record_fix(p_with_repo, 1, 1, "not a result line at all")
+    assert result["ok"] is False
+    assert result["error"] == "result-line-missing"
+    assert review_calls == []
+
+
+def test_record_fix_kimi_backend_commit_not_found_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "fix-r1")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    base = p.run_dir / "001-add-foo"
+    base.mkdir(parents=True, exist_ok=True)
+    summary = base / "round-1.fix.summary.md"
+    summary.write_text("# fix summary\n")
+    bogus_commit = "0" * 40
+    result_line = (
+        f"RESULT: commit={bogus_commit} fixed=1 tests=pass summary={summary} "
+        f"categories_scanned=validation regressions_added=- notes=-"
+    )
+    result = _pipeline.record_fix(p_with_repo, 1, 1, result_line)
+    assert result["ok"] is False
+    assert result["error"] == "commit-not-found"
+    assert review_calls == []
+
+
+def test_record_fix_kimi_backend_rerun_tests_failed_blocked(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+):
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    _seed_generator_backend(env_setup, "fix-r1")
+    p = env_setup
+    p_with_repo = type(p)(**{**p.__dict__, "repo_root": fake_repo})
+
+    (fake_repo / "fix_wire_kimi.txt").write_text("fix")
+    subprocess.run(["git", "add", "."], cwd=fake_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "fix: wire kimi"], cwd=fake_repo, check=True)
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=fake_repo, capture_output=True, text=True
+    ).stdout.strip()
+    base = p.run_dir / "001-add-foo"
+    base.mkdir(parents=True, exist_ok=True)
+    summary = base / "round-1.fix.summary.md"
+    summary.write_text("# fix summary\n")
+
+    def fake_rerun(repo_root, cfg, runner=None):
+        return {"no_command": False, "passed": False, "cmd": "pytest", "tail": "2 failed"}
+
+    monkeypatch.setattr(_verify, "run_tests_result", fake_rerun)
+    monkeypatch.setattr(
+        _pipeline, "load_config",
+        lambda repo_root, **kw: _config.Config(
+            verify=_config.VerifyConfig(rerun_tests=True)
+        ),
+    )
+    review_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "run_review_round",
+        lambda *a, **kw: review_calls.append(1) or {"ok": True},
+    )
+
+    result_line = (
+        f"RESULT: commit={commit} fixed=1 tests=pass summary={summary} "
+        f"categories_scanned=validation regressions_added=- notes=-"
+    )
+    result = _pipeline.record_fix(p_with_repo, 1, 1, result_line)
+    assert result["ok"] is False
+    assert result["error"] == "rerun-tests-failed"
+    assert review_calls == []
+
+
+def test_kimi_generated_code_review_dependency_missing_does_not_fallback(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """round-2 F4 修复：Kimi 生成，默认路由到 Claude review，但 Claude 二进制
+    缺失——必须走既有 dependency_missing 结构化错误，不静默降级为 codex/kimi 自审。
+    """
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "kimi",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    def raise_missing(override=None):
+        raise FileNotFoundError(
+            "未在 PATH 中找到 claude 命令；请安装 Claude Code CLI 或在 [review.claude] bin 指定"
+        )
+
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", raise_missing)
+    codex_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "_find_codex_bin",
+        lambda *a, **kw: codex_calls.append(1) or "/fake/codex",
+    )
+    kimi_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "_codex_exec",
+        lambda **kwargs: kimi_calls.append("codex-exec") or 0,
+    )
+
+    args = make_args(
+        seq=1, round_n=0, retries=1, timeout=900, codex_bin=None,
+        portable_timeout=None, engine=None, config=None,
+    )
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.cli_review_run(args)
+    assert ei.value.code == 4
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["error"] == "dependency_missing"
+    assert codex_calls == []
+    assert kimi_calls == []
+
+
+def test_kimi_generated_code_review_claude_exec_failed_does_not_fallback(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """对称于 test_run_review_round_claude_fails_then_retry_fails，固定
+    engine_name="claude"、phase 的 generator_backend="kimi"。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "kimi",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    cfg_path = tmp_path / "npc-kimi-claude-fail.toml"
+    cfg_path.write_text(
+        '[coder]\nbackend = "kimi"\n[review]\nengine = "claude"\n',
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    def fail_claude(**kwargs):
+        calls.append(1)
+        return 65  # JSON 提取失败
+
+    monkeypatch.setattr(_pipeline, "_claude_exec", fail_claude)
+    monkeypatch.setattr(
+        _pipeline, "_find_claude_bin", lambda override=None: "/fake/claude"
+    )
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+    codex_calls: list[str] = []
+    monkeypatch.setattr(
+        _pipeline, "_codex_exec",
+        lambda **kwargs: codex_calls.append("codex-exec") or 0,
+    )
+
+    p_with_repo = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(
+        p_with_repo, 1, 0, retries=1, engine_name="claude", config_path=cfg_path
+    )
+    assert result["ok"] is False
+    assert result["error"] == "claude-exec-failed"
+    assert result["engine"] == "claude"
+    assert len(calls) == 2
+    assert codex_calls == []

@@ -1,0 +1,22 @@
+{
+  "name": "agent-spine",
+  "version": "1.9.0",
+  "description": "Native Kimi Code carrier for the agent-spine run, spec, and analysis workflows.",
+  "author": {
+    "name": "alpha"
+  },
+  "homepage": "https://github.com/winewei/agent-spine",
+  "repository": "https://github.com/winewei/agent-spine",
+  "license": "MIT",
+  "interface": {
+    "displayName": "Agent Spine",
+    "shortDescription": "Run agent-spine workflows natively in Kimi Code",
+    "longDescription": "Carries the existing agent-spine knowledge and deterministic npc lifecycle into Kimi Code. Kimi-generated code and specs are reviewed by Claude.",
+    "developerName": "alpha"
+  },
+  "skills": "./skills/",
+  "hooks": [
+    { "event": "SessionStart", "command": "bash \"$KIMI_PLUGIN_ROOT/hooks/index-session.sh\" --runtime-host kimi", "timeout": 10 },
+    { "event": "SubagentStop", "matcher": "coder", "command": "bash \"$KIMI_PLUGIN_ROOT/hooks/verify-subagent-result.sh\"", "timeout": 15 }
+  ]
+}

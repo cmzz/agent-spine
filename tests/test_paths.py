@@ -78,6 +78,13 @@ def test_codex_runtime_env_roundtrip(computed_paths: _paths.Paths, monkeypatch):
     assert _paths.load_paths_from_env().runtime_host == "codex"
 
 
+def test_kimi_runtime_env_roundtrip(computed_paths: _paths.Paths, monkeypatch):
+    kimi_paths = replace(computed_paths, runtime_host="kimi")
+    for key, value in kimi_paths.to_env().items():
+        monkeypatch.setenv(key, value)
+    assert _paths.load_paths_from_env().runtime_host == "kimi"
+
+
 def test_load_paths_missing_env(monkeypatch):
     for k in (
         "NPC_REPO_ROOT",
@@ -121,6 +128,13 @@ def test_run_json_codex_runtime_roundtrip(computed_paths: _paths.Paths):
     target = _paths.write_run_json(codex_paths)
     assert json.loads(target.read_text(encoding="utf-8"))["runtime_host"] == "codex"
     assert _paths.read_run_json(target).runtime_host == "codex"
+
+
+def test_run_json_kimi_runtime_roundtrip(computed_paths: _paths.Paths):
+    kimi_paths = replace(computed_paths, runtime_host="kimi")
+    target = _paths.write_run_json(kimi_paths)
+    assert json.loads(target.read_text(encoding="utf-8"))["runtime_host"] == "kimi"
+    assert _paths.read_run_json(target).runtime_host == "kimi"
 
 
 def test_legacy_run_json_defaults_runtime_host_to_claude(computed_paths: _paths.Paths):

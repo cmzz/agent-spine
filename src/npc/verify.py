@@ -282,6 +282,25 @@ def check_routing(
             }
         )
 
+    # 规则 2b：Kimi 生成的产物 MUST 路由到 Claude review（Kimi 从不是合法的
+    # review.engine 取值，"同源"判定对它结构性不可达，必须直接按 generator
+    # 身份判定；显式 --engine codex 配合 Kimi 生成的产物会绕开"MUST 路由到
+    # Claude"，故独立新增此判定，不复用 both_codex/gen_not_orthogonal）。
+    kimi_review_not_claude = (
+        effective_backend == "kimi" and review.engine != "claude"
+    )
+    if kimi_review_not_claude:
+        violations.append(
+            {
+                "rule": "kimi_review_not_claude",
+                "detail": (
+                    "coder 生成身份为 kimi 但 review.engine="
+                    f"{review.engine!r} 非 claude：Kimi 生成的产物 MUST 路由到 "
+                    "Claude review，不允许显式改写为其它支持的 engine"
+                ),
+            }
+        )
+
     # 规则 3：MiMo 只许执行（无条件顶层挡：engine 或 claude_bin/model 含 mimo）→ 单条
     if (
         _contains_mimo(review.engine)
@@ -401,6 +420,23 @@ def _check_spec_gen_not_orthogonal(
             {
                 "rule": "spec_gen_not_orthogonal",
                 "detail": "spec_writer 与 spec_review 解析到同一执行身份，等于自己评自己",
+            }
+        )
+
+    # Kimi 生成的 spec MUST 路由到 Claude spec review——与非 spec 侧
+    # kimi_review_not_claude 同构（design.md F1 修复）。
+    spec_kimi_review_not_claude = (
+        effective_backend == "kimi" and spec_review.engine != "claude"
+    )
+    if spec_kimi_review_not_claude:
+        violations.append(
+            {
+                "rule": "spec_kimi_review_not_claude",
+                "detail": (
+                    "spec_writer 生成身份为 kimi 但 spec_review.engine="
+                    f"{spec_review.engine!r} 非 claude：Kimi 生成的 spec MUST "
+                    "路由到 Claude spec review，不允许显式改写为其它支持的 engine"
+                ),
             }
         )
 

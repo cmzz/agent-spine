@@ -76,9 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_init.add_argument("--fresh", action="store_true", help="忽略 in-progress 旧 run")
     p_init.add_argument(
         "--runtime-host",
-        choices=["claude", "codex"],
+        choices=["claude", "codex", "kimi"],
         default="claude",
-        help="主 session 运行载体（默认 claude；Codex skill 传 codex）",
+        help="主 session 运行载体（默认 claude；Codex skill 传 codex；Kimi skill 传 kimi）",
     )
     p_init.add_argument(
         "--shell-exports",
@@ -334,7 +334,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_impl_run.add_argument("--change-id", default=None, help="可选；与 state 中的 seq 一致性校验")
     p_impl_run.add_argument(
         "--backend",
-        choices=["claude", "mimo", "codex"],
+        choices=["claude", "mimo", "codex", "kimi"],
         default=None,
         help="覆盖 coder 后端（默认 claude；MiMo 需显式 --backend mimo / [coder].backend=\"mimo\"，mimo.env 存在不再自动路由）",
     )
@@ -374,7 +374,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fix_run.add_argument("--round", dest="round_n", type=int, required=True)
     p_fix_run.add_argument("--change-id", default=None)
     p_fix_run.add_argument(
-        "--backend", choices=["claude", "mimo", "codex"], default=None,
+        "--backend", choices=["claude", "mimo", "codex", "kimi"], default=None,
         help="覆盖 coder 后端",
     )
     p_fix_run.add_argument(

@@ -170,6 +170,19 @@ def test_coder_unknown_backend_rejected(tmp_path):
         load_config(repo)
 
 
+def test_supported_coder_backends_includes_kimi():
+    assert "kimi" in _config.SUPPORTED_CODER_BACKENDS
+    assert _config.DISPATCH_DEFAULTS["kimi"] == "headless"
+
+
+def test_coder_kimi_backend_parsed(tmp_path):
+    from npc.config import load_config
+    repo = _write_cfg(tmp_path, '[coder]\nbackend="kimi"\n')
+    cfg = load_config(repo)
+    assert cfg.coder.backend == "kimi"
+    assert cfg.coder.effective_backend == "kimi"
+
+
 # ============================================================
 # [coder].category_streak_threshold（change fix-prompt-exhaustive-sweep task 1）
 # ============================================================

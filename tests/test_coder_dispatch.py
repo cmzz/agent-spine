@@ -149,6 +149,31 @@ def test_codex_runtime_default_is_codex_in_session():
     assert dispatch == "in-session"
 
 
+def test_kimi_runtime_default_is_kimi_in_session():
+    cfg = Config()
+    backend = _coder.resolve_backend(cfg, "implement", runtime_host="kimi")
+    dispatch = _coder.resolve_dispatch(
+        cfg, "implement", backend, runtime_host="kimi"
+    )
+    assert backend == "kimi"
+    assert dispatch == "in-session"
+
+
+def test_kimi_runtime_explicit_headless_remains_authoritative():
+    cfg = Config(coder=CoderConfig(dispatch="headless"))
+    assert (
+        _coder.resolve_dispatch(
+            cfg, "implement", "kimi", runtime_host="kimi"
+        )
+        == "headless"
+    )
+
+
+def test_kimi_runtime_explicit_backend_remains_authoritative():
+    cfg = Config(coder=CoderConfig(backend="mimo"))
+    assert _coder.resolve_backend(cfg, "implement", runtime_host="kimi") == "mimo"
+
+
 def test_codex_runtime_explicit_headless_remains_authoritative():
     cfg = Config(coder=CoderConfig(dispatch="headless"))
     assert (

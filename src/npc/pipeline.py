@@ -752,9 +752,12 @@ def run_review_round(
             cfg.coder.backend_for_phase(config_phase) or p.runtime_host
         )
 
-    # Codex 产出默认强制交给 Claude review。显式 --engine codex 不在这里静默
-    # 改写，而是交给下方同源守卫拒绝，确保路由错误可观察。
-    default_engine = "claude" if generator_backend == "codex" else review_cfg.engine
+    # Codex/Kimi 产出默认强制交给 Claude review（不含 mimo）。显式
+    # --engine codex 不在这里静默改写，而是交给下方同源守卫 / Kimi 路由守卫
+    # 拒绝，确保路由错误可观察。
+    default_engine = (
+        "claude" if generator_backend in ("codex", "kimi") else review_cfg.engine
+    )
     selected_engine = (engine_name or default_engine).lower()
 
     # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝。
