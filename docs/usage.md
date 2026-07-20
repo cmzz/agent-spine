@@ -41,7 +41,7 @@ codex --add-dir "$HOME/.spine/worktrees" --add-dir "$HOME/task_log"
 
 对应入口为 `$agent-spine:spine-run`、`$agent-spine:spine-spec`、`$agent-spine:spine-analyze`。Codex 作为生成者时，代码与 spec 的 LLM review 强制由 Claude 执行；缺少 Claude CLI 时流程停止，不同源降级。
 
-Kimi Code（`0.27.0`）也复用同一个 plugin root 的原生 manifest/skills（`.kimi-plugin/plugin.json`），但 Kimi 0.27.0 **没有** `codex plugin add` 那种 shell 级插件安装命令——需要通过 Kimi Code 自身的插件管理机制（会话内 `/plugins` 命令）启用本地/git 插件源，并授予与 Codex 相同的两个外置目录访问权限：
+Kimi Code（验证基线 `0.27.0`；`0.28.0` 已实测同样适用——manifest 路径、hook 事件名、`KIMI_PLUGIN_ROOT`、默认 sub-agent profile `coder` 均未变）也复用同一个 plugin root 的原生 manifest/skills（`.kimi-plugin/plugin.json`），但 Kimi **没有** `codex plugin add` 那种 shell 级插件安装命令——需要在 Kimi 会话内用 `/plugins install <绝对路径>`（会弹出第三方插件信任确认，选 **Trust and install**），并授予与 Codex 相同的两个外置目录访问权限：
 
 ```text
 # 在 Kimi Code 会话内，用 /plugins 启用本地插件源（Kimi 无对应 shell 命令）：
