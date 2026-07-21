@@ -18,6 +18,7 @@ from npc import paths as _paths
 from npc import state as _state
 from npc import verify as _verify
 from npc import config as _config
+from npc import schema as _schema
 
 
 # ============================================================
@@ -735,6 +736,67 @@ def test_run_review_round2_prior_blocking_from_default_parse_of_round1(
     # 几何命中 round-1 的 blocking 三元组 → 有效来源覆盖为 carry-over-unresolved → 仍计入 blocking
     assert result["blocking"] == 1
     assert result["carryover_unresolved_blocking"] == 1
+
+
+def test_run_review_round2_syncs_stale_disk_schema_before_engine_exec(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path
+):
+    """F1 回归（round-3 fix）：磁盘 schema 文件只在 `npc init` 时写入一次；若该 run
+    跨越了引擎 REVIEW_SCHEMA 升级（此处模拟已完成 round 1 的旧版本 run，磁盘上的
+    schema 仍不含 finding_origin），round 2 必须在调用引擎前把磁盘 schema 同步为
+    当前 REVIEW_SCHEMA，engine 才能产出含 finding_origin 的合法 JSON 并通过校验。
+
+    同时验证：round-1 的历史 review JSON（同样不含 finding_origin，代表旧版本产物）
+    只经默认 parse_review 读取，不因 schema 同步而被重新按新 schema 校验或被重写。
+    """
+    p = env_setup
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    base = _round_n_setup(p, {
+        "implement": {"status": "done", "commit": "deadbeef"},
+        "fix-r1": {"status": "done", "commit": "fixc0mmit1"},
+    })
+
+    # 模拟"旧版本完成 round 1"：磁盘 schema 是不含 finding_origin 的旧版本。
+    stale_schema = json.loads(json.dumps(_schema.REVIEW_SCHEMA))
+    finding_props = stale_schema["properties"]["findings"]["items"]["properties"]
+    del finding_props["finding_origin"]
+    stale_schema["properties"]["findings"]["items"]["required"] = [
+        f for f in stale_schema["properties"]["findings"]["items"]["required"]
+        if f != "finding_origin"
+    ]
+    p.schema_path.parent.mkdir(parents=True, exist_ok=True)
+    p.schema_path.write_text(json.dumps(stale_schema), encoding="utf-8")
+
+    # round-1 历史产物：同样不含 finding_origin（代表升级前的旧版本输出）。
+    round1_finding = {
+        "id": "F1", "severity": "high", "category": "validation", "title": "t",
+        "file": "a.py", "line_range": "10-20", "detail": "d", "recommendation": "r",
+        "in_scope": True,
+    }
+    round1_raw = json.dumps(
+        {"verdict": "changes-requested", "findings": [round1_finding]}
+    )
+    (base / "round-1.review.json").write_text(round1_raw, encoding="utf-8")
+
+    # round-2 引擎产出：含 finding_origin，只有磁盘 schema 已被同步为最新版本，
+    # 引擎侧的结构化输出约束才允许该字段存在——这里直接构造代表"已同步后产出"
+    # 的合法 payload，验证同步动作发生在引擎调用之前、且不会因历史 round 干扰而失败。
+    review_payload = {
+        "verdict": "changes-requested",
+        "findings": [_pf("F2", "high", "validation", "b.py", "5-9", "round-diff-new")],
+    }
+    result = _run_round_n(p, fake_repo, monkeypatch, 2, review_payload)
+
+    assert result["ok"] is True
+
+    # 磁盘 schema 必须已被同步为当前 REVIEW_SCHEMA（修复前：仍是不含
+    # finding_origin 的 stale_schema，本断言会失败）。
+    synced = json.loads(p.schema_path.read_text(encoding="utf-8"))
+    assert synced == _schema.REVIEW_SCHEMA
+    assert "finding_origin" in synced["properties"]["findings"]["items"]["properties"]
+
+    # round-1 历史 JSON 原样保留，未被重写、未因新 schema 而失效。
+    assert (base / "round-1.review.json").read_text(encoding="utf-8") == round1_raw
 
 
 def test_run_review_round3_prior_blocking_from_state_not_reparsed_round2_json(
