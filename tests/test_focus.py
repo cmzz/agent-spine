@@ -255,50 +255,6 @@ def test_round_0_and_round_n_share_stub_criteria_verbatim():
     assert const in rn
 
 
-# ============================================================
-# round≥2 delta-review 分类块（change review-delta-convergence）
-# ============================================================
-
-
-def test_round_n_template_round2_with_fix_commit_includes_diff_and_classification():
-    text = _focus._round_n_template(
-        "add-foo", 2, "impl123", "CTX", round_fix_commit="abcd123"
-    )
-    assert "git --no-pager diff abcd123~1..abcd123" in text
-    assert "finding_origin" in text
-    assert "round-diff-new" in text and "pre-existing-new" in text
-
-
-def test_round_n_template_round2_without_fix_commit_still_has_classification():
-    text = _focus._round_n_template("add-foo", 2, "impl123", "CTX", round_fix_commit=None)
-    assert "git --no-pager diff abcd123~1..abcd123" not in text
-    assert "abcd123~1..abcd123" not in text
-    # 分类准则不依赖 round_fix_commit，仍须输出
-    assert "round-diff-new" in text and "pre-existing-new" in text
-
-
-def test_round_n_template_round1_no_delta_block_even_with_fix_commit():
-    text = _focus._round_n_template(
-        "add-foo", 1, "impl123", "CTX", round_fix_commit="abcd123"
-    )
-    assert "abcd123~1..abcd123" not in text
-    assert "Delta-Review 分类准则" not in text
-
-
-def test_output_requirements_block_contains_finding_origin_semantics():
-    block = _focus._output_requirements_block()
-    assert _focus.FINDING_ORIGIN_ENUM_SEMANTICS in block
-    assert "carry-over-unresolved" in block
-
-
-def test_delta_classification_rules_cover_boundary_scenarios():
-    """task 3.1 / spec Scenario：分类准则文案含边界场景的确定性优先级，不止枚举名罗列。"""
-    text = _focus._round_n_template("add-foo", 2, "impl123", "CTX")
-    assert "删除" in text or "跨文件" in text
-    assert "占位符" in text or "无法解析" in text
-    assert "保守归类为" in text or "保守归" in text
-
-
 def test_render_round_n_includes_history_hints(env_setup, capsys, make_args, tmp_path):
     out = tmp_path / "f.md"
     _focus.render(

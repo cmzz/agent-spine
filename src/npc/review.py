@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 from pathlib import Path
 from typing import Any
 
@@ -26,93 +25,12 @@ SPEC_ATTRIBUTION_VALUES = (
     "impl-deviation",
 )
 
-# finding_origin 三值枚举（与 schema.REVIEW_SCHEMA 的 finding_origin.enum 同源）。
-# 见 change review-delta-convergence D1。
-FINDING_ORIGIN_VALUES = (
-    "carry-over-unresolved",
-    "round-diff-new",
-    "pre-existing-new",
-)
 
-_LINE_RANGE_SINGLE_RE = re.compile(r"^\d+$")
-_LINE_RANGE_PAIR_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
-
-
-def _finding_key(f: dict) -> tuple:
-    """``(file, line_range, category)`` 精确三元组，供 ``merge_review_passes`` 同轮去重使用。
-
-    只服务于同一轮内跨 pass 的精确匹配（逐字符相等）；跨轮 carry-over 匹配见
-    :func:`_is_carry_over_match`（区间重叠），二者用途不同、互不替代（见 change
-    review-delta-convergence D2）。
-    """
-    return (f.get("file"), f.get("line_range"), f.get("category"))
-
-
-def _parse_line_range(line_range: Any) -> tuple[int, int] | None:
-    """把 ``line_range`` 解析为整数区间 ``(start, end)``；不可解析返回 ``None``，不抛异常。
-
-    可解析：单行 ``"N"``（视为 ``[N, N]``）、区间 ``"N-M"``（允许数字与连字符前后空白，
-    ``N > M`` 时归一化为 ``[min, max]``）。
-    不可解析：占位符 ``"-"``、空字符串、任意无法提取出两个整数端点的字符串。
-    """
-    if not isinstance(line_range, str):
-        return None
-    s = line_range.strip()
-    if not s:
-        return None
-    if _LINE_RANGE_SINGLE_RE.match(s):
-        n = int(s)
-        return (n, n)
-    m = _LINE_RANGE_PAIR_RE.match(s)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-        return (min(a, b), max(a, b))
-    return None
-
-
-def _is_carry_over_match(finding: dict, prior_finding: dict) -> bool:
-    """判定 ``finding`` 与 ``prior_finding`` 是否是「同一问题」的跨轮 carry-over 匹配。
-
-    判据（见 change review-delta-convergence D2、spec.md「round≥2 对 finding_origin
-    做几何交叉核验」Requirement）：``file``/``category`` 精确匹配 AND ``line_range``
-    解析出的整数区间存在重叠。任一 ``line_range`` 不可解析时直接返回 ``False``，
-    不抛异常、不做区间比较。
-    """
-    if finding.get("file") != prior_finding.get("file"):
-        return False
-    if finding.get("category") != prior_finding.get("category"):
-        return False
-    r1 = _parse_line_range(finding.get("line_range"))
-    r2 = _parse_line_range(prior_finding.get("line_range"))
-    if r1 is None or r2 is None:
-        return False
-    return max(r1[0], r2[0]) <= min(r1[1], r2[1])
-
-
-def parse_review(
-    review_json: dict,
-    *,
-    round_n: int = 0,
-    prior_blocking: list[dict] | None = None,
-) -> dict:
-    """从 review JSON 派生指标。纯函数。
-
-    ``round_n >= 2`` 且提供非 ``None`` 的 ``prior_blocking``（上一轮最终有效
-    ``blocking_findings``）时，对每条 finding 计算「有效来源」``effective_origin``
-    （几何命中优先于自报值，见 change review-delta-convergence D2），有效来源为
-    ``pre-existing-new`` 的 finding 不计入 blocking，``verdict`` 在调整后的集合上
-    重新计算，不采信自报 ``verdict``。
-
-    ``round_n < 2`` 或 ``prior_blocking`` 为 ``None``：``finding_origin`` 字段被
-    忽略，``blocking``/``advisory``/``verdict``/``blocking_findings`` 的派生计算
-    方式与本参数引入前完全一致（``carryover_unresolved_blocking`` 为 ``None``，
-    ``finding_origins`` 为空列表）。
-    """
+def parse_review(review_json: dict) -> dict:
+    """从 review JSON 派生指标。纯函数。"""
     findings = review_json.get("findings") or []
     if not isinstance(findings, list):
         raise ValueError("review.findings 必须是数组")
-
-    delta_active = round_n >= 2 and prior_blocking is not None
 
     blocking_list: list[dict] = []
     advisory_count = 0
@@ -122,8 +40,6 @@ def parse_review(
     # （统计范围与 blocking 一致）。缺失该字段（历史 review.json）计入 unknown，不抛异常。
     spec_attribution_counts: dict[str, int] = {v: 0 for v in SPEC_ATTRIBUTION_VALUES}
     spec_attribution_counts["unknown"] = 0
-    finding_origins: list[dict] = []
-    carryover_unresolved_blocking: int | None = 0 if delta_active else None
 
     for f in findings:
         sev = f.get("severity")
@@ -132,60 +48,24 @@ def parse_review(
         if cat and cat not in seen_cats:
             seen_cats.add(cat)
             categories.append(cat)
-
-        effective_origin: str | None = None
-        if delta_active:
-            reported_origin = f.get("finding_origin")
-            hit = any(_is_carry_over_match(f, g) for g in prior_blocking)
-            if hit:
-                effective_origin = "carry-over-unresolved"
-            elif reported_origin == "carry-over-unresolved":
-                # 自报声称遗留但几何核验未命中：保守回退，仍计入 blocking 候选。
-                effective_origin = "round-diff-new"
-            elif reported_origin in ("round-diff-new", "pre-existing-new"):
-                effective_origin = reported_origin
-            else:
-                # 自报字段缺失/非法枚举（防御性分支，schema 已强制必填合法枚举）。
-                effective_origin = "round-diff-new"
-            finding_origins.append({"id": f.get("id"), "effective_origin": effective_origin})
-
-        is_blocking_candidate = sev in BLOCKING_SEVERITIES and in_scope
-        if delta_active and effective_origin == "pre-existing-new":
-            is_blocking_candidate = False
-
-        if is_blocking_candidate:
+        if sev in BLOCKING_SEVERITIES and in_scope:
             blocking_list.append(f)
             attribution = f.get("spec_attribution")
             if attribution in SPEC_ATTRIBUTION_VALUES:
                 spec_attribution_counts[attribution] += 1
             else:
                 spec_attribution_counts["unknown"] += 1
-            if delta_active and effective_origin == "carry-over-unresolved":
-                carryover_unresolved_blocking = (carryover_unresolved_blocking or 0) + 1
         else:
             advisory_count += 1
 
     blocking_list.sort(key=lambda x: x.get("id", ""))
-
-    if delta_active:
-        if blocking_list:
-            verdict = "changes-requested"
-        elif advisory_count > 0:
-            verdict = "passed-with-advisory"
-        else:
-            verdict = "approve"
-    else:
-        verdict = review_json.get("verdict")
-
     return {
-        "verdict": verdict,
+        "verdict": review_json.get("verdict"),
         "blocking": len(blocking_list),
         "advisory": advisory_count,
         "categories": categories,
         "blocking_findings": blocking_list,
         "spec_attribution_counts": spec_attribution_counts,
-        "carryover_unresolved_blocking": carryover_unresolved_blocking,
-        "finding_origins": finding_origins,
     }
 
 
@@ -228,12 +108,15 @@ def merge_review_passes(pass1: dict, pass2: dict) -> tuple[dict, dict]:
     if not isinstance(p1_findings, list) or not isinstance(p2_findings, list):
         raise ValueError("review.findings 必须是数组")
 
-    pass1_keys = {_finding_key(f) for f in p1_findings}
+    def _key(f: dict) -> tuple:
+        return (f.get("file"), f.get("line_range"), f.get("category"))
+
+    pass1_keys = {_key(f) for f in p1_findings}
 
     merged: list[dict] = list(p1_findings)
     adversarial_blocking_count = 0
     for f in p2_findings:
-        if _finding_key(f) in pass1_keys:
+        if _key(f) in pass1_keys:
             continue
         merged.append(f)
         if f.get("severity") in BLOCKING_SEVERITIES and bool(f.get("in_scope")):

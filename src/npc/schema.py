@@ -42,7 +42,6 @@ REVIEW_SCHEMA = {
                     "recommendation",
                     "in_scope",
                     "spec_attribution",
-                    "finding_origin",
                 ],
                 "properties": {
                     "id": {"type": "string", "description": "本轮唯一 id，建议格式 F1/F2..."},
@@ -86,23 +85,6 @@ REVIEW_SCHEMA = {
                             "spec-ambiguous = spec 有规定但存在多种合理解读；"
                             "spec-contradicted = 实现与 spec 明文相悖；"
                             "impl-deviation = spec 明确无歧义，实现未照做。"
-                        ),
-                    },
-                    "finding_origin": {
-                        "type": "string",
-                        "enum": [
-                            "carry-over-unresolved",
-                            "round-diff-new",
-                            "pre-existing-new",
-                        ],
-                        "description": (
-                            "该 finding 相对本轮改动范围的来源（对所有轮次必填，"
-                            "round≥2 起参与 blocking 计算）："
-                            "carry-over-unresolved = 与上一轮已报告且仍未修复的 blocking finding "
-                            "是同一个问题；"
-                            "round-diff-new = 位置落在当前评审 diff 新引入/修改的代码内；"
-                            "pre-existing-new = 位置落在 diff 未修改的既有代码内，是本次新发现的"
-                            "既有问题。"
                         ),
                     },
                 },

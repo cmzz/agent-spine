@@ -394,39 +394,14 @@ def _do_phase_exit(
 
 
 def _do_review_phase_exit_and_trend(
-    p: _paths.Paths, seq: int, phase: str, metrics: dict, *, round_n: int = 0
+    p: _paths.Paths, seq: int, phase: str, metrics: dict
 ) -> dict:
-    """review-rN done：phase exit + update_trend + capture stale。一次 IO 完成。
-
-    ``round_n >= 2``（见 change review-delta-convergence D5 步骤 6）时，从
-    ``metrics`` 中提取 ``carryover_unresolved_blocking`` / ``hard_convergence_applied``
-    并从 ``metrics["blocking_findings"]`` 派生 ``effective_blocking_findings``
-    （``{file, line_range, category}`` 三元组列表）写入 state phase 记录，供下一轮
-    ``round_n + 1 >= 3`` 读取作为 ``prior_blocking``；``round_n < 2`` 时三键分别写
-    ``None`` / ``False`` / ``None``（历史 state 兼容，见 Migration Plan）。
-    """
+    """review-rN done：phase exit + update_trend + capture stale。一次 IO 完成。"""
     blocking = int(metrics.get("blocking", 0))
     new_categories = metrics.get("categories") or []
     done_at = _io.now_iso()
     done_ms = _io.now_ms()
     captured: dict[str, Any] = {}
-
-    if round_n >= 2:
-        carryover_unresolved_blocking = metrics.get("carryover_unresolved_blocking")
-        hard_convergence_applied = bool(metrics.get("hard_convergence_applied", False))
-        raw_blocking_findings = metrics.get("blocking_findings")
-        effective_blocking_findings: list[dict] | None = (
-            [
-                {"file": f.get("file"), "line_range": f.get("line_range"), "category": f.get("category")}
-                for f in raw_blocking_findings
-            ]
-            if raw_blocking_findings is not None
-            else None
-        )
-    else:
-        carryover_unresolved_blocking = None
-        hard_convergence_applied = False
-        effective_blocking_findings = None
 
     def mutate(state: dict) -> None:
         entry = _get_entry(state, seq)
@@ -443,9 +418,6 @@ def _do_review_phase_exit_and_trend(
             "blocking": blocking,
             "advisory": metrics.get("advisory"),
             "categories": metrics.get("categories"),
-            "carryover_unresolved_blocking": carryover_unresolved_blocking,
-            "hard_convergence_applied": hard_convergence_applied,
-            "effective_blocking_findings": effective_blocking_findings,
         }
         if started_at:
             new_phase["started_at"] = started_at
@@ -640,14 +612,8 @@ def _render_focus(
     implement_commit: str | None,
     base: Path | None = None,
     project_context_override: Path | None = None,
-    round_fix_commit: str | None = None,
 ) -> tuple[str, str, int]:
-    """渲染 focus 文本；返回 (text, project_context_source, fixed_history_count)。
-
-    ``round_fix_commit``：``round_n >= 2`` 时由调用方传入上一轮 ``fix-r{round_n-1}``
-    阶段记录的 ``commit``，供 ``_round_n_template`` 追加本轮增量 diff 指令
-    （见 change review-delta-convergence D4）。``round_n < 2`` 时忽略该参数。
-    """
+    """渲染 focus 文本；返回 (text, project_context_source, fixed_history_count)。"""
     ctx, src = _focus.load_project_context(p.repo_root, project_context_override)
     fixed_count = 0
     if round_n == 0:
@@ -663,12 +629,7 @@ def _render_focus(
                 history_md = _focus.render_fixed_history_section(items)
                 _focus.write_fixed_history_json(base, items)
         text = _focus._round_n_template(
-            change_id,
-            round_n,
-            implement_commit,
-            ctx,
-            fixed_history_md=history_md,
-            round_fix_commit=round_fix_commit if round_n >= 2 else None,
+            change_id, round_n, implement_commit, ctx, fixed_history_md=history_md
         )
     return text, src, fixed_count
 
@@ -821,16 +782,9 @@ def run_review_round(
     impl_phase = (entry.get("phases") or {}).get("implement") or {}
     implement_commit = impl_phase.get("commit")
 
-    # round_fix_commit（round_n >= 2 起才有意义，见 change review-delta-convergence D4/D5）：
-    # 上一轮 fix 阶段记录的 commit，用于 focus 追加本轮增量 diff 指令 + 计算 prior_blocking。
-    round_fix_commit: str | None = None
-    if round_n >= 2:
-        prior_fix_phase = (entry.get("phases") or {}).get(f"fix-r{round_n - 1}") or {}
-        round_fix_commit = prior_fix_phase.get("commit")
-
-    # 1. focus（round>=1 时自动注入 Already-Fixed History；round>=2 时额外追加 delta 规则）
+    # 1. focus（round>=1 时自动注入 Already-Fixed History）
     focus_text, ctx_src, fixed_history_count = _render_focus(
-        p, change_id, round_n, implement_commit, base=base, round_fix_commit=round_fix_commit
+        p, change_id, round_n, implement_commit, base=base
     )
     (base / f"round-{round_n}.focus.md").write_text(focus_text, encoding="utf-8")
 
@@ -951,27 +905,9 @@ def run_review_round(
         )
         review_data = merged
 
-    # 3c. round≥2 delta 计算所需的 prior_blocking（见 change review-delta-convergence D5
-    # 步骤 1）。round_n==2：对 round-1.review.json 走默认 parse_review（round 1 无 delta
-    # 概念，其 blocking_findings 即朴素语义）；round_n>=3：从 state 读取上一轮持久化的
-    # effective_blocking_findings（MUST NOT 对上一轮原始 JSON 重新默认解析，否则会把已被
-    # 降级的 finding 错误地重新纳入 prior_blocking）；缺失该字段（历史 state）时为 None。
-    prior_blocking: list[dict] | None = None
-    if round_n == 2:
-        round1_path = base / "round-1.review.json"
-        if round1_path.is_file():
-            try:
-                round1_data = json.loads(round1_path.read_text(encoding="utf-8"))
-                prior_blocking = _review.parse_review(round1_data)["blocking_findings"]
-            except (json.JSONDecodeError, ValueError):
-                prior_blocking = None
-    elif round_n >= 3:
-        prev_review_phase = (entry.get("phases") or {}).get(f"review-r{round_n - 1}") or {}
-        prior_blocking = prev_review_phase.get("effective_blocking_findings")
-
     # 4. parse
     try:
-        metrics = _review.parse_review(review_data, round_n=round_n, prior_blocking=prior_blocking)
+        metrics = _review.parse_review(review_data)
     except ValueError as e:
         exit_info = _do_phase_exit(
             p,
@@ -1010,50 +946,8 @@ def run_review_round(
             "detail": str(e),
         }
 
-    # 4b. D5 步骤 3/4：硬收敛覆盖（round_n >= 3，连续两轮无「上轮遗留未修复」blocking）。
-    # 覆盖 MUST 贯穿 state / telemetry / fixer 渲染门槛 / 返回值，故此处构造统一的
-    # effective_metrics，下游一律改用它而非原始 metrics（见 D5 步骤 5）。
-    hard_convergence_applied = False
-    if round_n >= 3:
-        prev_review_phase = (entry.get("phases") or {}).get(f"review-r{round_n - 1}") or {}
-        prev_carryover = prev_review_phase.get("carryover_unresolved_blocking")
-        cur_carryover = metrics.get("carryover_unresolved_blocking")
-        if prev_carryover == 0 and cur_carryover == 0:
-            hard_convergence_applied = True
-
-    if hard_convergence_applied:
-        overridden_advisory = metrics["advisory"] + len(metrics["blocking_findings"])
-        effective_metrics = {
-            **metrics,
-            "blocking": 0,
-            "advisory": overridden_advisory,
-            "blocking_findings": [],
-            "hard_convergence_applied": True,
-            "verdict": "passed-with-advisory" if overridden_advisory > 0 else "approve",
-        }
-    else:
-        effective_metrics = {**metrics, "hard_convergence_applied": False}
-
-    # 4c. D6：round≥2 落盘 advisory carryover 清单（有效来源 pre-existing-new 的 finding，
-    # 硬收敛覆盖发生时额外含被降级的原 blocking finding）。每轮独立快照，round_n<2 不产出。
-    if round_n >= 2:
-        origin_by_id = {
-            fo["id"]: fo["effective_origin"] for fo in metrics.get("finding_origins") or []
-        }
-        pre_existing_findings = [
-            f
-            for f in (review_data.get("findings") or [])
-            if origin_by_id.get(f.get("id")) == "pre-existing-new"
-        ]
-        downgraded_by_convergence = metrics["blocking_findings"] if hard_convergence_applied else []
-        carryover_findings = pre_existing_findings + downgraded_by_convergence
-        advisory_carryover_path = base / f"round-{round_n}.advisory-carryover.md"
-        advisory_carryover_path.write_text(
-            _fixer.render_findings(carryover_findings), encoding="utf-8"
-        )
-
     # 5. phase exit + trend（原子）
-    stale = _do_review_phase_exit_and_trend(p, seq, phase, effective_metrics, round_n=round_n)
+    stale = _do_review_phase_exit_and_trend(p, seq, phase, metrics)
     # 计算 review-rN 的 duration_ms（从 state 重新读最简单）
     _review_round_duration_ms = (
         _state.read_state(p.state_json).get("progress", [{}])[seq - 1]
@@ -1071,10 +965,10 @@ def run_review_round(
         base=base,
         ok=True,
         engine=selected_engine,
-        verdict=effective_metrics.get("verdict"),
-        blocking_count=effective_metrics.get("blocking"),
-        blocking_categories=effective_metrics.get("categories"),
-        spec_attribution_counts=effective_metrics.get("spec_attribution_counts"),
+        verdict=metrics.get("verdict"),
+        blocking_count=metrics.get("blocking"),
+        blocking_categories=metrics.get("categories"),
+        spec_attribution_counts=metrics.get("spec_attribution_counts"),
         duration_ms=_review_round_duration_ms,
         retry_count=max(0, attempts - 1),
         outcome_reason=None,
@@ -1084,14 +978,11 @@ def run_review_round(
         adversarial_blocking_count=adversarial_blocking_count,
     )
 
-    # 6. fixer findings 自动渲染（下一轮 fix 用），仅在 blocking>0 时（硬收敛覆盖后
-    # effective_metrics["blocking"] == 0，天然不触发，MUST NOT 额外加判断分支）
+    # 6. fixer findings 自动渲染（下一轮 fix 用），仅在 blocking>0 时
     findings_path: str | None = None
-    if effective_metrics["blocking"] > 0:
+    if metrics["blocking"] > 0:
         out = base / f"round-{round_n + 1}.fix.findings.md"
-        out.write_text(
-            _fixer.render_findings(effective_metrics["blocking_findings"]), encoding="utf-8"
-        )
+        out.write_text(_fixer.render_findings(metrics["blocking_findings"]), encoding="utf-8")
         findings_path = str(out)
 
     return {
@@ -1100,10 +991,10 @@ def run_review_round(
         "round": round_n,
         "change_id": change_id,
         "engine": selected_engine,
-        "verdict": effective_metrics["verdict"],
-        "blocking": effective_metrics["blocking"],
-        "advisory": effective_metrics["advisory"],
-        "categories": effective_metrics["categories"],
+        "verdict": metrics["verdict"],
+        "blocking": metrics["blocking"],
+        "advisory": metrics["advisory"],
+        "categories": metrics["categories"],
         "stale": stale["stale"],
         "rounds_since_strict_decrease": stale["rounds_since_strict_decrease"],
         "blocking_trend": stale["blocking_trend"],
@@ -1113,8 +1004,6 @@ def run_review_round(
         "findings_path": findings_path,
         "project_context_source": ctx_src,
         "fixed_history_items": fixed_history_count,
-        "carryover_unresolved_blocking": effective_metrics.get("carryover_unresolved_blocking"),
-        "hard_convergence_applied": effective_metrics.get("hard_convergence_applied", False),
     }
 
 

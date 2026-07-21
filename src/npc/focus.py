@@ -185,24 +185,6 @@ def load_project_context(
 SPEC_ATTRIBUTION_ENUM_SEMANTICS = """spec_attribution 四选一，用于判断该 finding 的根因是否可归因于 spec 文档本身：spec-silent = spec 未规定该行为；spec-ambiguous = spec 有规定但存在多种合理解读；spec-contradicted = 实现与 spec 明文相悖；impl-deviation = spec 明确无歧义，实现未照做。"""
 
 
-# finding_origin 三值语义（对齐 SPEC_ATTRIBUTION_ENUM_SEMANTICS 先例）。对所有轮次的
-# 「输出要求」文案统一生效（见 change review-delta-convergence D1/D4）。
-FINDING_ORIGIN_ENUM_SEMANTICS = """finding_origin 三选一，标注该 finding 相对本轮改动范围的来源（round≥2 起参与 blocking 计算，round 0/1 该字段必填但不影响判定）：carry-over-unresolved = 与上一轮已报告且仍未修复的 blocking finding 是同一个问题；round-diff-new = 位置落在当前评审 diff 新引入/修改的代码内；pre-existing-new = 位置落在 diff 未修改的既有代码内，是本次新发现的既有问题。"""
-
-
-# round≥2 delta-review 分类准则文案（见 change review-delta-convergence D4）：始终追加，
-# 不依赖 round_fix_commit 是否提供。含边界场景（删除代码/缺失实现/跨文件交互/无法归属
-# 单一位置或 line_range 占位符）的确定性优先级规则，不能只是三值枚举名称的罗列。
-DELTA_REVIEW_CLASSIFICATION_RULES = """## Delta-Review 分类准则（round≥2）
-
-`finding_origin` 与既有 `in_scope` 是两个正交问题：`in_scope` 看本次 change **累计** diff（`{implement_commit}~1..HEAD`）范围；`finding_origin` 的 `round-diff-new`/`pre-existing-new` 二分看**本轮 fix 自身**的增量 diff 范围（比累计 diff 更窄）。一条 `in_scope=true` 但 `finding_origin=pre-existing-new` 的 finding 是合法组合（该问题在更早轮次引入、本轮 fix 未触碰、你本轮才新发现），不需要为了让 finding 计入 blocking 而误填来源。
-
-确定性分类优先级（边界场景，MUST 遵循，不能只罗列枚举名称）：
-1. 若该 finding 涉及的任一位置（含被删除代码原所在行号区间、缺失实现的期望落点、跨文件交互涉及的任一文件）落在本轮增量 diff 范围内，必须归类为 `round-diff-new`。
-2. 仅当该 finding 涉及的全部位置均明确落在本轮增量 diff 范围之外，才归类为 `pre-existing-new`。
-3. 若该 finding 没有可归属的单一明确代码位置（跨越整个模块/设计层面的问题、`line_range` 为占位符 `-` 或无法解析、确实无法判断是否被本轮增量触及），必须保守归类为 `round-diff-new`，不得归类为 `pre-existing-new`——宁可多计入 blocking 候选（仍受 severity/in_scope 等既有条件约束），也不允许模糊归属的问题被静默排除出阻塞判定。"""
-
-
 # reviewer 侧「反 stub / 反删测」的 blocking 判据单一来源。
 # 放进 _output_requirements_block() 供 Round 0 / Round N（及对抗式 pass）共享，
 # 避免两份模板各自维护导致判据漂移或缺失（参照 SPEC_ATTRIBUTION_ENUM_SEMANTICS 先例）。
@@ -235,8 +217,7 @@ def _output_requirements_block(authority_disclaimer: bool = True) -> str:
   - verdict: "approve" = 无任何 in_scope blocking 且无 advisory；"passed-with-advisory" = 无 in_scope blocking 但有 advisory；"changes-requested" = 至少 1 个 in_scope blocking。
   - 每条 finding 必须包含 id / severity / category / title / file / line_range / detail / recommendation / in_scope / spec_attribution。
   - in_scope=true 表示与本 change diff 直接相关；diff 之外的既有问题或越界建议必须 in_scope=false，不计入 blocking。
-  - {SPEC_ATTRIBUTION_ENUM_SEMANTICS}
-  - {FINDING_ORIGIN_ENUM_SEMANTICS}{disclaimer_line}
+  - {SPEC_ATTRIBUTION_ENUM_SEMANTICS}{disclaimer_line}
 - 反 stub / 反删测判据：{STUB_AND_TEST_TAMPERING_BLOCKING}
 - 不要返回 markdown 包裹、不要返回散文、不要返回额外字段。"""
 
@@ -303,20 +284,8 @@ def _round_n_template(
     implement_commit: str,
     project_context: str,
     fixed_history_md: str = "",
-    round_fix_commit: str | None = None,
 ) -> str:
     history_block = f"\n{fixed_history_md}" if fixed_history_md else ""
-
-    # delta-review 分类准则（round_n >= 2 始终追加，不依赖 round_fix_commit；见 D4）。
-    delta_block = ""
-    if round_n >= 2:
-        delta_block = f"\n{DELTA_REVIEW_CLASSIFICATION_RULES}\n"
-        if round_fix_commit:
-            delta_block += f"""
-本轮 fix 自身引入范围的核对指令（区别于上面的累计 diff 指令）：
-    git --no-pager diff {round_fix_commit}~1..{round_fix_commit}
-"""
-
     return f"""本次审查的是 OpenSpec change `{change_id}` 的代码 diff（base = {implement_commit}~1）。
 这是第 {round_n} 轮 re-review，前 {round_n} 轮 review-fix 历史与已修复 findings 见 $LOG_BASE/change.md。
 请先在仓库内运行：
@@ -334,7 +303,7 @@ def _round_n_template(
 
 {project_context}
 {history_block}
-{delta_block}
+
 审查重点：
 1. 上轮 findings 是否被 Fixer 真正修复（含同类问题是否扫描完毕，避免「打地鼠」）；对照 fix.summary.md 的 Locations Scanned 段，验证 Fixer 是否真的去看了那些位置
 2. 修复是否引入新的与 spec 冲突的行为或回归
@@ -388,7 +357,6 @@ def render(args: argparse.Namespace) -> None:
         from .state import read_state as _read_state
 
         history_md = ""
-        round_fix_commit: str | None = None
         try:
             state = _read_state(p.state_json)
             progress = state.get("progress") or []
@@ -400,21 +368,12 @@ def render(args: argparse.Namespace) -> None:
                 if items:
                     history_md = render_fixed_history_section(items)
                     fixed_json_path = str(write_fixed_history_json(base, items))
-                if round_n >= 2:
-                    phases = entry.get("phases") or {}
-                    fix_phase = phases.get(f"fix-r{round_n - 1}") or {}
-                    round_fix_commit = fix_phase.get("commit")
         except (FileNotFoundError, OSError):
             # state 缺失或读取失败：focus 仍可渲染，只是不注入历史
             pass
 
         text = _round_n_template(
-            args.change_id,
-            round_n,
-            args.implement_commit,
-            ctx,
-            fixed_history_md=history_md,
-            round_fix_commit=round_fix_commit,
+            args.change_id, round_n, args.implement_commit, ctx, fixed_history_md=history_md
         )
 
     output.write_text(text, encoding="utf-8")

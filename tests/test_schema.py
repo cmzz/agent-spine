@@ -127,66 +127,6 @@ def test_review_schema_rejects_invalid_spec_attribution():
 
 
 # ============================================================
-# finding_origin（change: review-delta-convergence，task 1.1）
-# ============================================================
-
-
-def test_review_schema_finding_origin_required_and_enum():
-    finding = _schema.REVIEW_SCHEMA["properties"]["findings"]["items"]
-    assert "finding_origin" in finding["required"]
-    assert finding["properties"]["finding_origin"]["enum"] == [
-        "carry-over-unresolved",
-        "round-diff-new",
-        "pre-existing-new",
-    ]
-
-
-def test_review_schema_rejects_missing_finding_origin():
-    finding = {
-        "id": "F1",
-        "severity": "critical",
-        "category": "validation",
-        "title": "x",
-        "file": "-",
-        "line_range": "-",
-        "detail": "d",
-        "recommendation": "r",
-        "in_scope": True,
-        "spec_attribution": "spec-silent",
-    }
-    payload = {"verdict": "changes-requested", "findings": [finding]}
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(payload, _schema.REVIEW_SCHEMA)
-
-
-def test_review_schema_rejects_invalid_finding_origin_enum_value():
-    finding = {
-        "id": "F1",
-        "severity": "critical",
-        "category": "validation",
-        "title": "x",
-        "file": "-",
-        "line_range": "-",
-        "detail": "d",
-        "recommendation": "r",
-        "in_scope": True,
-        "spec_attribution": "spec-silent",
-        "finding_origin": "not-a-valid-value",
-    }
-    payload = {"verdict": "changes-requested", "findings": [finding]}
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(payload, _schema.REVIEW_SCHEMA)
-
-
-def test_spec_review_schema_does_not_include_finding_origin():
-    """SPEC_REVIEW_SCHEMA（spec review）MUST NOT 受本 change 影响，回归防护。"""
-    required = _schema.SPEC_REVIEW_SCHEMA["properties"]["findings"]["items"]["required"]
-    props = _schema.SPEC_REVIEW_SCHEMA["properties"]["findings"]["items"]["properties"]
-    assert "finding_origin" not in required
-    assert "finding_origin" not in props
-
-
-# ============================================================
 # SPEC_REVIEW_SCHEMA（change: spine-spec-writer，tasks 1.1–1.5）
 # ============================================================
 
