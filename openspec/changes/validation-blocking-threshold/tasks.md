@@ -18,7 +18,7 @@ $ rg -n "_output_requirements_block\(" --type py
 $ rg -n "REVIEW_SCHEMA\b" --type py
 ```
 匹配 42 处，跨 `src/npc/schema.py`（7 处，含定义）、`src/npc/spec_pipeline.py`（2 处，均为 `SPEC_REVIEW_SCHEMA`，不受影响）、`src/npc/pipeline.py`（4 处，`jsonschema.validate` 校验点）、`src/npc/templates.py`（2 处，注释提及 `SPEC_REVIEW_SCHEMA` 边界，不受影响）、`src/npc/review.py`（3 处，注释）、`tests/test_pipeline.py`（1 处，注释）、`tests/test_schema.py`（16 处）、`tests/test_spec_attribution_non_goals.py`（1 处）。
-本 change 只改 `schema.py` 的 `REVIEW_SCHEMA` 定义本身（新增 `properties.trigger_evidence` + `allOf` 条件必需规则）；`pipeline.py` 的 4 处 `jsonschema.validate(parsed, _schema.REVIEW_SCHEMA)` 校验点 MUST 无需改动（校验逻辑对 schema 内容透明，`allOf` 条件规则由 `jsonschema` 库原生支持）；`tests/test_schema.py` 新增 `trigger_evidence` 条件必需断言（含 `category == "validation"` 缺字段应被拒绝、非 validation 类缺字段应通过两个方向）；既有 `data == _schema.REVIEW_SCHEMA` 语义比对类断言因两侧同源不受破坏。
+本 change 只改 `schema.py` 的 `REVIEW_SCHEMA` 定义本身（新增 `properties.trigger_evidence` 纯可选属性，**不新增** `allOf`/`if`/`then` 条件必需规则——design.md D2 经 Round 4 spec 语义评审裁决修订）；`pipeline.py` 的 4 处 `jsonschema.validate(parsed, _schema.REVIEW_SCHEMA)` 校验点 MUST 无需改动；`tests/test_schema.py` 新增断言覆盖"`category == "validation"` 缺 `trigger_evidence` 字段 MUST 通过 schema 校验"（回归防护：确保未来不会误加条件必需规则）与"非 validation 类缺字段同样通过"两个方向；既有 `data == _schema.REVIEW_SCHEMA` 语义比对类断言因两侧同源不受破坏。
 
 ```
 $ rg -n "parse_review\(" --type py
@@ -51,13 +51,15 @@ $ rg -n "EMIT_FIELD_CONTRACT" --type py
 - [ ] 1.3 落地 `templates.py::SELFCHECK_RUBRIC_MD` 的 `validation` 行文案（design.md D1）
 - [ ] 1.4 运行既有 `tests/test_reduce_review_fix_cost.py` 全量，确认类目存在性/单一来源/`no-stub` 相关断言零回归
 
-## 2. `schema.py`：`trigger_evidence` 条件必需字段（(b) schema 侧）
+## 2. `schema.py`：`trigger_evidence` 可选字段（(b) schema 侧，Round 4 修订：不做条件必需；Round 5 修订：类型允许 null）
 
-- [ ] 2.1 新增失败测试（`tests/test_schema.py`）：`category == "validation"` 且缺 `trigger_evidence` 的 finding 未通过 `REVIEW_SCHEMA` 校验
-- [ ] 2.2 新增失败测试：`category == "validation"` 且 `trigger_evidence` 为空字符串 `""` 的 finding **通过** schema 校验（schema 层只保证 key 存在，不保证非空——design.md D2 显式设计，回归防护避免误加 `minLength`）
-- [ ] 2.3 新增失败测试：`category != "validation"`（如 `"security"`）缺 `trigger_evidence` 的 finding 通过 schema 校验（非 validation 类不受条件必需约束）
-- [ ] 2.4 新增失败测试：`SPEC_REVIEW_SCHEMA` 不含 `trigger_evidence` 属性、不含 `allOf` 条件规则（回归防护）
-- [ ] 2.5 落地 `REVIEW_SCHEMA["properties"]["findings"]["items"]` 的 `properties.trigger_evidence` + `allOf` 条件必需规则（design.md D2）
+- [ ] 2.1 新增失败测试（`tests/test_schema.py`）：`category == "validation"` 且缺 `trigger_evidence` 的 finding **通过** `REVIEW_SCHEMA` 校验（Round 4 裁决：该字段对所有 category 均为可选，缺失不导致校验失败；回归防护避免未来误加条件必需规则）
+- [ ] 2.2 新增失败测试：`category == "validation"` 且 `trigger_evidence` 为空字符串 `""` 的 finding **通过** schema 校验（schema 层只保证类型为 `["string", "null"]`，不保证非空——design.md D2 显式设计，回归防护避免误加 `minLength`）
+- [ ] 2.2b 新增失败测试（Round 5，F1 回归防护）：`category == "validation"` 且 `trigger_evidence` 显式为 `null` 的 finding **通过** `REVIEW_SCHEMA` 校验（锁死 Round 5 裁决：类型允许 `["string", "null"]`，显式 `null` 不被 schema 拒绝，能正常到达 `parse_review()` 的 `null` 降级分支）
+- [ ] 2.3 新增失败测试：`category != "validation"`（如 `"security"`）缺 `trigger_evidence` 的 finding 通过 schema 校验（非 validation 类同样不受约束）
+- [ ] 2.4 新增失败测试：`SPEC_REVIEW_SCHEMA` 不含 `trigger_evidence` 属性、不含针对 `category` 的 `allOf`/`if`/`then` 条件规则（回归防护）
+- [ ] 2.4b 新增失败测试：`REVIEW_SCHEMA` 顶层/finding items 不含任何针对 `trigger_evidence` 的 `required`/`allOf`/`if`/`then` 条件必需规则（回归防护，锁死 Round 4 裁决：确定性判定只在 `parse_review()`，不在 schema）
+- [ ] 2.5 落地 `REVIEW_SCHEMA["properties"]["findings"]["items"]` 的 `properties.trigger_evidence` 纯可选属性，类型 `["string", "null"]`（**不加** `required`/`allOf`/`if`/`then`，design.md D2）
 - [ ] 2.6 运行 `tests/test_schema.py` 全量，确认新增用例通过、既有用例（含 `test_spec_attribution_non_goals.py` 依赖的 finding schema 结构断言）不回归
 
 ## 3. `focus.py`：举证要求文案（(b) prompt 侧）
@@ -101,11 +103,13 @@ $ rg -n "EMIT_FIELD_CONTRACT" --type py
 - [ ] 5.8 落地 `pipeline.py::run_review_round` 两处 `emit_review_round` 调用点新增 `downgrade_counts` 传参（失败路径 `None`，成功路径 `metrics.get("downgrade_counts")`）
 - [ ] 5.9 运行 `tests/test_structural_invariants.py`、`tests/test_spec_attribution_agg.py`（或新建对应文件）、`tests/test_pipeline.py` 全量确认通过
 
-## 6. spec delta：`validation-blocking-threshold`（新能力） + `implement-selfcheck-rubric`（修订） + `spec-attribution`（修订）
+## 6. spec delta：`validation-blocking-threshold`（新能力） + `implement-selfcheck-rubric`（修订） + `spec-attribution`（修订） + `review-adversarial-pass`（修订）
 
-- [ ] 6.1 撰写 `openspec/changes/validation-blocking-threshold/specs/validation-blocking-threshold/spec.md`（`## ADDED Requirements`）：validation 类 blocking 举证门槛（schema 条件必需 + npc 侧缺失降级，含 schema 失败流程 Scenario）、spec-silent 非 critical 降级、降级可观测性、**verdict 必须与降级后的最终 blocking 集合保持一致**四条 Requirement 及各自 Scenario
+- [ ] 6.1 撰写 `openspec/changes/validation-blocking-threshold/specs/validation-blocking-threshold/spec.md`（`## ADDED Requirements`）：validation 类 blocking 举证门槛（`trigger_evidence` 为 schema 纯可选字段、类型 `["string", "null"]` + `parse_review()` 侧确定性缺失降级，不含 schema 失败流程 Scenario——Round 4/Round 5 裁决修订）、spec-silent 非 critical 降级、降级可观测性、**verdict 必须与降级后的最终 blocking 集合保持一致**四条 Requirement 及各自 Scenario
 - [ ] 6.2 撰写 `openspec/changes/validation-blocking-threshold/specs/implement-selfcheck-rubric/spec.md`（`## MODIFIED Requirements`）：细化后的 validation 自查要点 Requirement 与对应 Scenario
-- [ ] 6.3 撰写 `openspec/changes/validation-blocking-threshold/specs/spec-attribution/spec.md`（`## MODIFIED Requirements`）：窄化后的「spec 归因不参与 blocking 判定」、统计范围改写后的「派生 spec 归因分布并向后兼容」、「本 change 不引入任何闸门」**三条** Requirement 与对应 Scenario
+- [ ] 6.3 撰写 `openspec/changes/validation-blocking-threshold/specs/spec-attribution/spec.md`（`## MODIFIED Requirements`）：窄化后的「spec 归因不参与 blocking 判定」（Round 5 修订：补充 validation 举证门槛降级作为与 spec-silent 例外并列的独立引用）、统计范围改写后的「派生 spec 归因分布并向后兼容」、「本 change 不引入任何闸门」**三条** Requirement 与对应 Scenario
+- [ ] 6.4 撰写 `openspec/changes/validation-blocking-threshold/specs/review-adversarial-pass/spec.md`（`## MODIFIED Requirements`，Round 5 新增，修复 F3）：「findings 合并去重规则确定性」第 3 条 verdict 重算规则改为基于降级后最终 blocking 集合、「telemetry 透出对抗通道运行状态」显式裁决 `adversarial_blocking_count` 为"pass2 原始候选数、不感知降级"语义，与对应新增 Scenario
+- [ ] 6.5 运行 `openspec validate validation-blocking-threshold --type change --strict`，确认新增 `review-adversarial-pass` capability delta 被正确识别、无重复/矛盾 Requirement 校验错误
 
 ## 7. 收尾
 
