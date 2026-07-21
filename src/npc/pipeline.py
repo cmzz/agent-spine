@@ -838,15 +838,6 @@ def run_review_round(
     phase = f"review-r{round_n}"
     _do_phase_enter(p, seq, phase)
 
-    # 2.5 schema 同步：磁盘 schema 文件仅在 `npc init` 时写入一次，若本次 run
-    # 跨越了引擎 REVIEW_SCHEMA 升级（例如旧版本已完成 round 1、升级后继续
-    # round N），磁盘上仍是旧版本、且 additionalProperties=false 会拒绝新字段
-    # （如 finding_origin）。引擎按旧 schema 生成的 JSON 随后又被内存中最新的
-    # `_schema.REVIEW_SCHEMA` 校验拒绝，导致本轮持续重试失败。这里在每轮生成前
-    # 强制把磁盘 schema 同步为当前 REVIEW_SCHEMA，历史 round 的 JSON 产物本身
-    # 不受影响（仅通过默认 parse_review 读取，不会被重新按 schema 校验）。
-    _schema.ensure_schema(p.schema_path)
-
     # 3. engine exec（含重试）
     pt = _portable_timeout_bin(portable_timeout)
     if selected_engine == "codex":
