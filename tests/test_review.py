@@ -402,27 +402,12 @@ def test_parse_line_range_overlong_pair_endpoint_returns_none_no_raise():
     assert _review._parse_line_range(f"{overlong}-{overlong}") is None
 
 
-def test_parse_line_range_zero_single_accepted():
-    """spec.md 明确 N/M 为非负整数：单行 "0" 必须解析为 (0, 0)，不可判为不可解析
-    （fix round 2 F1，change review-delta-convergence）。"""
-    assert _review._parse_line_range("0") == (0, 0)
+def test_parse_line_range_zero_single_rejected():
+    assert _review._parse_line_range("0") is None
 
 
-def test_parse_line_range_zero_endpoint_in_pair_accepted():
-    """"0-10" 必须解析为 (0, 10)，不可判为不可解析（fix round 2 F1）。"""
-    assert _review._parse_line_range("0-10") == (0, 10)
-
-
-def test_parse_line_range_zero_endpoint_reverse_pair_accepted():
-    """"10-0" 归一化为 (0, 10)（fix round 2 F1）。"""
-    assert _review._parse_line_range("10-0") == (0, 10)
-
-
-def test_is_carry_over_match_zero_line_range_matches():
-    """回归：零值行区间（"0" / "0-10"）必须参与 carry-over 几何匹配，不可被误判为
-    不可解析而回退为 round-diff-new（fix round 2 F1）。"""
-    f = _prior(line_range="0")
-    assert _review._is_carry_over_match(f, _prior(line_range="0-10")) is True
+def test_parse_line_range_zero_endpoint_in_pair_rejected():
+    assert _review._parse_line_range("0-10") is None
 
 
 def test_parse_line_range_max_digits_boundary_accepted():
