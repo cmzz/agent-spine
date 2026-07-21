@@ -34,8 +34,15 @@ FINDING_ORIGIN_VALUES = (
     "pre-existing-new",
 )
 
-_LINE_RANGE_SINGLE_RE = re.compile(r"^\d+$")
-_LINE_RANGE_PAIR_RE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+# 行号端点最大位数：远超真实源文件行数上限（10^9 行），同时远小于 CPython
+# int() 字符串转换的默认安全上限（sys.int_info.default_max_str_digits，通常 4300），
+# 从根源上避免超长数字字符串触发 int() 的 ValueError（见 change
+# review-delta-convergence 修复 F2）。
+_LINE_NUMBER_MAX_DIGITS = 9
+_LINE_RANGE_SINGLE_RE = re.compile(r"^\d{1,%d}$" % _LINE_NUMBER_MAX_DIGITS)
+_LINE_RANGE_PAIR_RE = re.compile(
+    r"^(\d{1,%d})\s*-\s*(\d{1,%d})$" % (_LINE_NUMBER_MAX_DIGITS, _LINE_NUMBER_MAX_DIGITS)
+)
 
 
 def _finding_key(f: dict) -> tuple:
@@ -51,22 +58,33 @@ def _finding_key(f: dict) -> tuple:
 def _parse_line_range(line_range: Any) -> tuple[int, int] | None:
     """把 ``line_range`` 解析为整数区间 ``(start, end)``；不可解析返回 ``None``，不抛异常。
 
-    可解析：单行 ``"N"``（视为 ``[N, N]``）、区间 ``"N-M"``（允许数字与连字符前后空白，
+    可解析：单行 ``"N"``（视为 ``[N, N]``，``N`` 为不超过 ``_LINE_NUMBER_MAX_DIGITS``
+    位的正整数）、区间 ``"N-M"``（同样的端点约束，允许数字与连字符前后空白，
     ``N > M`` 时归一化为 ``[min, max]``）。
-    不可解析：占位符 ``"-"``、空字符串、任意无法提取出两个整数端点的字符串。
+    不可解析：占位符 ``"-"``、空字符串、零值端点、超过 ``_LINE_NUMBER_MAX_DIGITS`` 位的
+    端点、任意无法提取出两个合理整数端点的字符串。正则已将端点位数限制在
+    ``_LINE_NUMBER_MAX_DIGITS`` 以内，但仍用 ``try/except`` 包裹 ``int()`` 作为
+    纵深防御，任何 ``ValueError`` 一律按不可解析处理，不向上抛出。
     """
     if not isinstance(line_range, str):
         return None
     s = line_range.strip()
     if not s:
         return None
-    if _LINE_RANGE_SINGLE_RE.match(s):
-        n = int(s)
-        return (n, n)
-    m = _LINE_RANGE_PAIR_RE.match(s)
-    if m:
-        a, b = int(m.group(1)), int(m.group(2))
-        return (min(a, b), max(a, b))
+    try:
+        if _LINE_RANGE_SINGLE_RE.match(s):
+            n = int(s)
+            if n <= 0:
+                return None
+            return (n, n)
+        m = _LINE_RANGE_PAIR_RE.match(s)
+        if m:
+            a, b = int(m.group(1)), int(m.group(2))
+            if a <= 0 or b <= 0:
+                return None
+            return (min(a, b), max(a, b))
+    except ValueError:
+        return None
     return None
 
 

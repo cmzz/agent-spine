@@ -10,6 +10,32 @@ import pytest
 from npc import focus as _focus
 
 
+# ============================================================
+# extract_fixed_history / _FINDING_RE：超长数字 id 防御（fix round 1 F2 同类扫描，
+# change review-delta-convergence）
+# ============================================================
+
+
+def test_extract_fixed_history_overlong_finding_id_does_not_raise(tmp_path: Path):
+    """round-1.fix.summary.md 中 Per-Finding Resolution 若混入超长数字 F-id（畸形/
+    对抗性 coder 输出），提取与排序都不应抛 ValueError（同类根因见 src/npc/review.py
+    _parse_line_range 的 F2 修复：不可无界信任外部文本里的数字长度）。"""
+    overlong_id = "9" * 5000
+    (tmp_path / "round-1.fix.summary.md").write_text(
+        f"""# Fix Round 1 Summary
+
+## Per-Finding Resolution
+- F{overlong_id} (标题): 修复说明
+- F2 (另一个标题): 另一条修复说明
+""",
+        encoding="utf-8",
+    )
+    items = _focus.extract_fixed_history(tmp_path, up_to_round_exclusive=2)
+    # 超长 id 那一行因不满足位数上限而不被 _FINDING_RE 匹配，被安全跳过；
+    # 合法的 F2 仍被正常提取。
+    assert [it["id"] for it in items] == ["2"]
+
+
 def test_extract_section_hit():
     md = """# Top
 

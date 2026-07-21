@@ -20,7 +20,12 @@ from . import _io, paths as _paths
 # Already-Fixed History（fix.summary.md → focus 注入）
 # ============================================================
 
-_FINDING_RE = re.compile(r"^-\s*F(\d+)\s+\((.+)\)\s*:\s*(.+?)\s*$")
+# F 后的数字与下方 round 一样限位数：避免 fix.summary.md 中畸形/超长数字字符串
+# 传给 int() 时触发 ValueError（同类问题见 change review-delta-convergence 修复
+# F2 / src/npc/review.py：外部（此处是 fix coder 自报的 markdown）文本里的数字
+# 长度不应无界地信任）。
+_ID_MAX_DIGITS = 9
+_FINDING_RE = re.compile(r"^-\s*F(\d{1,%d})\s+\((.+)\)\s*:\s*(.+?)\s*$" % _ID_MAX_DIGITS)
 
 
 def _extract_per_finding_resolution(summary_text: str) -> list[tuple[str, str, str]]:

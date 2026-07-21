@@ -386,6 +386,55 @@ def test_is_carry_over_match_malformed_line_range_no_exception():
 
 
 # ============================================================
+# _parse_line_range：超长数字端点防御（fix round 1 F2，change review-delta-convergence）
+# ============================================================
+
+
+def test_parse_line_range_overlong_single_digit_returns_none_no_raise():
+    """schema 合法（字符串）但位数远超 CPython int() 字符串转换安全上限：
+    不应抛 ValueError，必须安全返回 None。"""
+    overlong = "9" * 5000
+    assert _review._parse_line_range(overlong) is None
+
+
+def test_parse_line_range_overlong_pair_endpoint_returns_none_no_raise():
+    overlong = "9" * 5000
+    assert _review._parse_line_range(f"{overlong}-{overlong}") is None
+
+
+def test_parse_line_range_zero_single_rejected():
+    assert _review._parse_line_range("0") is None
+
+
+def test_parse_line_range_zero_endpoint_in_pair_rejected():
+    assert _review._parse_line_range("0-10") is None
+
+
+def test_parse_line_range_max_digits_boundary_accepted():
+    """恰好等于位数上限的合理行号仍应正常解析。"""
+    n = "9" * _review._LINE_NUMBER_MAX_DIGITS
+    assert _review._parse_line_range(n) == (int(n), int(n))
+
+
+def test_is_carry_over_match_overlong_line_range_no_exception():
+    """finding_key 精确扫描以外，跨轮几何匹配路径同样必须对超长数字端点免疫。"""
+    overlong = "9" * 5000
+    f = _prior(line_range=overlong)
+    assert _review._is_carry_over_match(f, _prior()) is False
+
+
+def test_parse_review_overlong_line_range_does_not_raise():
+    """端到端：schema 合法但超长数字行号的 finding 混入 findings 时，
+    parse_review 整体不应抛异常（回归 F2 报告的"整个 review phase 被标记失败"故障）。"""
+    findings = [
+        _finding("F1", "high", "validation", "a.py", "9" * 5000),
+        _finding("F2", "high", "validation", "b.py", "42"),
+    ]
+    result = _review.parse_review({"findings": findings})
+    assert result["blocking"] == 2
+
+
+# ============================================================
 # parse_review：round_n / prior_blocking（change review-delta-convergence D2）
 # ============================================================
 
