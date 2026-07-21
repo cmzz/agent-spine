@@ -1,29 +1,32 @@
 ## ADDED Requirements
 
-### Requirement: validation 类 finding 携带条件必需的触发证据字段
+### Requirement: validation 类 finding 携带可选的触发证据字段
 
-`REVIEW_SCHEMA` 的每条 finding MUST 声明可选属性 `trigger_evidence`（string）。当某条 finding 的 `category == "validation"` 时，该 finding MUST 包含 `trigger_evidence` 键（`allOf`/`if`/`then` 条件必需）；`category != "validation"` 的 finding MUST NOT 被要求包含该字段。该字段的 schema 级校验 MUST 仅保证键存在，MUST NOT 施加非空长度约束（如 `minLength`）——字段是否存在由 schema 保证，字段值是否为空/占位符由 `parse_review()` 在派生计算阶段处理（见「validation 类 finding 缺失触发证据时降级为 advisory」Requirement）。
+`REVIEW_SCHEMA` 的每条 finding MUST 声明可选属性 `trigger_evidence`，其 schema 类型 MUST 声明为 `["string", "null"]`（或等效的"string 或 null 均合法"表达）。该字段对**任意** `category` 取值（含 `"validation"`）均为**纯可选**：MUST NOT 出现在 `required` 中，MUST NOT 通过 `allOf`/`if`/`then` 或任何其它条件规则使其在 `category == "validation"` 时变为必需。该字段的 schema 级校验 MUST NOT 施加非空长度约束（如 `minLength`）——字段是否存在、字段值是否为 `null`/空/占位符，均不影响 schema 校验结果，全部由 `parse_review()` 在派生计算阶段做确定性判断（见「validation 类 finding 缺失触发证据时降级为 advisory」Requirement）。
 
-本 Requirement 定义的 schema 级"键必须存在"约束 MUST 通过引擎产出环节既有的 `invalid_review_schema` 校验-重试机制生效（`src/npc/pipeline.py::_execute_review_pass()` 对 `jsonschema.validate(parsed, REVIEW_SCHEMA)` 失败的既有处理：本轮重试，重试预算耗尽后以 `invalid_review_schema` 失败原因结束该 review round）——这是 `REVIEW_SCHEMA` 现有其它必填字段（如 `verdict`/`findings`/finding 必填属性）校验失败时已经复用的同一条既有失败路径，本 Requirement MUST NOT 引入新的失败原因码或新的阻断类型，仅新增一种触发该既有路径的 schema 违例条件。因此，任何**当前经 `REVIEW_SCHEMA` 校验通过**的 review（无论单 pass 或对抗式双 pass）中，`category == "validation"` 的 finding 的 `trigger_evidence` 键 MUST 已经存在且其值 MUST 为字符串类型（不为 `null`、不缺失）——"键缺失"或"值为 `null`"这两种状态在该场景下不可达；「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 中针对这两种状态定义的降级分支，其覆盖范围仅限于绕开本 Requirement schema 校验的输入（本 change 生效前生成的历史 `round-N.review.json` 经 `npc review parse` 重新解析、或测试/其它调用方直接构造 dict 调用 `parse_review()`），详见该 Requirement 正文的范围说明。
+**Rationale（Round 4 spec 语义评审修订）**：本 Requirement 此前采用 schema `allOf`/`if`/`then` 条件必需的设计，会使缺失 `trigger_evidence` 的 `category == "validation"` finding 在 schema 校验阶段即失败，触发 `src/npc/pipeline.py::_execute_review_pass()` 既有的重试机制，重试预算耗尽后以 `invalid_review_schema` 结束整轮 review——该 review 永远不会到达 `parse_review()`，与"缺失该字段应确定性降级为 advisory"的承诺直接矛盾（同一输入被同时描述为"advisory 降级"与"整轮失败"两种互斥结果）。经用户裁决：`trigger_evidence` MUST 是纯可选字段，"缺失/空串/占位符即降级"的全部判定确定性落在 `parse_review()`；不存在与该判定并存或矛盾的 schema 级强制路径。
 
-#### Scenario: category 为 validation 且缺失 trigger_evidence 未通过 schema 校验
+**Rationale（Round 5 spec 语义评审修订，F1）**：Round 4 文本仍把该字段的 schema 类型仅声明为 `string`，而降级 Requirement 的四个判定分支之一是显式 `null`。若 schema 类型只允许 `string`，则一条显式携带 `trigger_evidence: null` 的 finding 会先被 `REVIEW_SCHEMA` 拒绝（类型不匹配），触发既有重试-失败机制，永远无法到达 `parse_review()`——这与"`null` 分支在实时流程同样可达、会被确定性降级为 advisory"的承诺直接矛盾（同一输入被同时描述为"schema 拒绝导致整轮失败"与"降级为 advisory"两种互斥结果，与 Round 4 修复的矛盾同构但换了一个取值）。经裁决：schema 类型改为允许 `["string", "null"]`，使显式 `null`、缺键、空串、占位符四种输入统一只经过 `parse_review()` 这一条"证据不足 → 降级"路径，不存在 schema 拒绝分支。
+
+#### Scenario: category 为 validation 且缺失 trigger_evidence 仍通过 schema 校验
 
 - **GIVEN** 一条 finding 的 `category == "validation"`，其 JSON 对象不含 `trigger_evidence` 键
 - **WHEN** 用 `REVIEW_SCHEMA` 校验该 finding
-- **THEN** 校验失败
-
-#### Scenario: 引擎持续产出缺失 trigger_evidence 的 validation finding 时的流程结果
-
-- **GIVEN** 某轮 review，引擎在全部重试次数内产出的 JSON 均含至少一条 `category == "validation"` 且缺失 `trigger_evidence` 键的 finding
-- **WHEN** `_execute_review_pass()` 对每次产出执行 `jsonschema.validate(parsed, REVIEW_SCHEMA)`
-- **THEN** 每次校验均失败，触发既有重试；重试预算耗尽后，该 review round 以既有 `invalid_review_schema` 失败原因结束（与 `verdict`/`findings` 等其它必填字段校验失败时完全相同的既有失败路径，不新增失败原因码）
-- **AND** 该轮不会到达 `parse_review()`，也就不会命中「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 的降级分支
+- **THEN** 校验通过（该字段对所有 category 均为可选，不因 `category == "validation"` 而变为必需）
+- **AND** 该 finding 正常到达 `parse_review()`，由「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 的判定分支处理
 
 #### Scenario: category 为 validation 且 trigger_evidence 为空字符串仍通过 schema 校验
 
 - **GIVEN** 一条 finding 的 `category == "validation"`，其 `trigger_evidence` 取值为 `""`
 - **WHEN** 用 `REVIEW_SCHEMA` 校验该 finding
 - **THEN** 校验通过（schema 层不做非空判断）
+
+#### Scenario: category 为 validation 且 trigger_evidence 显式为 null 仍通过 schema 校验
+
+- **GIVEN** 一条 finding 的 `category == "validation"`，其 `trigger_evidence` 取值显式为 `null`
+- **WHEN** 用 `REVIEW_SCHEMA` 校验该 finding
+- **THEN** 校验通过（schema 类型允许 `["string", "null"]`，不因显式 `null` 而拒绝）
+- **AND** 该 finding 正常到达 `parse_review()`，由「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 的 `null` 判定分支处理，不触发 `invalid_review_schema` 重试-失败路径
 
 #### Scenario: category 非 validation 时不要求 trigger_evidence
 
@@ -38,22 +41,27 @@
 
 ### Requirement: validation 类 finding 缺失触发证据时降级为 advisory
 
-`parse_review()` 对每条满足既有 blocking 候选条件（`severity ∈ {critical, high}` 且 `in_scope == true`）且 `category == "validation"` 的 finding，MUST 额外判断其 `trigger_evidence` 字段是否满足以下任一"缺失"条件：字段不存在、取值为 `null`、取值为字符串且去除首尾空白后为空字符串、或去除首尾空白后等于占位符 `"-"`。满足任一缺失条件时，该 finding MUST NOT 计入 `blocking`/`blocking_findings`，MUST 计入 `advisory` 计数；该判定 MUST NOT 受 `severity` 取值影响（`critical` 与 `high` 同样适用，与「spec-silent 归因窄化降级为 advisory」Requirement 的 `severity == critical` 例外相互独立，不共享豁免条件）。`trigger_evidence` 非空且不等于占位符 `"-"` 时，MUST NOT 因本 Requirement 而降级。`parse_review()` MUST NOT 修改或丢弃 finding 记录本身（`round-N.review.json` 落盘内容不受影响）。
+`parse_review()` 对每条满足既有 blocking 候选条件（`severity ∈ {critical, high}` 且 `in_scope == true`）且 `category == "validation"` 的 finding，MUST 额外判断其 `trigger_evidence` 字段是否满足以下任一"证据不足"条件：字段不存在；取值为 `null`；取值为字符串且去除首尾空白后为空字符串；取值为字符串且去除首尾空白后等于占位符 `"-"`；或取值既非字符串也非 `null`（例如数字 `0`、布尔 `false`、列表、字典等任意其它 JSON 类型）。最后一个分支覆盖 `REVIEW_SCHEMA` 本不允许但可能经由直接构造的 dict（如测试 fixture）或历史 `round-N.review.json` 重放到达 `parse_review()` 的输入——`parse_review()` 是纯函数、不做 schema 校验，因此不能假设输入必然经过 schema 校验；此类值一律与"证据不足"其余四个分支同等对待，MUST NOT 被视为有效证据。满足任一"证据不足"条件时，该 finding MUST NOT 计入 `blocking`/`blocking_findings`，MUST 计入 `advisory` 计数；该判定 MUST NOT 受 `severity` 取值影响（`critical` 与 `high` 同样适用，与「spec-silent 归因窄化降级为 advisory」Requirement 的 `severity == critical` 例外相互独立，不共享豁免条件）。`trigger_evidence` 为非空字符串且不等于占位符 `"-"` 时，MUST NOT 因本 Requirement 而降级。`parse_review()` MUST NOT 修改或丢弃 finding 记录本身（`round-N.review.json` 落盘内容不受影响）。
 
-`parse_review()` 是纯函数，不做 schema 校验，因此本 Requirement 定义的四个判定分支（键不存在 / `null` / 空字符串 / 占位符）在**任意输入**上均一体适用，不因输入来源而分叉逻辑。但结合「validation 类 finding 携带条件必需的触发证据字段」Requirement 的既有约束，"键不存在"与"取值为 `null`"这两个分支在**当前经 `REVIEW_SCHEMA` 校验通过的实时 review 流程**中永远不会被触发（schema 已保证该场景下 `trigger_evidence` 键存在且类型为 string）；这两个分支实际可达的输入仅为：本 change 生效前生成、不含该字段的历史 `round-N.review.json`（经 `npc review parse` 重新解析）、或测试 / 其它调用方绕开 schema 直接构造 dict 调用 `parse_review()`。"空字符串"与"占位符 `-`"两个分支在实时 schema 校验通过的流程与历史文件重放中均可达（schema 不拒绝空字符串，见「validation 类 finding 携带条件必需的触发证据字段」Requirement 的对应 Scenario）。
+`parse_review()` 是纯函数，不做 schema 校验，因此本 Requirement 定义的五个判定分支（键不存在 / `null` / 空字符串 / 占位符 / 非字符串非 `null` 的其它类型）在**任意输入**上均一体适用，不因输入来源而分叉逻辑，也不区分"实时生成的 review"与"历史 `round-N.review.json` 重放"——两者对 `parse_review()` 而言是同一种输入，适用同一条规则。这是 Round 4 spec 语义评审的显式修订：`trigger_evidence` 是「validation 类 finding 携带可选的触发证据字段」Requirement 定义的纯可选字段（不进 schema `required`、不做条件必需），因此"键不存在"与"取值为 `null`"这两个分支在实时 review 流程中同样可达——"键不存在"可达是因为 schema 从不拒绝缺失该字段的 finding，"取值为 `null`"可达是因为该 Requirement（Round 5 修订，见对应 schema Requirement 的 F1 Rationale）的 schema 类型显式声明为 `["string", "null"]`，两个分支均不会在到达 `parse_review()` 之前被 schema 拒绝；不存在"仅历史重放可达、实时流程不可达"的区分；原方案中"实时兜底降级"与"历史重放兜底降级"两个分支已合并为同一条规则。"非字符串非 `null`"分支不依赖 schema 校验结果——即使 `REVIEW_SCHEMA` 本身禁止该取值，`parse_review()` 仍须对绕过 schema 到达的此类输入（直接构造的 dict、历史重放）给出与其余四个分支一致的确定性结论（Round 6 spec 语义评审修订，F1：此前本 Requirement 未枚举该分支，导致与 `design.md` 中 `_validation_evidence_missing` 谓词的既有实现——非字符串值一律被当作空字符串处理——相矛盾）。
 
-#### Scenario: trigger_evidence 缺失键时降级（历史文件重放 / 直接调用场景）
+#### Scenario: trigger_evidence 缺失键时降级
 
-- **GIVEN** 一条 finding：`category="validation"`、`severity="high"`、`in_scope=true`，JSON 对象不含 `trigger_evidence` 键（例如本 change 生效前生成的历史 `round-N.review.json`，或测试直接构造的 dict）
+- **GIVEN** 一条 finding：`category="validation"`、`severity="high"`、`in_scope=true`，JSON 对象不含 `trigger_evidence` 键（该场景在实时 review 流程与历史 `round-N.review.json` 重放中均可达，因 schema 从不要求该字段存在）
 - **WHEN** 调用 `parse_review()`
 - **THEN** 该 finding 不出现在 `blocking_findings` 中，计入 `advisory`
-- **AND** 该场景 MUST NOT 出现在当前经 `REVIEW_SCHEMA` 校验通过的实时 review 流程中（见「validation 类 finding 携带条件必需的触发证据字段」Requirement）
 
 #### Scenario: trigger_evidence 为空字符串或占位符时降级
 
 - **GIVEN** 一条 finding：`category="validation"`、`severity="high"`、`in_scope=true`，`trigger_evidence` 分别取值 `""` 与 `"-"`（两个独立场景）
 - **WHEN** 调用 `parse_review()`
 - **THEN** 两种取值下该 finding 均不计入 `blocking_findings`，计入 `advisory`
+
+#### Scenario: trigger_evidence 为非字符串非 null 值时降级
+
+- **GIVEN** 三条 finding：`category="validation"`、`severity="high"`、`in_scope=true`，`trigger_evidence` 分别取值数字 `0`、布尔 `false`、字典 `{}`（三个独立场景，均绕过 `REVIEW_SCHEMA` 的类型约束由测试直接构造或历史重放到达 `parse_review()`）
+- **WHEN** 调用 `parse_review()`
+- **THEN** 三种取值下该 finding 均不出现在 `blocking_findings` 中，计入 `advisory`（与字段缺失/`null`/空字符串/占位符走同一条降级路径）
 
 #### Scenario: trigger_evidence 非空且非占位符时不降级
 
@@ -85,13 +93,13 @@
 
 #### Scenario: spec-silent 且 severity=critical 时不降级
 
-- **GIVEN** 一条 finding：`spec_attribution="spec-silent"`、`severity="critical"`、`in_scope=true`
+- **GIVEN** 一条 finding：`spec_attribution="spec-silent"`、`severity="critical"`、`in_scope=true`、`category` 非 `"validation"`（避免与「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 的独立降级规则交叉，使本场景仅由本 Requirement 的判定唯一确定 `blocking_findings` 结果）
 - **WHEN** 调用 `parse_review()`
 - **THEN** 该 finding 正常计入 `blocking_findings`
 
 #### Scenario: 其余三个归因值不触发本 Requirement 的降级
 
-- **GIVEN** 三条 finding，分别 `spec_attribution` 为 `spec-ambiguous`、`spec-contradicted`、`impl-deviation`，其余字段均满足 blocking 候选条件（`severity="high"`、`in_scope=true`）
+- **GIVEN** 三条 finding，分别 `spec_attribution` 为 `spec-ambiguous`、`spec-contradicted`、`impl-deviation`，其余字段均满足 blocking 候选条件（`severity="high"`、`in_scope=true`），且均 `category` 非 `"validation"`（避免与「validation 类 finding 缺失触发证据时降级为 advisory」Requirement 的独立降级规则交叉，使本场景仅由本 Requirement 的判定唯一确定 `blocking_findings` 结果）
 - **WHEN** 调用 `parse_review()`
 - **THEN** 三条 finding 均正常计入 `blocking_findings`，不因本 Requirement 降级
 
