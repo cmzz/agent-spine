@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 
 import pytest
@@ -402,13 +403,14 @@ def _make_spine_worktree(canonical, worktree_path, run_ts):
     return spine_branch
 
 
-def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60):
+def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60, owner=None):
     """为 worktree 路径构造对应的 task_log_dir 并写 state。
 
     使用实际的 run_ts（含 suffix，如 YYYY-MM-DD-HHMM-<suffix>）创建 run 目录和
     state 文件，scan_runs 现在能正确识别带 suffix 的格式。
     age_days 控制 run 目录及 state 文件的 mtime（默认 60 天前，足够旧）。
     对 in-progress 状态，age_days 不影响 find_latest_in_progress 的结果（它只读 status）。
+    owner="alive" / "dead" 时注入 owner_pid + 新鲜心跳（owner 存活语义）。
     """
     from npc import paths as _paths
     wt_proj_key = _paths.proj_key_for(wt_path)
@@ -420,6 +422,9 @@ def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60):
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "run.events.jsonl").write_text("", encoding="utf-8")
     state = {"run_ts": run_ts, "status": status, "progress": []}
+    if owner is not None:
+        state["owner_pid"] = os.getpid() if owner == "alive" else _dead_pid()
+        state["owner_heartbeat_at"] = _clean._io.now_iso()
     state_file = wt_task_log / f"{run_ts}-plan-state.json"
     state_file.write_text(json.dumps(state), encoding="utf-8")
 
@@ -429,6 +434,13 @@ def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60):
         _age(state_file, age_days)
 
     return wt_task_log
+
+
+def _dead_pid() -> int:
+    """获取一个确定已退出且已回收的 pid。"""
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
 
 
 class TestWorktreeCleanOrphan:
@@ -528,7 +540,7 @@ class TestWorktreeCleanInProgress:
         run_ts = "2026-06-22-0901-00abc1"
         wt_path = tmp_path / "wt_inprogress"
         _make_spine_worktree(canonical, wt_path, run_ts)
-        _make_wt_task_log(home, wt_path, run_ts, "in-progress")
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress", owner="alive")
 
         orphans, in_progress = _clean.scan_spine_worktrees(canonical, home)
         in_progress_paths = [w["path"] for w in in_progress]
@@ -546,7 +558,7 @@ class TestWorktreeCleanInProgress:
         spine_branch = _make_spine_worktree(canonical, wt_path, run_ts)
         tld = home / "task_log" / _paths.proj_key_for(canonical)
         tld.mkdir(parents=True, exist_ok=True)
-        _make_wt_task_log(home, wt_path, run_ts, "in-progress")
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress", owner="alive")
 
         monkeypatch.setattr(_clean._paths, "detect_repo_root", lambda start=None: canonical)
         monkeypatch.setattr(_clean.Path, "home", staticmethod(lambda: home))
@@ -582,7 +594,7 @@ class TestWorktreeCleanInProgress:
         ip_ts = "2026-06-22-0901-00abc1"
         ip_path = tmp_path / "wt_inprogress"
         ip_branch = _make_spine_worktree(canonical, ip_path, ip_ts)
-        _make_wt_task_log(home, ip_path, ip_ts, "in-progress")
+        _make_wt_task_log(home, ip_path, ip_ts, "in-progress", owner="alive")
 
         tld = home / "task_log" / _paths.proj_key_for(canonical)
         tld.mkdir(parents=True, exist_ok=True)
@@ -784,3 +796,81 @@ class TestWorktreeStaleGate:
             cwd=canonical, capture_output=True, text=True,
         )
         assert check.returncode == 0, f"too-recent branch {spine_branch} 不应被删"
+
+
+# ============================================================
+# owner 存活门槛（worktree-owner-liveness change，D5）
+# ============================================================
+
+
+class TestWorktreeOwnerLiveness:
+    """in-progress 保护门槛改为"owner 存活才保护"；owner 已死落入 age-gate。"""
+
+    def test_owner_dead_in_progress_within_keep_window_kept(self, tmp_path):
+        """owner 已死 + run 未过 keep_days 保留窗口 → 不进 orphans 也不进 in_progress_wts。
+
+        断言形态：该 worktree 不出现在 scan_spine_worktrees 的两个返回列表中
+        （age-gate 未满足，保守跳过，留给后续 npc init 续跑接管）。
+        """
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-22-0901-00abc1"
+        wt_path = tmp_path / "wt_owner_dead_recent"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        # owner 已死；mtime 保持新鲜（未过 14 天保留窗口）
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress", owner="dead")
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+        orphan_paths = [o["path"] for o in orphans]
+        ip_paths = [w["path"] for w in in_progress]
+        assert str(wt_path) not in orphan_paths
+        assert str(wt_path) not in ip_paths
+
+    def test_owner_dead_in_progress_beyond_keep_window_orphaned(self, tmp_path):
+        """owner 已死 + run 已过 keep_days 保留窗口 → 进 orphans（可回收）。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-22-0901-00abc1"
+        wt_path = tmp_path / "wt_owner_dead_stale"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        wt_task_log = _make_wt_task_log(
+            home, wt_path, run_ts, "in-progress", owner="dead"
+        )
+        # 手工老化 run 目录与 state 文件（_make_wt_task_log 对 in-progress 不老化）
+        _age(wt_task_log / run_ts, 60)
+        _age(wt_task_log / f"{run_ts}-plan-state.json", 60)
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+        orphan_paths = [o["path"] for o in orphans]
+        ip_paths = [w["path"] for w in in_progress]
+        assert str(wt_path) in orphan_paths
+        assert str(wt_path) not in ip_paths
+
+    def test_owner_alive_in_progress_protected(self, tmp_path):
+        """owner 存活的 in-progress worktree → 落入 in_progress_wts（保护行为回归）。"""
+        home = tmp_path / "home"
+        home.mkdir()
+        canonical, _ = _setup_canonical(tmp_path)
+
+        run_ts = "2026-06-22-0901-00abc1"
+        wt_path = tmp_path / "wt_owner_alive"
+        _make_spine_worktree(canonical, wt_path, run_ts)
+        _make_wt_task_log(home, wt_path, run_ts, "in-progress", owner="alive")
+
+        now_ms = _clean._io.now_ms()
+        orphans, in_progress = _clean.scan_spine_worktrees(
+            canonical, home, keep_days=14, now_ms=now_ms
+        )
+        ip_paths = [w["path"] for w in in_progress]
+        assert str(wt_path) in ip_paths
+        assert all(o["path"] != str(wt_path) for o in orphans)
