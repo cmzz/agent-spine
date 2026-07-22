@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -181,3 +184,81 @@ def test_find_latest_in_progress_picks_only_in_progress(tmp_path, computed_paths
 def test_find_latest_in_progress_none(tmp_path, computed_paths):
     found = _resume.find_latest_in_progress(computed_paths.task_log_dir)
     assert found is None
+
+
+# ----------------------------- detect() owner 存活门槛（worktree-owner-liveness） -----------------------------
+
+
+def _dead_pid() -> int:
+    p = subprocess.Popen(["true"])
+    p.wait()
+    return p.pid
+
+
+def _fresh_heartbeat() -> str:
+    return (datetime.now().astimezone() - timedelta(hours=1)).isoformat(timespec="seconds")
+
+
+def _stale_heartbeat() -> str:
+    """过期心跳（25h 前）。dead pid 本身不构成死亡证据，判死靠心跳过期。"""
+    return (datetime.now().astimezone() - timedelta(hours=25)).isoformat(timespec="seconds")
+
+
+def _write_in_progress(tld, run_ts, **extra):
+    tld.mkdir(parents=True, exist_ok=True)
+    state = {
+        "schema_version": 2,
+        "run_ts": run_ts,
+        "status": "in-progress",
+        "progress": [{"seq": 1, "change_id": "a", "status": "pending", "phases": {}}],
+        **extra,
+    }
+    f = tld / f"{run_ts}-plan-state.json"
+    f.write_text(json.dumps(state), encoding="utf-8")
+    return f
+
+
+def test_detect_owner_alive_not_resumable(tmp_path, capsys, make_args):
+    """owner 存活的 in-progress state → needs_resume=False，message 含 owner 字样。"""
+    tld = tmp_path / "tld"
+    _write_in_progress(
+        tld, "2026-05-21-0900", owner_pid=os.getpid(), owner_heartbeat_at=_fresh_heartbeat()
+    )
+    _resume.detect(make_args(task_log_dir=str(tld)))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is False
+    assert payload["state_json"] is None
+    assert "owner" in payload["message"]
+    assert payload["message"] != "没有找到 in-progress 旧 run"
+
+
+def test_detect_owner_dead_resumable(tmp_path, capsys, make_args):
+    """owner 已死的 in-progress state → 行为不变（needs_resume=True，指向该文件）。"""
+    tld = tmp_path / "tld"
+    state_file = _write_in_progress(
+        tld, "2026-05-21-0900", owner_pid=_dead_pid(), owner_heartbeat_at=_stale_heartbeat()
+    )
+    _resume.detect(make_args(task_log_dir=str(tld)))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is True
+    assert payload["state_json"] == str(state_file)
+
+
+def test_detect_legacy_state_without_owner_fields_resumable(tmp_path, capsys, make_args):
+    """无 owner 字段的旧 schema in-progress state → 视为孤儿候选，可续跑（向后兼容）。"""
+    tld = tmp_path / "tld"
+    state_file = _write_in_progress(tld, "2026-05-21-0900")
+    _resume.detect(make_args(task_log_dir=str(tld)))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is True
+    assert payload["state_json"] == str(state_file)
+
+
+def test_detect_no_in_progress_message_unchanged(tmp_path, capsys, make_args):
+    """无 in-progress 记录 → 原始消息不变。"""
+    tld = tmp_path / "tld"
+    tld.mkdir()
+    _resume.detect(make_args(task_log_dir=str(tld)))
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is False
+    assert payload["message"] == "没有找到 in-progress 旧 run"

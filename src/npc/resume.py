@@ -23,6 +23,7 @@ import re
 from pathlib import Path
 
 from . import _io, paths as _paths, state as _state
+from . import owner as _owner
 
 
 def find_latest_in_progress(task_log_dir: Path) -> Path | None:
@@ -316,6 +317,24 @@ def detect(args: argparse.Namespace) -> None:
                     "needs_resume": False,
                     "state_json": None,
                     "message": "没有找到 in-progress 旧 run",
+                }
+            )
+            return
+        # owner 存活门槛：owner 仍存活的 in-progress state 不视为可续跑候选
+        # （他人活跃 run），诊断消息区别于"没有找到 in-progress 旧 run"。
+        try:
+            _candidate_state = json.loads(latest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            _candidate_state = {}
+        if isinstance(_candidate_state, dict) and _owner.owner_alive(_candidate_state):
+            _io.emit(
+                {
+                    "needs_resume": False,
+                    "state_json": None,
+                    "message": (
+                        "找到 in-progress 记录，但 owner 仍存活（他人 run），不建议接管；"
+                        "确认需要强制接管时用 npc init --takeover"
+                    ),
                 }
             )
             return

@@ -1,0 +1,3 @@
+# worktree-owner-liveness
+
+修复 npc init/resume 悬空 worktree 扫描的并发踩踏缺陷：当前 _scan_spine_worktrees_for_resume 把「plan-state status=in-progress」直接等同于「悬空可续跑」，多个并发主 session 在同一仓库下会把彼此活跃的 spine worktree 当悬空 run 抢走（今日已两次实际发生，用户被迫用 --fresh 规避）。要求：不把 --fresh 设为默认（会废掉崩溃恢复通道），改为引入 owner 存活判定——init/resume 时在 run 的 task_log（或 worktree）落 owner 锁（pid + session_id + 时间戳心跳），悬空扫描时对候选 worktree 做 owner 存活检查（pid 存活探测，必要时辅以心跳新鲜度），owner 仍存活的 worktree 一律跳过（视为他人活跃 run，直接建新 worktree），只有 owner 已死的真孤儿才作为 resume 候选；--fresh 语义保持不变作为手动逃生口；锁的写入/清理要幂等且崩溃安全（stale 锁不能阻塞恢复）；覆盖 --no-worktree 路径的同类续跑探测（find_latest_in_progress 同样无所有权判定）；补齐并发场景测试。

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+from datetime import datetime
 
 import pytest
 
@@ -321,3 +323,78 @@ def test_finalize_blocked_by_needs_decision(env_setup, capsys, make_args):
         _state.finalize(make_args())
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["error"] == "has_needs_decision"
+
+
+# ----------------------------- owner 字段刷新（worktree-owner-liveness） -----------------------------
+
+
+def _minimal_state(**overrides):
+    state = {
+        "schema_version": 2,
+        "run_ts": "2026-05-22-1545",
+        "mode": "interactive",
+        "status": "in-progress",
+        "plan_order": ["a"],
+        "progress": [{"seq": 1, "change_id": "a", "status": "pending", "phases": {}}],
+    }
+    state.update(overrides)
+    return state
+
+
+def test_write_state_refreshes_owner_fields(tmp_path, monkeypatch):
+    """write_state 后 state JSON 含 owner_pid / owner_heartbeat_at / owner_session_id。"""
+    monkeypatch.setattr(os, "getppid", lambda: 7777)
+    sj = tmp_path / "state.json"
+    sm = tmp_path / "state.md"
+    _state.write_state(sj, sm, _minimal_state())
+    loaded = json.loads(sj.read_text())
+    assert loaded["owner_pid"] == 7777
+    assert isinstance(loaded["owner_heartbeat_at"], str)
+    datetime.fromisoformat(loaded["owner_heartbeat_at"])  # 可解析
+    assert "owner_session_id" in loaded
+
+
+def test_write_state_owner_session_id_from_cc_session(tmp_path):
+    """cc_session.session_id 存在时，owner_session_id 派生自它。"""
+    sj = tmp_path / "state.json"
+    sm = tmp_path / "state.md"
+    _state.write_state(
+        sj, sm, _minimal_state(cc_session={"session_id": "sess-123", "source": "hook"})
+    )
+    loaded = json.loads(sj.read_text())
+    assert loaded["owner_session_id"] == "sess-123"
+
+
+def test_write_state_owner_session_id_none_without_cc_session(tmp_path):
+    """无 cc_session（或为 None）时 owner_session_id 为 None，不抛异常。"""
+    sj = tmp_path / "state.json"
+    sm = tmp_path / "state.md"
+    _state.write_state(sj, sm, _minimal_state())
+    assert json.loads(sj.read_text())["owner_session_id"] is None
+
+    sj2 = tmp_path / "state2.json"
+    sm2 = tmp_path / "state2.md"
+    _state.write_state(sj2, sm2, _minimal_state(cc_session=None))
+    assert json.loads(sj2.read_text())["owner_session_id"] is None
+
+
+def test_write_state_heartbeat_refreshed_on_every_call(tmp_path, monkeypatch):
+    """连续两次 write_state：第二次 owner_heartbeat_at 晚于第一次（刷新语义）。"""
+    sj = tmp_path / "state.json"
+    sm = tmp_path / "state.md"
+    ticks = iter(
+        [
+            "2026-05-22T15:45:00+08:00",
+            "2026-05-22T15:45:00+08:00",  # render_state_md 不调用 now_iso，双写各一次
+            "2026-05-22T15:46:00+08:00",
+            "2026-05-22T15:46:00+08:00",
+        ]
+    )
+    monkeypatch.setattr(_state._io, "now_iso", lambda: next(ticks))
+    _state.write_state(sj, sm, _minimal_state())
+    first = json.loads(sj.read_text())["owner_heartbeat_at"]
+    _state.write_state(sj, sm, _minimal_state())
+    second = json.loads(sj.read_text())["owner_heartbeat_at"]
+    assert first == "2026-05-22T15:45:00+08:00"
+    assert second == "2026-05-22T15:46:00+08:00"
+    assert second > first

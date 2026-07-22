@@ -15,6 +15,7 @@ from pathlib import Path
 
 from . import _io, paths as _paths, schema, session, resume, git_chain as _git_chain, state as _state
 from . import doctor as _doctor
+from . import owner as _owner
 from . import settings_auth as _settings_auth
 from . import git_ops as _git_ops
 
@@ -142,10 +143,26 @@ def _mark_initializing_skeleton_orphan(init_file: Path) -> None:
         pass
 
 
+def _owner_alive_for_state_file(state_file: Path) -> bool:
+    """读取 state/骨架 JSON 并做 owner 存活判定。
+
+    读取失败（OSError / json.JSONDecodeError）时保守视为不存活——允许进入
+    续跑候选池，与既有"缺信息即孤儿候选"的宽松向后兼容语义一致。
+    """
+    try:
+        data = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    return _owner.owner_alive(data)
+
+
 def _scan_spine_worktrees_for_resume(
     canonical_repo_root: Path,
     home: Path,
     runner=subprocess.run,
+    takeover: bool = False,
 ) -> tuple[bool, Path | None, bool]:
     """扫描 spine/* worktree，查找有 in-progress 或 initializing state 的悬空 worktree。
 
@@ -155,8 +172,17 @@ def _scan_spine_worktrees_for_resume(
       init-run 未执行，调用方应复用该 worktree_root 重新走 init 流程（跳过 worktree 创建）。
     多个命中取 state mtime 最新（in-progress 优先于 initializing）。
 
+    owner 存活门槛：in-progress 与 initializing 两类候选在进入候选池前 MUST 先过
+    ``owner.owner_alive()`` 判定——owner 仍存活的 worktree 一律跳过（视为他人活跃
+    run），只有 owner 已死（或无 owner 信息的旧 schema 文件）的候选才计入。
+    ``takeover=True``（``npc init --takeover``）时跳过该门槛，显式接管 owner 判定
+    仍存活的候选（崩溃后心跳未过期时的手动恢复通道）；孤儿标记的 owner 门槛
+    **不受** takeover 影响——接管是续跑语义，不是把他人骨架判残骸的许可。
+
     副作用：发现 worktree 缺失/残破的 initializing 记录时，将骨架文件的 status 更新为
     'orphan'（记录在案），以便后续 clean 命令可以发现并回收，同时 init 继续新建 worktree。
+    孤儿标记同样过 owner 存活门槛：骨架 owner 仍存活（并发 init 的「骨架已落盘、
+    worktree add 未完成」窗口）时跳过标记，避免把他人活跃 run 误判为残骸。
     """
     try:
         worktrees = _git_ops.list_worktrees(canonical_repo_root, runner=runner)
@@ -186,6 +212,10 @@ def _scan_spine_worktrees_for_resume(
             wt_task_log_dir = home / "task_log" / wt_proj_key
             init_file = resume.find_latest_initializing(wt_task_log_dir)
             if init_file is not None:
+                # owner 存活门槛：骨架 owner 仍存活时不得标孤儿（目录缺失可能是
+                # 并发窗口/瞬态，标孤儿会把活跃 run 误判为可回收残骸）。
+                if _owner_alive_for_state_file(init_file):
+                    continue
                 _mark_initializing_skeleton_orphan(init_file)
             continue
         # 按 worktree 路径推 task_log_dir
@@ -198,6 +228,10 @@ def _scan_spine_worktrees_for_resume(
         # 先检查 in-progress（优先级高于 initializing）
         state_file = resume.find_latest_in_progress(wt_task_log_dir)
         if state_file is not None:
+            # owner 存活判定：owner 仍存活 → 他人活跃 run，不进候选池
+            # （--takeover 显式接管时豁免）
+            if not takeover and _owner_alive_for_state_file(state_file):
+                continue
             try:
                 mtime = state_file.stat().st_mtime
             except OSError:
@@ -208,6 +242,10 @@ def _scan_spine_worktrees_for_resume(
         # 再检查 initializing（崩溃窗口中间态）
         init_file = resume.find_latest_initializing(wt_task_log_dir)
         if init_file is not None:
+            # owner 存活判定：owner 仍存活 → 他人正在初始化，不进候选池
+            # （--takeover 显式接管时豁免）
+            if not takeover and _owner_alive_for_state_file(init_file):
+                continue
             try:
                 mtime = init_file.stat().st_mtime
             except OSError:
@@ -235,6 +273,11 @@ def _scan_spine_worktrees_for_resume(
             wt_root = Path(wt_root_str)
             # 如果 worktree 不在 git 列表里且目录不存在 → 标记孤儿
             if wt_root not in known_wt_dirs and not wt_root.is_dir():
+                # owner 存活门槛：骨架 owner 仍存活时不得标孤儿——并发 init 场景下
+                # 对方可能正处于「骨架已落盘、git worktree add 尚未完成」的窗口，
+                # 此时标孤儿会把活跃 run 误判为可回收残骸。
+                if _owner_alive_for_state_file(init_file):
+                    continue
                 _mark_initializing_skeleton_orphan(init_file)
 
     # in-progress 优先
@@ -314,7 +357,8 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
 
     if not no_worktree and not args.fresh:
         needs_resume_wt, resume_wt_path, is_initializing = _scan_spine_worktrees_for_resume(
-            canonical_repo_root, home, runner=runner
+            canonical_repo_root, home, runner=runner,
+            takeover=bool(getattr(args, "takeover", False)),
         )
         if needs_resume_wt and resume_wt_path is not None:
             if not is_initializing:
@@ -366,8 +410,15 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
     needs_resume = False
     if not args.fresh and no_worktree:
         if task_log_dir_for_resume.is_dir():
-            resume_state_json = resume.find_latest_in_progress(task_log_dir_for_resume)
-            needs_resume = resume_state_json is not None
+            candidate = resume.find_latest_in_progress(task_log_dir_for_resume)
+            _takeover = bool(getattr(args, "takeover", False))
+            if candidate is not None and (
+                _takeover or not _owner_alive_for_state_file(candidate)
+            ):
+                resume_state_json = candidate
+                needs_resume = True
+            # owner 存活且未 --takeover → resume_state_json 保持 None，
+            # needs_resume 保持 False，步骤 5 走"新生成 run_ts"分支，等价于"未发现候选"。
 
     # 4. worktree 模式：创建 worktree + 分支（跳过条件：已从 initializing 恢复）
     if not no_worktree and worktree_root is None:
@@ -391,10 +442,16 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
             "base_branch": base_branch,
             "plan_order": [],
             "progress": [],
+            # owner 存活信息：owner_pid + 心跳在骨架落盘时写入；
+            # owner_session_id 先置 None（session 探测发生在骨架写入之后）。
+            "owner_session_id": None,
+            **_owner.capture_owner_fields(),
         }
-        _skeleton_path.write_text(
+        # 原子替换写（tmp + os.replace）：与 write_state() 落盘出口共享同一机制，
+        # 失败整体向上抛出，不留缺 owner 字段的半态新文件。
+        _state._atomic_write_text(
+            _skeleton_path,
             json.dumps(_skeleton, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
         )
 
         try:
@@ -557,6 +614,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         "mode": mode,
         "runtime_host": p.runtime_host,
         "fresh": bool(args.fresh),
+        "takeover": bool(getattr(args, "takeover", False)),
         "auto_auth": auto_auth,
         "auto_local_dirs": auto_local,
         "provision": provision_info,

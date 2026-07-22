@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from . import _io, paths as _paths, telemetry as _telemetry
 from . import git_ops as _git_ops
+from . import owner as _owner
 
 
 SCHEMA_VERSION = 2
@@ -108,8 +109,13 @@ def write_state(state_json: Path, state_md: Path, state: dict) -> None:
     """原子写 STATE_JSON，紧接着重新渲染 STATE_MD。
 
     last_updated_at 在此处统一更新；调用方无需手工设置。
+    owner 三字段（owner_pid / owner_heartbeat_at / owner_session_id）也在此处
+    统一刷新：write_state 是所有生命周期子命令共享的唯一落盘出口，每次落盘
+    即刷新一次 owner 存活快照，与其余 state 字段共享同一次原子替换写。
     """
     state["last_updated_at"] = _io.now_iso()
+    state.update(_owner.capture_owner_fields())
+    state["owner_session_id"] = (state.get("cc_session") or {}).get("session_id")
     json_text = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
     _atomic_write_text(state_json, json_text)
     md_text = render_state_md(state)

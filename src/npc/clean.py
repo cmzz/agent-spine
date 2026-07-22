@@ -11,7 +11,9 @@
 in-progress 的 run 绝不删；active run 绝不删。
 
 额外：扫描 spine/* worktree，对无 in-progress state 的孤儿 worktree 执行
-git worktree remove + 删对应分支；有 in-progress state 的跳过。
+git worktree remove + 删对应分支；有 in-progress state 且 owner 仍存活的跳过；
+owner 已死的 in-progress worktree 不再无条件保护，落入与普通孤儿相同的
+keep_days age-gate 二次判定（未过保留窗口的保守跳过）。
 
 CLI handler：run
 纯函数：plan_cleanup（不碰文件系统，便于单测）
@@ -26,6 +28,7 @@ import shutil
 from pathlib import Path
 
 from . import _io, paths as _paths, state as _state, git_ops as _git_ops, resume as _resume
+from . import owner as _owner
 
 
 # 默认保留窗口（天）。
@@ -228,9 +231,10 @@ def scan_spine_worktrees(
 
     返回：
         (orphans, in_progress_wts)
-        orphans: [{path, branch_name}] — 无 in-progress state 且 task_log
-            run 均已过 keep_days 保留窗口，可清理。
-        in_progress_wts: [{path, branch_name}] — 有 in-progress state，跳过。
+        orphans: [{path, branch_name}] — 无 in-progress state（或 in-progress 但
+            owner 已死）且 task_log run 均已过 keep_days 保留窗口，可清理。
+        in_progress_wts: [{path, branch_name}] — 有 in-progress state 且
+            owner 仍存活，跳过。
 
     保守原则：
         · 无法推算 proj_key → 跳过（不删）。
@@ -275,11 +279,25 @@ def scan_spine_worktrees(
 
         entry = {"path": str(wt_path), "branch_name": branch_name}
 
-        # 第一道门：有 in-progress state → 无论如何跳过。
-        has_in_progress = _resume.find_latest_in_progress(wt_task_log_dir) is not None
-        if has_in_progress:
-            in_progress_wts.append(entry)
-            continue
+        # 第一道门：有 in-progress state 且 owner 仍存活 → 无论如何跳过。
+        # owner 已死（或读取失败无法判定 → 保守视为不存活）→ 不再无条件保护，
+        # 落入下方 orphan 骨架 / initializing 骨架 / 第二道门（task_log run 的
+        # age-gate plan_cleanup）判定链路，与"无 in-progress 记录"的 worktree
+        # 走同一套保守回收判定。
+        owner_dead_run_ts: str | None = None
+        state_file = _resume.find_latest_in_progress(wt_task_log_dir)
+        if state_file is not None:
+            try:
+                candidate_state = json.loads(state_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                candidate_state = {}
+            if isinstance(candidate_state, dict) and _owner.owner_alive(candidate_state):
+                in_progress_wts.append(entry)
+                continue
+            owner_dead_run_ts = (
+                (candidate_state.get("run_ts") if isinstance(candidate_state, dict) else None)
+                or state_file.name[: -len("-plan-state.json")]
+            )
 
         # orphan 骨架检测：骨架已被 init 标记为 status=orphan（worktree 缺失/残破）。
         # orphan 状态意味着 init 已确认该 worktree 无法复用，直接列为孤儿回收。
@@ -315,6 +333,14 @@ def scan_spine_worktrees(
         if not runs:
             # 无法确认 age/status → 保守保留
             continue
+
+        # owner 已死的 in-progress run：改写为可回收终态语义（仅内存判定，不落盘），
+        # 使其与 completed/aborted run 走同一条 active / keep_days 保守门槛——
+        # 未过保留窗口的仍然跳过（留给后续 npc init 可能的续跑接管）。
+        if owner_dead_run_ts is not None:
+            for r in runs:
+                if r["run_ts"] == owner_dead_run_ts and r["status"] == "in-progress":
+                    r["status"] = "aborted"
 
         active_ts = _paths.read_active(wt_task_log_dir)
         plan = plan_cleanup(runs, active_ts, keep_days, now_ms)
