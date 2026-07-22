@@ -330,6 +330,45 @@ def check_routing(
     return violations
 
 
+def resolve_review_engine(
+    generator_backend: str,
+    configured_engine: str,
+    *,
+    engine_override: str | None = None,
+    generator_identity: tuple[str | None, str | None] | None = None,
+    review_identity: tuple[str | None, str | None] | None = None,
+) -> str:
+    """review 引擎的 backend-aware 确定性选择（纯函数，review/spec pipeline 共用）。
+
+    优先级：显式 override > 生成源 backend-aware 默认 > 配置引擎。
+
+    1. ``engine_override`` 非空 → 原样返回（合法性交给 :func:`check_routing`
+       判定，本函数不做校验，绝不静默重路由）。
+    2. 生成源为 codex / kimi → ``"claude"``。
+    3. 生成源为 claude 且配置引擎与生成源同源（engine 为 claude 且执行身份
+       相同）→ ``"codex"``；不同源 → 配置引擎。
+    4. 其余（mimo 等）→ 配置引擎。
+
+    ``generator_identity`` / ``review_identity`` 为 ``(bin, model)`` 二元组，
+    仅参与 claude/claude 同源判定，口径与 :func:`check_routing` 的
+    ``same_claude_identity`` 一致；任一侧缺省为 ``None`` 时按「同源」保守
+    处理（即选 codex），与 check_routing 的保守拒绝口径一致。
+    """
+    if engine_override:
+        return engine_override
+    if generator_backend in ("codex", "kimi"):
+        return "claude"
+    if generator_backend == "claude" and configured_engine == "claude":
+        same_identity = (
+            generator_identity is None
+            or review_identity is None
+            or generator_identity == review_identity
+        )
+        if same_identity:
+            return "codex"
+    return configured_engine
+
+
 def _check_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
     """校验 mimo 后端不得使用 in-session 分发（纯函数，原地追加 violation）。
 

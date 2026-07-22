@@ -728,7 +728,10 @@ def run_review_round(
 ) -> dict:
     """跑完整一轮 review。失败时返回 {ok:false,...}；调用方判断 exit code。
 
-    engine 选择优先级：``engine_name`` > 配置文件 ``[review].engine`` > 默认 ``codex``。
+    engine 选择优先级（单一确定性 resolver，见
+    :func:`npc.verify.resolve_review_engine`）：显式 ``engine_name`` override >
+    生成源 backend-aware 默认（生成源 codex/kimi→claude；生成源 claude 且与配置
+    引擎同源→codex）> 配置文件 ``[review].engine``（缺省 codex）。
     ``config_path`` 显式指定 TOML 配置；省略走 :func:`config.load_config` 的标准查找链。
     """
     try:
@@ -752,13 +755,16 @@ def run_review_round(
             cfg.coder.backend_for_phase(config_phase) or p.runtime_host
         )
 
-    # Codex/Kimi 产出默认强制交给 Claude review（不含 mimo）。显式
-    # --engine codex 不在这里静默改写，而是交给下方同源守卫 / Kimi 路由守卫
-    # 拒绝，确保路由错误可观察。
-    default_engine = (
-        "claude" if generator_backend in ("codex", "kimi") else review_cfg.engine
-    )
-    selected_engine = (engine_name or default_engine).lower()
+    # 单一确定性 resolver（verify.resolve_review_engine）：显式 override >
+    # 生成源 backend-aware 默认 > 配置引擎。显式 --engine 不在 resolver 内
+    # 校验，而是交给下方同源守卫 / Kimi 路由守卫拒绝，确保路由错误可观察。
+    selected_engine = _verify.resolve_review_engine(
+        generator_backend,
+        review_cfg.engine,
+        engine_override=engine_name,
+        generator_identity=(cfg.coder.bin, cfg.coder.model),
+        review_identity=(review_cfg.claude_bin, review_cfg.claude_model),
+    ).lower()
 
     # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝。
     # 若 CLI 传入 engine_name 覆盖了配置中的 review.engine，需用覆盖后的值做校验，

@@ -163,6 +163,97 @@ def test_routing_mimo_coder_claude_non_mimo_review_benign():
 
 
 # ============================================================
+# routing：resolve_review_engine 纯函数（change review-routing-backend-aware）
+# ============================================================
+
+
+def test_resolver_override_wins():
+    # 显式 override 永远优先，原样返回（合法性交给 check_routing，不在此校验）
+    assert (
+        _verify.resolve_review_engine("codex", "codex", engine_override="codex")
+        == "codex"
+    )
+    assert (
+        _verify.resolve_review_engine("claude", "codex", engine_override="claude")
+        == "claude"
+    )
+
+
+def test_resolver_codex_generator_defaults_claude():
+    assert _verify.resolve_review_engine("codex", "codex") == "claude"
+
+
+def test_resolver_kimi_generator_defaults_claude():
+    assert _verify.resolve_review_engine("kimi", "codex") == "claude"
+
+
+def test_resolver_claude_generator_same_source_routes_codex():
+    # claude 生成源 + 配置 claude 且身份相同（同 bin+model）→ 自动 codex
+    assert (
+        _verify.resolve_review_engine(
+            "claude",
+            "claude",
+            generator_identity=("claude", "opus"),
+            review_identity=("claude", "opus"),
+        )
+        == "codex"
+    )
+
+
+def test_resolver_claude_generator_default_identity_is_same_source():
+    # identity 全缺省（None/None）也按同源保守处理 → codex
+    assert _verify.resolve_review_engine("claude", "claude") == "codex"
+
+
+def test_resolver_claude_generator_missing_identity_conservative_codex():
+    # 任一侧 identity 缺省为 None → 保守按同源 → codex
+    assert (
+        _verify.resolve_review_engine(
+            "claude", "claude", generator_identity=("claude", "opus")
+        )
+        == "codex"
+    )
+    assert (
+        _verify.resolve_review_engine(
+            "claude", "claude", review_identity=("claude", "opus")
+        )
+        == "codex"
+    )
+
+
+def test_resolver_claude_generator_diff_identity_uses_configured():
+    # claude 生成源 + 配置 claude 但身份不同（不同 model）→ 用配置引擎
+    assert (
+        _verify.resolve_review_engine(
+            "claude",
+            "claude",
+            generator_identity=("claude", "opus"),
+            review_identity=("claude", "sonnet"),
+        )
+        == "claude"
+    )
+
+
+def test_resolver_claude_generator_codex_config_uses_configured():
+    # claude 生成源 + 配置 codex（本就不同源）→ 配置引擎
+    assert _verify.resolve_review_engine("claude", "codex") == "codex"
+
+
+def test_resolver_mimo_generator_uses_configured():
+    # mimo 生成源 → 配置引擎（合法性由 check_routing 保证）
+    assert _verify.resolve_review_engine("mimo", "codex") == "codex"
+    assert (
+        _verify.resolve_review_engine(
+            "mimo",
+            "claude",
+            generator_identity=("claude", "mimo-v2.5-pro"),
+            review_identity=("claude", "opus"),
+        )
+        == "claude"
+    )
+
+
+# ============================================================
 # routing：run_routing handler（emit + 退出码）
 # ============================================================
 

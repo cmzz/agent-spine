@@ -255,7 +255,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--engine",
         choices=["codex", "claude"],
         default=None,
-        help="覆盖 review 引擎（默认从配置文件 [review].engine 读，缺省 codex）",
+        help=(
+            "覆盖 review 引擎（缺省按生成源 backend-aware 解析："
+            "codex/kimi 生成→claude，claude 生成且与配置引擎同源→codex，"
+            "否则取配置文件 [review].engine，缺省 codex）"
+        ),
     )
     p_review_run.add_argument(
         "--config",
@@ -536,7 +540,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--engine",
         choices=["codex", "claude"],
         default=None,
-        help="覆盖 spec_review 引擎（默认从配置文件 [spec_review].engine 读，缺省 codex）",
+        help=(
+            "覆盖 spec_review 引擎（缺省按生成源 backend-aware 解析："
+            "codex/kimi 生成→claude，claude 生成且与配置引擎同源→codex，"
+            "否则取配置文件 [spec_review].engine，缺省 codex）"
+        ),
     )
     p_sr_run.add_argument("--timeout", type=int, default=900, help="单次引擎调用超时秒数")
     p_sr_run.add_argument("--retries", type=int, default=0, help="引擎失败重试次数")

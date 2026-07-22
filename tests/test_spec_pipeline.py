@@ -1147,7 +1147,11 @@ def test_spec_write_run_rejects_mimo_backend(env_setup, fake_repo):
     assert not (_sp._spec_base(p, "add-foo") / "spec-write.prompt.md").exists()
 
 
-def test_spec_write_run_rejects_non_orthogonal_writer_review(env_setup, fake_repo):
+def test_spec_write_run_codex_writer_same_source_config_auto_routes_claude(env_setup, fake_repo):
+    """claude runtime 下显式 spec_writer.backend=codex + spec_review.engine=codex
+    （同源）→ backend-aware 自动路由 claude spec review，不再以
+    spec_gen_not_orthogonal 拒绝（change review-routing-backend-aware：与
+    review pipeline 的 codex/kimi→claude 默认共用同一 resolver）。"""
     _make_change_dir(fake_repo, "add-foo")
     npc_dir = fake_repo / ".npc"
     npc_dir.mkdir()
@@ -1156,12 +1160,9 @@ def test_spec_write_run_rejects_non_orthogonal_writer_review(env_setup, fake_rep
     )
     p = _with_repo(env_setup, fake_repo)
 
-    engine_calls: list[dict] = []
     result = _sp.spec_write_run(p, "add-foo", config_path=npc_dir / "config.toml")
-    assert result["ok"] is False
-    rules = {v["rule"] for v in result["violations"]}
-    assert "spec_gen_not_orthogonal" in rules
-    assert engine_calls == []
+    assert result["ok"] is True
+    assert result["deferred"] is True
 
 
 def test_spec_review_run_rejects_engine_name_cli_override_same_source(

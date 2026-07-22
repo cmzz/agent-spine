@@ -227,6 +227,91 @@ def test_codex_generated_code_rejects_explicit_codex_review(
     assert any(v["rule"] == "gen_not_orthogonal" for v in payload["violations"])
 
 
+def test_claude_generated_code_same_source_config_defaults_to_codex_review(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: claude 生成源 + 配置 review.engine=claude 且执行身份同源
+    （同 bin+model，此处双侧皆缺省 None）→ 无显式 override 时自动路由 codex，
+    不产生 routing-violation，review 正常执行。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "claude",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    cfg_path = tmp_path / "claude-review.toml"
+    cfg_path.write_text(
+        '[review]\nengine = "claude"\nadversarial_round0 = false\n',
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+    stub = _stub_codex_writes_review({"verdict": "approve", "findings": []})
+
+    def recording_codex(**kwargs):
+        calls.append("codex")
+        return stub(**kwargs)
+
+    monkeypatch.setattr(_pipeline, "_codex_exec", recording_codex)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(
+        _pipeline,
+        "_portable_timeout_bin",
+        lambda override=None: Path("/fake/portable-timeout"),
+    )
+    p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert calls == ["codex"]
+
+
+def test_claude_generated_code_diff_identity_uses_configured_engine(
+    env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
+):
+    """Scenario: claude 生成源 + 配置 review.engine=claude 但身份不同源
+    （review 侧显式不同 model）→ 仍使用配置引擎 claude。"""
+    _bootstrap_run(env_setup, make_args, capsys, "add-foo")
+    state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
+    state["progress"][0].setdefault("phases", {})["implement"] = {
+        "status": "done",
+        "generator_backend": "claude",
+        "commit": "abc",
+    }
+    env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
+
+    cfg_path = tmp_path / "claude-review-diff-model.toml"
+    cfg_path.write_text(
+        '[review]\nengine = "claude"\nadversarial_round0 = false\n'
+        '[review.claude]\nmodel = "claude-opus-4-8"\n',
+        encoding="utf-8",
+    )
+    calls: list[str] = []
+
+    def fake_claude(**kwargs):
+        calls.append("claude")
+        kwargs["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kwargs["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kwargs["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_pipeline, "_claude_exec", fake_claude)
+    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(
+        _pipeline,
+        "_portable_timeout_bin",
+        lambda override=None: Path("/fake/portable-timeout"),
+    )
+    p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
+    result = _pipeline.run_review_round(p, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert calls == ["claude"]
+
+
 def test_fix_phase_exit_retains_generator_backend(
     env_setup, make_args, capsys
 ):
@@ -1515,12 +1600,14 @@ def test_run_review_round_rejects_mimo_in_review_model(
     assert "mimo_exec_only" in rules
 
 
-def test_run_review_round_rejects_review_same_source_as_coder(
+def test_run_review_round_same_source_config_auto_routes_codex(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """Scenario: review 与 coder 同源（相同 claude bin+model）→ 拒绝执行 routing-violation。
+    """Scenario: claude 生成源 + 配置 review 与 coder 同源（相同 claude bin+model）
+    → 自动路由 codex，不产生 routing-violation（change review-routing-backend-aware）。
 
-    接线测试：断言不变量 1（生成⊥验证）在 run_review_round 入口被强制。
+    旧行为（同源即 gen_not_orthogonal 拒绝）已被 backend-aware 自动选路取代；
+    生成⊥验证仍由 check_routing 对最终选择强制（codex review ⊥ claude coder）。
     """
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
 
@@ -1532,17 +1619,18 @@ def test_run_review_round_rejects_review_same_source_as_coder(
         encoding="utf-8",
     )
 
+    review_payload = {"verdict": "approve", "findings": []}
+    monkeypatch.setattr(_pipeline, "_codex_exec", _stub_codex_writes_review(review_payload))
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
+    monkeypatch.setattr(
+        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
+    )
+
     p_with_repo = _make_p_with_repo(env_setup, fake_repo)
 
-    with pytest.raises(SystemExit) as ei:
-        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
-    assert ei.value.code == 1
-
-    out = json.loads(capsys.readouterr().out)
-    assert out["ok"] is False
-    assert out["error"] == "routing-violation"
-    rules = {v["rule"] for v in out["violations"]}
-    assert "gen_not_orthogonal" in rules
+    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert result["ok"] is True
+    assert result["engine"] == "codex"
 
 
 def test_run_review_round_allows_legal_routing(
