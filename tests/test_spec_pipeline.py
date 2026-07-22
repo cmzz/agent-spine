@@ -1147,16 +1147,16 @@ def test_spec_write_run_rejects_mimo_backend(env_setup, fake_repo):
     assert not (_sp._spec_base(p, "add-foo") / "spec-write.prompt.md").exists()
 
 
-def test_spec_write_run_codex_writer_same_source_config_auto_routes_claude(env_setup, fake_repo):
-    """claude runtime 下显式 spec_writer.backend=codex + spec_review.engine=codex
-    （同源）→ backend-aware 自动路由 claude spec review，不再以
-    spec_gen_not_orthogonal 拒绝（change review-routing-backend-aware：与
-    review pipeline 的 codex/kimi→claude 默认共用同一 resolver）。"""
+def test_spec_write_run_codex_writer_unconfigured_engine_defaults_claude(env_setup, fake_repo):
+    """claude runtime 下显式 spec_writer.backend=codex + 未显式配置
+    spec_review.engine（None）→ backend-aware 默认路由 claude spec review
+    （change review-routing-backend-aware：codex 生成源 → claude 默认）。
+    显式 engine=codex 同源配置则由守卫可观察地拒绝，不再静默重路由。"""
     _make_change_dir(fake_repo, "add-foo")
     npc_dir = fake_repo / ".npc"
     npc_dir.mkdir()
     (npc_dir / "config.toml").write_text(
-        '[spec_writer]\nbackend = "codex"\n\n[spec_review]\nengine = "codex"\n', encoding="utf-8"
+        '[spec_writer]\nbackend = "codex"\n', encoding="utf-8"
     )
     p = _with_repo(env_setup, fake_repo)
 
@@ -1929,13 +1929,14 @@ def test_spine_spec_writer_agent_lists_interrogate_phase():
 # ============================================================
 
 
-def test_kimi_runtime_spec_review_defaults_to_claude(env_setup, fake_repo, monkeypatch):
-    """对称于 test_codex_runtime_spec_review_defaults_to_claude。"""
+def test_kimi_runtime_spec_review_defaults_to_codex(env_setup, fake_repo, monkeypatch):
+    """change review-routing-backend-aware：只有 codex 生成源默认 claude
+    spec review；kimi runtime（writer=kimi）未显式配置时默认 codex。"""
     _make_change_dir(fake_repo, "add-foo")
     p = _with_repo(env_setup, fake_repo)
     p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
     monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
-    monkeypatch.setattr(_sp, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(_sp, "_find_codex_bin", lambda override=None: "/fake/codex")
     monkeypatch.setattr(
         _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
     )
@@ -1960,7 +1961,7 @@ def test_kimi_runtime_spec_review_defaults_to_claude(env_setup, fake_repo, monke
         gate_runner=subprocess.run,
     )
     assert result["ok"] is True
-    assert engine_calls[0]["engine_name"] == "claude"
+    assert engine_calls[0]["engine_name"] == "codex"
 
 
 def test_kimi_runtime_rejects_explicit_non_kimi_spec_writer(env_setup, fake_repo, tmp_path):
@@ -1997,34 +1998,49 @@ def test_explicit_kimi_spec_review_engine_is_rejected(env_setup, fake_repo):
     assert "kimi" in str(ei.value)
 
 
-def test_explicit_codex_spec_review_of_kimi_written_spec_is_rejected(
+def test_explicit_codex_spec_review_of_kimi_written_spec_is_allowed(
     env_setup, fake_repo, monkeypatch
 ):
-    """round-3 F1 修复：第 2 步——Kimi 写的 spec 显式请求 codex spec review 应被
-    拒绝为 spec 路由 violation，而不是被静默执行。"""
+    """change review-routing-backend-aware（断言方向翻转）：Kimi 写的 spec 显式
+    请求 codex spec review 应被放行——原 spec_kimi_review_not_claude 硬规则已
+    废除，显式指定只受 spec_gen⊥verify / mimo exec-only 结构性不变量约束。"""
     _make_change_dir(fake_repo, "add-foo")
     p = _with_repo(env_setup, fake_repo)
     p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
-
-    codex_calls: list[str] = []
+    monkeypatch.setattr(_sp, "_find_openspec_bin", lambda override=None: "/fake/openspec")
+    monkeypatch.setattr(_sp, "_find_codex_bin", lambda override=None: "/fake/codex")
     monkeypatch.setattr(
-        _sp, "_spec_engine_exec",
-        lambda **kw: codex_calls.append("codex") or 0,
+        _sp, "_portable_timeout_bin", lambda override=None: Path("/fake/timeout")
     )
-    result = _sp.spec_review_run(p, "add-foo", 0, engine_name="codex")
-    assert result["ok"] is False
-    assert result["error"] == "spec_routing_violation"
-    assert any(
-        v["rule"] == "spec_kimi_review_not_claude" for v in result["violations"]
+    engine_calls: list[dict] = []
+
+    def fake_engine(**kw):
+        engine_calls.append(kw)
+        kw["review_out"].parent.mkdir(parents=True, exist_ok=True)
+        kw["review_out"].write_text(
+            json.dumps({"verdict": "approve", "findings": []}),
+            encoding="utf-8",
+        )
+        kw["events_out"].write_text("x\n", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(_sp, "_spec_engine_exec", fake_engine)
+    result = _sp.spec_review_run(
+        p, "add-foo", 0,
+        engine_name="codex",
+        validate_runner=_fake_validate_runner(returncode=0),
+        gate_runner=subprocess.run,
     )
-    assert codex_calls == []
+    assert result["ok"] is True
+    assert engine_calls[0]["engine_name"] == "codex"
 
 
 def test_kimi_written_spec_review_dependency_missing_does_not_fallback(
     env_setup, fake_repo, monkeypatch
 ):
-    """round-2 F4 修复：Kimi 写的 spec，默认路由到 Claude spec review，但 Claude
-    二进制缺失——必须走既有 dependency_missing，不静默降级为 codex/kimi 自审。"""
+    """round-2 F4 修复（新语义）：Kimi 写的 spec，未显式配置时默认路由 codex
+    spec review，但 codex 二进制缺失——必须走既有 dependency_missing，不静默
+    降级为 claude 或 kimi 自审。"""
     _make_change_dir(fake_repo, "add-foo")
     p = _with_repo(env_setup, fake_repo)
     p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
@@ -2035,10 +2051,10 @@ def test_kimi_written_spec_review_dependency_missing_does_not_fallback(
 
     def raise_missing(override=None):
         raise FileNotFoundError(
-            "未在 PATH 中找到 claude 命令；请安装 Claude Code CLI 或在 [review.claude] bin 指定"
+            "未在 PATH 中找到 codex 命令；请安装 codex CLI 或在 [spec_review] codex_bin 指定"
         )
 
-    monkeypatch.setattr(_sp, "_find_claude_bin", raise_missing)
+    monkeypatch.setattr(_sp, "_find_codex_bin", raise_missing)
     codex_calls: list[str] = []
     monkeypatch.setattr(
         _sp, "_spec_engine_exec",
@@ -2059,7 +2075,8 @@ def test_kimi_written_spec_review_claude_exec_failed_does_not_fallback(
     env_setup, fake_repo, monkeypatch
 ):
     """对称于既有 {"ok": False, "error": "claude-exec-failed"} 用例，phase 的
-    spec writer 为 kimi。"""
+    spec writer 为 kimi；新语义下 kimi 默认引擎为 codex，故显式
+    engine_name="claude" 固定 claude 引擎。"""
     _make_change_dir(fake_repo, "add-foo")
     p = _with_repo(env_setup, fake_repo)
     p = type(p)(**{**p.__dict__, "runtime_host": "kimi"})
@@ -2076,6 +2093,7 @@ def test_kimi_written_spec_review_claude_exec_failed_does_not_fallback(
 
     result = _sp.spec_review_run(
         p, "add-foo", 0,
+        engine_name="claude",
         validate_runner=_fake_validate_runner(returncode=0),
         gate_runner=subprocess.run,
     )

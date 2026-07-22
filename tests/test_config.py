@@ -20,7 +20,15 @@ def test_load_config_defaults_when_no_file(tmp_path: Path):
     home = tmp_path / "home"
     home.mkdir()
     cfg = _config.load_config(repo, home=home)
-    assert cfg.review.engine == "codex"
+    # None = 未显式配置（实效引擎由 resolve_review_engine 按生成身份解析）
+    assert cfg.review.engine is None
+    # effective_engine：显式值优先；None 时 codex 生成→claude，其它→codex
+    assert cfg.review.effective_engine("codex") == "claude"
+    assert cfg.review.effective_engine("claude") == "codex"
+    assert cfg.review.effective_engine("kimi") == "codex"
+    assert cfg.spec_review.effective_engine("codex") == "claude"
+    assert cfg.spec_review.effective_engine("kimi") == "codex"
+    assert _config.ReviewEngineConfig(engine="claude").effective_engine("kimi") == "claude"
     assert cfg.review.codex_bin is None
     assert cfg.review.claude_bin is None
     assert cfg.review.claude_model is None

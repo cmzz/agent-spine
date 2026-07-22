@@ -19,14 +19,14 @@ This skill is a host adapter, not a second workflow definition.
 - Run the canonical `npc init` command with `--runtime-host codex`.
 - Map each `spine-spec-writer` Claude `Agent` spawn to an isolated Codex sub-agent. Pass `.spawn_prompt` unchanged and require it to read `.prompt_file` before writing artifacts.
 - Map `AskUserQuestion` to Codex's user-input mechanism, retaining the canonical `--auto` prohibition.
-- `npc spec review run` has built-in backend-aware routing: specs written by a Codex sub-agent are automatically routed to Claude review, so no explicit `--engine` is needed. Passing `--engine claude` explicitly remains legal but is not required. A Claude dependency or execution failure stops the review; Codex MUST NOT review its own spec as a fallback.
+- `npc spec review run` has built-in backend-aware routing: with no explicit `[spec_review].engine` configured, specs written by a Codex sub-agent default to Claude review, so no explicit `--engine` is needed. An explicit engine choice is always honored (subject only to the generation⊥verification orthogonality and MiMo-exec-only invariants). A dependency or execution failure stops the review; Codex MUST NOT review its own spec as a fallback.
 
 ### Kimi host adapter mapping
 
 - Run the canonical `npc init` command with `--runtime-host kimi`.
 - Map each `spine-spec-writer` Claude `Agent` spawn to Kimi's `Agent` tool, called without explicitly passing `subagent_type` (or explicitly passing `subagent_type="coder"`, Kimi's built-in default profile) — a custom profile named for this agent-spine writer is not assumed to exist. Pass `.spawn_prompt` unchanged and require it to read `.prompt_file` before writing artifacts.
 - Map `AskUserQuestion` to Kimi's user-input mechanism, retaining the canonical `--auto` prohibition.
-- `npc spec review run` has built-in backend-aware routing: specs written by a Kimi sub-agent are automatically routed to Claude review, so no explicit `--engine` is needed. Passing `--engine claude` explicitly remains legal but is not required. A Claude dependency or execution failure stops the review; Kimi MUST NOT review its own spec as a fallback.
+- `npc spec review run` has built-in backend-aware routing: with no explicit `[spec_review].engine` configured, specs written by a Kimi sub-agent default to Codex review (only codex-written specs default to Claude review). An explicit engine choice (e.g. `--engine claude`) is always honored. A dependency or execution failure stops the review; Kimi MUST NOT review its own spec as a fallback.
 
 Keep all `npc` state, record, telemetry, gate, archive, and finalization calls exactly as defined by the canonical workflow.
 

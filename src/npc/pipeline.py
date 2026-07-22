@@ -730,8 +730,8 @@ def run_review_round(
 
     engine 选择优先级（单一确定性 resolver，见
     :func:`npc.verify.resolve_review_engine`）：显式 ``engine_name`` override >
-    生成源 backend-aware 默认（生成源 codex/kimi→claude；生成源 claude 且与配置
-    引擎同源→codex）> 配置文件 ``[review].engine``（缺省 codex）。
+    配置文件 ``[review].engine``（显式配置无条件生效）> 生成源 backend-aware
+    默认（codex 生成→claude；其它生成→codex）。
     ``config_path`` 显式指定 TOML 配置；省略走 :func:`config.load_config` 的标准查找链。
     """
     try:
@@ -756,20 +756,19 @@ def run_review_round(
         )
 
     # 单一确定性 resolver（verify.resolve_review_engine）：显式 override >
-    # 生成源 backend-aware 默认 > 配置引擎。显式 --engine 不在 resolver 内
-    # 校验，而是交给下方同源守卫 / Kimi 路由守卫拒绝，确保路由错误可观察。
+    # 显式配置 > 生成源 backend-aware 默认。显式值不在 resolver 内校验，
+    # 而是交给下方同源守卫拒绝，确保路由错误可观察、绝不静默重路由。
     selected_engine = _verify.resolve_review_engine(
         generator_backend,
         review_cfg.engine,
         engine_override=engine_name,
-        generator_identity=(cfg.coder.bin, cfg.coder.model),
-        review_identity=(review_cfg.claude_bin, review_cfg.claude_model),
     ).lower()
 
     # 不变量 1/4 强制：review 执行前校验路由；violations 非空立即拒绝。
     # 若 CLI 传入 engine_name 覆盖了配置中的 review.engine，需用覆盖后的值做校验，
     # 否则会出现"按旧 engine 通过校验、按新 engine 实际执行"的漏洞。
-    if selected_engine != review_cfg.engine.lower():
+    # engine=None（未显式配置）时也统一物化为解析后的具体引擎。
+    if review_cfg.engine is None or selected_engine != review_cfg.engine.lower():
         effective_review_cfg = dataclasses.replace(review_cfg, engine=selected_engine)
         effective_cfg = dataclasses.replace(cfg, review=effective_review_cfg)
     else:

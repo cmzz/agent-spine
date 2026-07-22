@@ -230,9 +230,8 @@ def test_codex_generated_code_rejects_explicit_codex_review(
 def test_claude_generated_code_same_source_config_defaults_to_codex_review(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """Scenario: claude 生成源 + 配置 review.engine=claude 且执行身份同源
-    （同 bin+model，此处双侧皆缺省 None）→ 无显式 override 时自动路由 codex，
-    不产生 routing-violation，review 正常执行。"""
+    """Scenario: claude 生成源 + 未显式配置 review.engine（None）→
+    backend-aware 默认路由 codex，不产生 routing-violation，review 正常执行。"""
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
     state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
     state["progress"][0].setdefault("phases", {})["implement"] = {
@@ -244,7 +243,7 @@ def test_claude_generated_code_same_source_config_defaults_to_codex_review(
 
     cfg_path = tmp_path / "claude-review.toml"
     cfg_path.write_text(
-        '[review]\nengine = "claude"\nadversarial_round0 = false\n',
+        "[review]\nadversarial_round0 = false\n",
         encoding="utf-8",
     )
     calls: list[str] = []
@@ -1603,11 +1602,12 @@ def test_run_review_round_rejects_mimo_in_review_model(
 def test_run_review_round_same_source_config_auto_routes_codex(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """Scenario: claude 生成源 + 配置 review 与 coder 同源（相同 claude bin+model）
-    → 自动路由 codex，不产生 routing-violation（change review-routing-backend-aware）。
+    """Scenario: claude 生成源 + **显式**配置 review 与 coder 同源（相同 claude
+    bin+model）→ 显式配置无条件透传，由 check_routing 以 gen_not_orthogonal
+    可观察地拒绝——绝不静默重路由（change review-routing-backend-aware）。
 
-    旧行为（同源即 gen_not_orthogonal 拒绝）已被 backend-aware 自动选路取代；
-    生成⊥验证仍由 check_routing 对最终选择强制（codex review ⊥ claude coder）。
+    未显式配置（engine=None）的 backend-aware 自动选路见
+    test_claude_generated_code_same_source_config_defaults_to_codex_review。
     """
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
 
@@ -1619,18 +1619,15 @@ def test_run_review_round_same_source_config_auto_routes_codex(
         encoding="utf-8",
     )
 
-    review_payload = {"verdict": "approve", "findings": []}
-    monkeypatch.setattr(_pipeline, "_codex_exec", _stub_codex_writes_review(review_payload))
-    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
-    monkeypatch.setattr(
-        _pipeline, "_portable_timeout_bin", lambda override=None: Path("/fake/pt")
-    )
-
     p_with_repo = _make_p_with_repo(env_setup, fake_repo)
 
-    result = _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
-    assert result["ok"] is True
-    assert result["engine"] == "codex"
+    with pytest.raises(SystemExit) as ei:
+        _pipeline.run_review_round(p_with_repo, 1, 0, config_path=cfg_path)
+    assert ei.value.code == 1
+    out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert out["ok"] is False
+    assert out["error"] == "routing-violation"
+    assert any(v["rule"] == "gen_not_orthogonal" for v in out["violations"])
 
 
 def test_run_review_round_allows_legal_routing(
@@ -2262,10 +2259,11 @@ def test_record_fix_rejects_commit_not_on_run_branch(
 # ============================================================
 
 
-def test_kimi_generated_code_defaults_to_claude_review(
+def test_kimi_generated_code_defaults_to_codex_review(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path, tmp_path: Path
 ):
-    """对称于 test_codex_generated_code_defaults_to_claude_review。"""
+    """change review-routing-backend-aware：只有 codex 生成源默认 claude review；
+    kimi 生成源未显式配置 engine 时默认 codex review。"""
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
     state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
     state["progress"][0].setdefault("phases", {})["implement"] = {
@@ -2280,19 +2278,14 @@ def test_kimi_generated_code_defaults_to_claude_review(
         "[review]\nadversarial_round0 = false\n", encoding="utf-8"
     )
     calls: list[str] = []
+    stub = _stub_codex_writes_review({"verdict": "approve", "findings": []})
 
-    def fake_claude(**kwargs):
-        calls.append("claude")
-        kwargs["review_out"].parent.mkdir(parents=True, exist_ok=True)
-        kwargs["review_out"].write_text(
-            json.dumps({"verdict": "approve", "findings": []}),
-            encoding="utf-8",
-        )
-        kwargs["events_out"].write_text("x\n", encoding="utf-8")
-        return 0
+    def recording_codex(**kwargs):
+        calls.append("codex")
+        return stub(**kwargs)
 
-    monkeypatch.setattr(_pipeline, "_claude_exec", fake_claude)
-    monkeypatch.setattr(_pipeline, "_find_claude_bin", lambda override=None: "/fake/claude")
+    monkeypatch.setattr(_pipeline, "_codex_exec", recording_codex)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
     monkeypatch.setattr(
         _pipeline,
         "_portable_timeout_bin",
@@ -2301,7 +2294,7 @@ def test_kimi_generated_code_defaults_to_claude_review(
     p = type(env_setup)(**{**env_setup.__dict__, "repo_root": fake_repo})
     result = _pipeline.run_review_round(p, 1, 0, config_path=cfg_path)
     assert result["ok"] is True
-    assert calls == ["claude"]
+    assert calls == ["codex"]
 
 
 def test_explicit_kimi_review_engine_is_rejected(
@@ -2318,11 +2311,12 @@ def test_explicit_kimi_review_engine_is_rejected(
     assert "kimi" in str(ei.value)
 
 
-def test_explicit_codex_review_of_kimi_generated_code_is_rejected(
-    env_setup, make_args, capsys, fake_repo: Path, monkeypatch
+def test_explicit_codex_review_of_kimi_generated_code_is_allowed(
+    env_setup, make_args, capsys, fake_repo: Path, monkeypatch, tmp_path: Path
 ):
-    """round-3 F1 修复：第 2 步——Kimi 生成的产物显式请求 codex engine 应被
-    拒绝为路由 violation，而不是被静默执行。"""
+    """change review-routing-backend-aware（断言方向翻转）：Kimi 生成的产物
+    显式请求 codex engine 应被放行——原 kimi_review_not_claude 硬规则已废除，
+    显式指定只受 gen⊥verify / mimo exec-only 结构性不变量约束。"""
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
     state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
     state["progress"][0].setdefault("phases", {})["implement"] = {
@@ -2332,24 +2326,31 @@ def test_explicit_codex_review_of_kimi_generated_code_is_rejected(
     }
     env_setup.state_json.write_text(json.dumps(state), encoding="utf-8")
 
+    cfg_path = tmp_path / "single-pass.toml"
+    cfg_path.write_text(
+        "[review]\nadversarial_round0 = false\n", encoding="utf-8"
+    )
     p_with_repo = _make_p_with_repo(env_setup, fake_repo)
 
     codex_calls: list[str] = []
+    stub = _stub_codex_writes_review({"verdict": "approve", "findings": []})
+
+    def recording_codex(**kwargs):
+        codex_calls.append("codex")
+        return stub(**kwargs)
+
+    monkeypatch.setattr(_pipeline, "_codex_exec", recording_codex)
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", lambda override=None: "/fake/codex")
     monkeypatch.setattr(
         _pipeline,
-        "_codex_exec",
-        lambda **kwargs: codex_calls.append("codex") or 0,
+        "_portable_timeout_bin",
+        lambda override=None: Path("/fake/portable-timeout"),
     )
-    with pytest.raises(SystemExit) as ei:
-        _pipeline.run_review_round(p_with_repo, 1, 0, engine_name="codex")
-    assert ei.value.code == 1
-
-    out = json.loads(capsys.readouterr().out)
-    assert out["ok"] is False
-    assert out["error"] == "routing-violation"
-    rules = {v["rule"] for v in out["violations"]}
-    assert "kimi_review_not_claude" in rules
-    assert codex_calls == []
+    result = _pipeline.run_review_round(
+        p_with_repo, 1, 0, engine_name="codex", config_path=cfg_path
+    )
+    assert result["ok"] is True
+    assert codex_calls == ["codex"]
 
 
 def _seed_generator_backend(env_setup, phase: str, backend: str = "kimi") -> None:
@@ -2544,8 +2545,9 @@ def test_record_fix_kimi_backend_rerun_tests_failed_blocked(
 def test_kimi_generated_code_review_dependency_missing_does_not_fallback(
     env_setup, make_args, capsys, monkeypatch, fake_repo: Path
 ):
-    """round-2 F4 修复：Kimi 生成，默认路由到 Claude review，但 Claude 二进制
-    缺失——必须走既有 dependency_missing 结构化错误，不静默降级为 codex/kimi 自审。
+    """round-2 F4 修复（新语义）：Kimi 生成，未显式配置时默认路由 codex review，
+    但 codex 二进制缺失——必须走既有 dependency_missing 结构化错误，不静默
+    降级为 claude 或 kimi 自审。
     """
     _bootstrap_run(env_setup, make_args, capsys, "add-foo")
     state = json.loads(env_setup.state_json.read_text(encoding="utf-8"))
@@ -2558,19 +2560,19 @@ def test_kimi_generated_code_review_dependency_missing_does_not_fallback(
 
     def raise_missing(override=None):
         raise FileNotFoundError(
-            "未在 PATH 中找到 claude 命令；请安装 Claude Code CLI 或在 [review.claude] bin 指定"
+            "未在 PATH 中找到 codex 命令；请安装 codex CLI 或在 [review] codex_bin 指定"
         )
 
-    monkeypatch.setattr(_pipeline, "_find_claude_bin", raise_missing)
-    codex_calls: list[str] = []
+    monkeypatch.setattr(_pipeline, "_find_codex_bin", raise_missing)
+    claude_calls: list[str] = []
     monkeypatch.setattr(
-        _pipeline, "_find_codex_bin",
-        lambda *a, **kw: codex_calls.append(1) or "/fake/codex",
+        _pipeline, "_find_claude_bin",
+        lambda *a, **kw: claude_calls.append(1) or "/fake/claude",
     )
-    kimi_calls: list[str] = []
+    exec_calls: list[str] = []
     monkeypatch.setattr(
-        _pipeline, "_codex_exec",
-        lambda **kwargs: kimi_calls.append("codex-exec") or 0,
+        _pipeline, "_claude_exec",
+        lambda **kwargs: exec_calls.append("claude-exec") or 0,
     )
 
     args = make_args(
@@ -2582,8 +2584,8 @@ def test_kimi_generated_code_review_dependency_missing_does_not_fallback(
     assert ei.value.code == 4
     out = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert out["error"] == "dependency_missing"
-    assert codex_calls == []
-    assert kimi_calls == []
+    assert claude_calls == []
+    assert exec_calls == []
 
 
 def test_kimi_generated_code_review_claude_exec_failed_does_not_fallback(

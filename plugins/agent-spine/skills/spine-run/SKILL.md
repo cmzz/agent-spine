@@ -20,7 +20,7 @@ This skill is a host adapter, not a second workflow definition.
 - Map Claude `TodoWrite` usage to Codex plan updates.
 - Map a Claude `Agent` spawn to an isolated Codex sub-agent. Pass the canonical `.spawn_prompt` unchanged and require the sub-agent to read `.prompt_file` before acting. The sub-agent is the coder; the main session remains the orchestrator.
 - Map `AskUserQuestion` to Codex's user-input mechanism. In `--auto` mode, keep the canonical prohibition on asking the user.
-- `npc review run` has built-in backend-aware routing: artifacts generated with `backend=codex` are automatically routed to Claude review (and a Claude-generated artifact whose configured engine is same-source is automatically routed to codex), so no explicit `--engine` is needed. Passing `--engine claude` explicitly remains legal but is not required. Never fall back to Codex review if Claude is missing or fails; report the existing structured dependency/review failure.
+- `npc review run` has built-in backend-aware routing: with no explicit `[review].engine` configured, artifacts generated with `backend=codex` default to Claude review, and all other generators (claude/kimi/mimo) default to Codex review. An explicit `--engine` or configured `[review].engine` is always honored (subject only to the generation⊥verification orthogonality and MiMo-exec-only invariants). Never silently fall back to a different engine if the selected one is missing or fails; report the existing structured dependency/review failure.
 
 ### Kimi host adapter mapping
 
@@ -28,7 +28,7 @@ This skill is a host adapter, not a second workflow definition.
 - Map Claude `TodoWrite` usage to Kimi's own todo tool.
 - Call the `Agent` tool without explicitly passing `subagent_type` (or explicitly pass `subagent_type="coder"`, Kimi's built-in default profile) — a custom profile named for this agent-spine coder is not assumed to exist. Pass the canonical `.spawn_prompt` unchanged and require the sub-agent to read `.prompt_file` before acting. The sub-agent is the coder; the main session remains the orchestrator.
 - Map `AskUserQuestion` to Kimi's user-input mechanism. In `--auto` mode, keep the canonical prohibition on asking the user.
-- `npc review run` has built-in backend-aware routing: artifacts generated with `backend=kimi` are automatically routed to Claude review, so no explicit `--engine` is needed. Passing `--engine claude` explicitly remains legal but is not required. Never fall back to Kimi review if Claude is missing or fails; report the existing structured dependency/review failure.
+- `npc review run` has built-in backend-aware routing: with no explicit `[review].engine` configured, artifacts generated with `backend=kimi` default to Codex review (only codex-generated artifacts default to Claude review). An explicit engine choice (e.g. `--engine claude`) is always honored. Never fall back to Kimi self-review if the selected engine is missing or fails; report the existing structured dependency/review failure.
 
 Keep all `npc` state, record, telemetry, gate, archive, and finalization calls exactly as defined by the canonical workflow.
 

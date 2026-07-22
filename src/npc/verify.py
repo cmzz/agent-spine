@@ -257,7 +257,9 @@ def check_routing(
                 "detail": f"coder.backend={effective_backend!r} 不在支持列表 {_config.SUPPORTED_CODER_BACKENDS}",
             }
         )
-    if review.engine not in _config.SUPPORTED_ENGINES:
+    # engine=None 表示"未显式配置"，合法——解析默认由 resolve_review_engine
+    # 按生成身份给出（结构上不可能落在支持列表之外，也不可能自评）。
+    if review.engine is not None and review.engine not in _config.SUPPORTED_ENGINES:
         violations.append(
             {
                 "rule": "engine_unsupported",
@@ -265,15 +267,20 @@ def check_routing(
             }
         )
 
+    # 规则 2/3 用解析后的实效引擎判定（显式配置原样透传，None 解析为
+    # backend-aware 默认），使 `npc verify routing` 在未显式配置时也校验
+    # 真实将要执行的路由。
+    resolved_engine = resolve_review_engine(effective_backend, review.engine)
+
     # 规则 2：gen ⊥ verify（coder 与 review 解析到同一执行身份 = 自己评自己）
     same_claude_identity = (
         effective_backend == "claude"
-        and review.engine == "claude"
+        and resolved_engine == "claude"
         and coder.bin == review.claude_bin
         and coder.model == review.claude_model
     )
-    both_mimo = effective_backend == "mimo" and review.engine == "mimo"
-    both_codex = effective_backend == "codex" and review.engine == "codex"
+    both_mimo = effective_backend == "mimo" and resolved_engine == "mimo"
+    both_codex = effective_backend == "codex" and resolved_engine == "codex"
     if same_claude_identity or both_mimo or both_codex:
         violations.append(
             {
@@ -282,28 +289,14 @@ def check_routing(
             }
         )
 
-    # 规则 2b：Kimi 生成的产物 MUST 路由到 Claude review（Kimi 从不是合法的
-    # review.engine 取值，"同源"判定对它结构性不可达，必须直接按 generator
-    # 身份判定；显式 --engine codex 配合 Kimi 生成的产物会绕开"MUST 路由到
-    # Claude"，故独立新增此判定，不复用 both_codex/gen_not_orthogonal）。
-    kimi_review_not_claude = (
-        effective_backend == "kimi" and review.engine != "claude"
-    )
-    if kimi_review_not_claude:
-        violations.append(
-            {
-                "rule": "kimi_review_not_claude",
-                "detail": (
-                    "coder 生成身份为 kimi 但 review.engine="
-                    f"{review.engine!r} 非 claude：Kimi 生成的产物 MUST 路由到 "
-                    "Claude review，不允许显式改写为其它支持的 engine"
-                ),
-            }
-        )
+    # （原规则 2b kimi_review_not_claude 已废除：change
+    # review-routing-backend-aware——"Kimi 产物只许 Claude 评"是默认值偏好而
+    # 非结构性不变量，显式指定任意支持引擎均放行，只受 gen⊥verify 与
+    # mimo exec-only 约束。）
 
     # 规则 3：MiMo 只许执行（无条件顶层挡：engine 或 claude_bin/model 含 mimo）→ 单条
     if (
-        _contains_mimo(review.engine)
+        _contains_mimo(resolved_engine)
         or _contains_mimo(review.claude_model)
         or _contains_mimo(review.claude_bin)
     ):
@@ -332,41 +325,29 @@ def check_routing(
 
 def resolve_review_engine(
     generator_backend: str,
-    configured_engine: str,
+    configured_engine: str | None,
     *,
     engine_override: str | None = None,
-    generator_identity: tuple[str | None, str | None] | None = None,
-    review_identity: tuple[str | None, str | None] | None = None,
 ) -> str:
     """review 引擎的 backend-aware 确定性选择（纯函数，review/spec pipeline 共用）。
 
-    优先级：显式 override > 生成源 backend-aware 默认 > 配置引擎。
+    优先级：显式 override > 显式配置 ``engine`` > 生成源 backend-aware 默认。
 
-    1. ``engine_override`` 非空 → 原样返回（合法性交给 :func:`check_routing`
-       判定，本函数不做校验，绝不静默重路由）。
-    2. 生成源为 codex / kimi → ``"claude"``。
-    3. 生成源为 claude 且配置引擎与生成源同源（engine 为 claude 且执行身份
-       相同）→ ``"codex"``；不同源 → 配置引擎。
-    4. 其余（mimo 等）→ 配置引擎。
+    1. ``engine_override`` 非空 → 原样返回。
+    2. ``configured_engine`` 非 ``None``（TOML 显式配置）→ 原样返回。
+    3. 均未显式指定 → 按生成身份取默认：生成源为 codex → ``"claude"``；
+       其它生成源（claude / kimi / mimo）→ ``"codex"``。
 
-    ``generator_identity`` / ``review_identity`` 为 ``(bin, model)`` 二元组，
-    仅参与 claude/claude 同源判定，口径与 :func:`check_routing` 的
-    ``same_claude_identity`` 一致；任一侧缺省为 ``None`` 时按「同源」保守
-    处理（即选 codex），与 check_routing 的保守拒绝口径一致。
+    本函数绝不静默重路由：显式值（override 或配置）无条件透传，其合法性
+    （生成⊥验证正交、mimo exec-only、支持列表）交给 :func:`check_routing`
+    判定并可观察地拒绝。backend-aware 默认在结构上不可能自评（codex 生成
+    配 claude 评、其余生成配 codex 评），无需二次判定。
     """
     if engine_override:
         return engine_override
-    if generator_backend in ("codex", "kimi"):
-        return "claude"
-    if generator_backend == "claude" and configured_engine == "claude":
-        same_identity = (
-            generator_identity is None
-            or review_identity is None
-            or generator_identity == review_identity
-        )
-        if same_identity:
-            return "codex"
-    return configured_engine
+    if configured_engine is not None:
+        return configured_engine
+    return "claude" if generator_backend == "codex" else "codex"
 
 
 def _check_mimo_in_session(cfg: _config.Config, violations: list[dict]) -> None:
@@ -419,7 +400,11 @@ def _check_spec_backend_engine_unsupported(
                 ),
             }
         )
-    if spec_review.engine not in _config.SUPPORTED_ENGINES:
+    # None = 未显式配置，合法（同非 spec 侧口径）。
+    if (
+        spec_review.engine is not None
+        and spec_review.engine not in _config.SUPPORTED_ENGINES
+    ):
         violations.append(
             {
                 "rule": "spec_engine_unsupported",
@@ -446,14 +431,15 @@ def _check_spec_gen_not_orthogonal(
     spec_review = cfg.spec_review
     effective_backend = effective_backend or spec_writer.effective_backend
 
+    resolved_engine = resolve_review_engine(effective_backend, spec_review.engine)
     same_claude_identity = (
         effective_backend == "claude"
-        and spec_review.engine == "claude"
+        and resolved_engine == "claude"
         and spec_writer.bin == spec_review.claude_bin
         and spec_writer.model == spec_review.claude_model
     )
-    both_mimo = effective_backend == "mimo" and spec_review.engine == "mimo"
-    both_codex = effective_backend == "codex" and spec_review.engine == "codex"
+    both_mimo = effective_backend == "mimo" and resolved_engine == "mimo"
+    both_codex = effective_backend == "codex" and resolved_engine == "codex"
     if same_claude_identity or both_mimo or both_codex:
         violations.append(
             {
@@ -462,22 +448,8 @@ def _check_spec_gen_not_orthogonal(
             }
         )
 
-    # Kimi 生成的 spec MUST 路由到 Claude spec review——与非 spec 侧
-    # kimi_review_not_claude 同构（design.md F1 修复）。
-    spec_kimi_review_not_claude = (
-        effective_backend == "kimi" and spec_review.engine != "claude"
-    )
-    if spec_kimi_review_not_claude:
-        violations.append(
-            {
-                "rule": "spec_kimi_review_not_claude",
-                "detail": (
-                    "spec_writer 生成身份为 kimi 但 spec_review.engine="
-                    f"{spec_review.engine!r} 非 claude：Kimi 生成的 spec MUST "
-                    "路由到 Claude spec review，不允许显式改写为其它支持的 engine"
-                ),
-            }
-        )
+    # （原 spec_kimi_review_not_claude 已废除，同非 spec 侧规则 2b：change
+    # review-routing-backend-aware。）
 
 
 def _check_spec_mimo_exec_only(cfg: _config.Config, violations: list[dict]) -> None:
@@ -486,8 +458,11 @@ def _check_spec_mimo_exec_only(cfg: _config.Config, violations: list[dict]) -> N
     与既有规则 3（``mimo_exec_only``）同构，多条件合并为单条 violation。
     """
     spec_review = cfg.spec_review
+    resolved_engine = resolve_review_engine(
+        cfg.spec_writer.effective_backend, spec_review.engine
+    )
     if (
-        _contains_mimo(spec_review.engine)
+        _contains_mimo(resolved_engine)
         or _contains_mimo(spec_review.claude_model)
         or _contains_mimo(spec_review.claude_bin)
     ):
@@ -545,7 +520,10 @@ def run_routing(args: argparse.Namespace) -> None:
         {
             "ok": len(violations) == 0,
             "coder_backend": cfg.coder.effective_backend,
-            "review_engine": cfg.review.engine,
+            # 报告解析后的实效引擎（None=未显式配置时为 backend-aware 默认）
+            "review_engine": resolve_review_engine(
+                cfg.coder.effective_backend, cfg.review.engine
+            ),
             "violations": violations,
         }
     )

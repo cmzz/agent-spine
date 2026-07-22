@@ -24,7 +24,9 @@ def test_spec_config_defaults_when_unconfigured():
     """未配置 [spec_writer]/[spec_review] 时的 dataclass 默认值。"""
     cfg = _config.Config()
     assert cfg.spec_writer.effective_backend == "claude"
-    assert cfg.spec_review.engine == "codex"
+    # None = 未显式配置；claude writer 的实效默认引擎为 codex
+    assert cfg.spec_review.engine is None
+    assert _verify.resolve_review_engine("claude", cfg.spec_review.engine) == "codex"
     assert _verify.check_routing(cfg) == []
 
 
@@ -35,7 +37,9 @@ def test_spec_config_defaults_via_toml_load_without_spec_sections(tmp_path):
     (npc_dir / "config.toml").write_text('[review]\nengine = "codex"\n')
     cfg = _config.load_config(tmp_path)
     assert cfg.spec_writer.effective_backend == "claude"
-    assert cfg.spec_review.engine == "codex"
+    # [spec_review] 段缺失 → engine=None（未显式配置），实效默认 codex
+    assert cfg.spec_review.engine is None
+    assert _verify.resolve_review_engine("claude", cfg.spec_review.engine) == "codex"
     rules = {v["rule"] for v in _verify.check_routing(cfg)}
     assert not any(r.startswith("spec_") for r in rules)
 

@@ -171,9 +171,9 @@ def _effective_spec_routing(
     spec writer 恒为宿主内 agent，因此非 Claude runtime（Codex/Kimi）的 writer
     身份必为该 runtime_host 本身；Claude runtime 保持现有 ``[spec_writer]`` 解析。
     review 引擎由单一确定性 resolver（``verify.resolve_review_engine``）选择：
-    显式 override > 生成源 backend-aware 默认（codex/kimi→claude；claude 与配置
-    引擎同源→codex）> 配置引擎。显式 ``--engine codex`` 则保留并由同源守卫 /
-    Kimi 路由守卫拒绝。
+    显式 override > 显式配置 ``[spec_review].engine`` > 生成源 backend-aware
+    默认（codex 生成→claude；其它生成→codex）。显式值原样保留，由同源守卫
+    可观察地拒绝，绝不静默重路由。
 
     显式 ``[spec_writer].backend`` 与非 Claude 宿主冲突时不在此静默改写——由
     ``_spec_routing_violations`` 的 host-mismatch 规则报错，保持路由错误可观察。
@@ -185,11 +185,10 @@ def _effective_spec_routing(
         writer_backend,
         cfg.spec_review.engine,
         engine_override=engine_name,
-        generator_identity=(cfg.spec_writer.bin, cfg.spec_writer.model),
-        review_identity=(cfg.spec_review.claude_bin, cfg.spec_review.claude_model),
     ).lower()
     effective_cfg = cfg
-    if selected_engine != cfg.spec_review.engine.lower():
+    # engine=None（未显式配置）时也统一物化为解析后的具体引擎。
+    if cfg.spec_review.engine is None or selected_engine != cfg.spec_review.engine.lower():
         effective_cfg = dataclasses.replace(
             cfg,
             spec_review=dataclasses.replace(

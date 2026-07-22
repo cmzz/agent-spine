@@ -256,9 +256,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["codex", "claude"],
         default=None,
         help=(
-            "覆盖 review 引擎（缺省按生成源 backend-aware 解析："
-            "codex/kimi 生成→claude，claude 生成且与配置引擎同源→codex，"
-            "否则取配置文件 [review].engine，缺省 codex）"
+            "覆盖 review 引擎（优先级：本参数 > 配置文件 [review].engine 显式值 "
+            "> 生成源 backend-aware 默认：codex 生成→claude，其它生成→codex）"
         ),
     )
     p_review_run.add_argument(
@@ -541,9 +540,8 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=["codex", "claude"],
         default=None,
         help=(
-            "覆盖 spec_review 引擎（缺省按生成源 backend-aware 解析："
-            "codex/kimi 生成→claude，claude 生成且与配置引擎同源→codex，"
-            "否则取配置文件 [spec_review].engine，缺省 codex）"
+            "覆盖 spec_review 引擎（优先级：本参数 > 配置文件 [spec_review].engine "
+            "显式值 > 生成源 backend-aware 默认：codex 生成→claude，其它生成→codex）"
         ),
     )
     p_sr_run.add_argument("--timeout", type=int, default=900, help="单次引擎调用超时秒数")

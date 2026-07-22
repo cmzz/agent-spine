@@ -7,7 +7,8 @@
 3. ``~/.config/npc/config.toml``（用户全局配置）
 4. ``<HOME>/task_log/config.toml``（兼容 task_log 目录布局）
 
-任何一级文件不存在则继续向下查找；全部缺失时返回内置默认（engine=codex，
+任何一级文件不存在则继续向下查找；全部缺失时返回内置默认（engine=None，
+即未显式配置——实效引擎按生成身份解析：codex 生成→claude，其它→codex；
 其它字段为 ``None``，使用 PATH 中的 codex / claude）。
 
 TOML 示例：
@@ -53,7 +54,9 @@ class ConfigError(Exception):
 class ReviewEngineConfig:
     """review 引擎相关配置。"""
 
-    engine: str = "codex"
+    # None = 未显式配置：实效引擎由 verify.resolve_review_engine 按生成身份
+    # 解析（codex 生成→claude，其它生成→codex）；显式配置无条件生效。
+    engine: str | None = None
     codex_bin: str | None = None
     claude_bin: str | None = None
     claude_model: str | None = None
@@ -70,8 +73,15 @@ class ReviewEngineConfig:
     # round_n != 0 时该配置无效（round>=1 恒单通道）。
     adversarial_round0: bool = True
 
+    def effective_engine(self, generator_backend: str) -> str:
+        """实效引擎：显式配置原样返回；None 按生成身份取默认（codex 生成→claude，
+        其它→codex）。与 verify.resolve_review_engine 的无 override 分支同口径。"""
+        if self.engine is not None:
+            return self.engine
+        return "claude" if generator_backend == "codex" else "codex"
+
     def __post_init__(self) -> None:
-        if self.engine not in SUPPORTED_ENGINES:
+        if self.engine is not None and self.engine not in SUPPORTED_ENGINES:
             raise ConfigError(
                 f"未知 review engine：{self.engine!r}（仅支持 {'/'.join(SUPPORTED_ENGINES)}）"
             )
@@ -225,14 +235,21 @@ class SpecReviewConfig:
     spec fix 循环 MUST NOT 复用该判据（design.md D4）。默认 3。
     """
 
-    engine: str = "codex"  # 安全默认值：与既有 review 默认一致
+    # None = 未显式配置：与 [review].engine 同语义（backend-aware 默认解析）。
+    engine: str | None = None
     claude_bin: str | None = None
     claude_model: str | None = None
     gate_cmd: tuple[str, ...] | None = None
     max_rounds: int = 3
 
+    def effective_engine(self, generator_backend: str) -> str:
+        """实效引擎（同 ReviewEngineConfig.effective_engine 口径）。"""
+        if self.engine is not None:
+            return self.engine
+        return "claude" if generator_backend == "codex" else "codex"
+
     def __post_init__(self) -> None:
-        if self.engine not in SUPPORTED_ENGINES:
+        if self.engine is not None and self.engine not in SUPPORTED_ENGINES:
             raise ConfigError(
                 f"未知 spec_review engine：{self.engine!r}（仅支持 {'/'.join(SUPPORTED_ENGINES)}）"
             )
@@ -365,7 +382,8 @@ def _build(data: dict, source: str) -> Config:
     if not isinstance(review_raw, dict):
         raise ConfigError(f"[review] 节必须是 table（{source}）")
 
-    engine = str(review_raw.get("engine", "codex"))
+    _engine_raw = review_raw.get("engine")
+    engine = str(_engine_raw) if _engine_raw is not None else None
 
     codex_raw = review_raw.get("codex") or {}
     if not isinstance(codex_raw, dict):
@@ -451,7 +469,8 @@ def _build(data: dict, source: str) -> Config:
     spec_review_raw = data.get("spec_review") or {}
     if not isinstance(spec_review_raw, dict):
         raise ConfigError(f"[spec_review] 节必须是 table（{source}）")
-    spec_review_engine = str(spec_review_raw.get("engine", "codex"))
+    _spec_engine_raw = spec_review_raw.get("engine")
+    spec_review_engine = str(_spec_engine_raw) if _spec_engine_raw is not None else None
     spec_review_claude_bin = _opt_str(
         spec_review_raw.get("claude_bin"), "spec_review.claude_bin", source
     )
