@@ -331,7 +331,10 @@ def detect(args: argparse.Namespace) -> None:
                 {
                     "needs_resume": False,
                     "state_json": None,
-                    "message": "找到 in-progress 记录，但 owner 仍存活（他人 run），不建议接管",
+                    "message": (
+                        "找到 in-progress 记录，但 owner 仍存活（他人 run），不建议接管；"
+                        "确认需要强制接管时用 npc init --takeover"
+                    ),
                 }
             )
             return

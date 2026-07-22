@@ -29,17 +29,22 @@
 - **THEN** 该次落盘调用整体失败并向上抛出异常、中断当次子命令
 - **AND** MUST NOT 静默吞掉该异常后留下一份包含其余字段但缺 owner 字段的"新"落盘文件
 
-### Requirement: owner 存活判定以 pid 探测为主、心跳新鲜度为兜底
+### Requirement: owner 存活判定——pid 探测只能确认存活，判死由心跳新鲜度决定
 
-给定一份 plan-state（骨架或正式 STATE_JSON）的 owner 字段，判定其 owner 是否存活 MUST 遵循以下确定性算法：
+给定一份 plan-state（骨架或正式 STATE_JSON）的 owner 字段，判定其 owner 是否存活 MUST 遵循以下确定性算法。核心原则：**pid 探测只能作为存活的证据、不得作为死亡的证据**——`owner_pid` 记录的是触发子命令的父进程，在真实部署（CC 经 shell 包装调用 npc）中该父进程常是每条命令独立的短命包装 shell，命令结束后数秒内即退出；若把 pid 死亡当作 owner 死亡，活跃 run 在任意两次生命周期子命令之间都会被并发 session 误判为孤儿，原始并发踩踏缺陷将原样复现。
 1. `owner_pid` 缺失时退化为仅心跳判定：`owner_heartbeat_at` 也缺失 → 判定为不存活；否则按第 3 步的心跳新鲜度判定。
-2. `owner_pid` 存在时，MUST 用 `os.kill(pid, 0)` 探测：进程确认不存在（`ProcessLookupError`）→ 立即判定为不存活，**不受**心跳新鲜度阈值影响；因权限不足无法探测（`PermissionError`）或探测成功（进程存在）→ 判定为"pid 存活"，继续第 3 步二次确认；其它异常（非法 pid 值）→ 退化为仅心跳判定（同第 1 步）。
+2. `owner_pid` 存在时，MUST 用 `os.kill(pid, 0)` 探测：探测成功（进程存在）或因权限不足无法探测（`PermissionError`）→ 判定为"pid 存活"，继续第 3 步二次确认；进程不存在（`ProcessLookupError`）、非法 pid 值或其它探测异常 → pid 无法确认存活，MUST 退化为仅心跳判定（同第 1 步），MUST NOT 仅凭 pid 不存在就判定 owner 不存活。
 3. "pid 存活"分支的二次确认：`owner_heartbeat_at` 缺失 → 信任 pid 判定，视为存活；心跳时间在 24 小时（`OWNER_HEARTBEAT_STALENESS_SECONDS`）以内 → 存活；心跳已超过 24 小时 → 判定为不存活（视为 pid 复用，原进程已退出）。
 
-#### Scenario: pid 确认死亡立即判定为不存活
+#### Scenario: pid 已死但心跳新鲜判定为存活（短命包装 shell 场景）
 
-- **WHEN** plan-state 的 `owner_pid` 对应的进程已不存在
-- **THEN** owner 存活判定返回不存活，不参考心跳新鲜度
+- **WHEN** plan-state 的 `owner_pid` 对应的进程已不存在（如短命包装 shell 已退出），但 `owner_heartbeat_at` 在 24 小时以内
+- **THEN** owner 存活判定返回存活（活跃 run 不得因包装 shell 退出而被并发 session 接管）
+
+#### Scenario: pid 已死且心跳过期或缺失判定为不存活
+
+- **WHEN** plan-state 的 `owner_pid` 对应的进程已不存在，且 `owner_heartbeat_at` 超过 24 小时未刷新（或缺失）
+- **THEN** owner 存活判定返回不存活（真崩溃：心跳停止刷新，过期即可被接管）
 
 #### Scenario: pid 存活且心跳新鲜判定为存活
 

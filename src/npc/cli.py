@@ -73,7 +73,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # ===== init =====
     p_init = sub.add_parser("init", help="初始化运行环境，输出路径与 session 信息")
     p_init.add_argument("--auto", action="store_true", help="标记 auto 模式")
-    p_init.add_argument("--fresh", action="store_true", help="忽略 in-progress 旧 run")
+    _init_resume_mode = p_init.add_mutually_exclusive_group()
+    _init_resume_mode.add_argument(
+        "--fresh", action="store_true", help="忽略 in-progress 旧 run"
+    )
+    _init_resume_mode.add_argument(
+        "--takeover",
+        action="store_true",
+        help="显式接管 owner 判定仍存活的 in-progress 旧 run（崩溃后心跳未过期时的手动恢复通道）",
+    )
     p_init.add_argument(
         "--runtime-host",
         choices=["claude", "codex", "kimi"],

@@ -199,6 +199,11 @@ def _fresh_heartbeat() -> str:
     return (datetime.now().astimezone() - timedelta(hours=1)).isoformat(timespec="seconds")
 
 
+def _stale_heartbeat() -> str:
+    """过期心跳（25h 前）。dead pid 本身不构成死亡证据，判死靠心跳过期。"""
+    return (datetime.now().astimezone() - timedelta(hours=25)).isoformat(timespec="seconds")
+
+
 def _write_in_progress(tld, run_ts, **extra):
     tld.mkdir(parents=True, exist_ok=True)
     state = {
@@ -231,7 +236,7 @@ def test_detect_owner_dead_resumable(tmp_path, capsys, make_args):
     """owner 已死的 in-progress state → 行为不变（needs_resume=True，指向该文件）。"""
     tld = tmp_path / "tld"
     state_file = _write_in_progress(
-        tld, "2026-05-21-0900", owner_pid=_dead_pid(), owner_heartbeat_at=_fresh_heartbeat()
+        tld, "2026-05-21-0900", owner_pid=_dead_pid(), owner_heartbeat_at=_stale_heartbeat()
     )
     _resume.detect(make_args(task_log_dir=str(tld)))
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])

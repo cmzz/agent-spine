@@ -4,7 +4,9 @@
 
 仓库里已有的可复用先例：`src/npc/state.py::write_state()` 是几乎所有生命周期子命令（`state init-run`/`add-change`/`set-progress`/`phase enter|exit|rotate`/`set-parallel-fields`/`finalize`）共享的唯一落盘出口；`session.py::detect_via_hook` 已有"用文件 mtime 新鲜度代替显式心跳"的先例；`init_cmd.py::_mark_initializing_skeleton_orphan` 已有"读 plan-state.json → 改字段 → 原样写回、失败静默不阻塞"的保守写入惯例。
 
-用户在盘问阶段已就四个关键问题拍板（见下方 Pattern Mapping），核心结论：(1) 主判定机制选纯 pid 探测（`os.kill(pid, 0)`）+ 心跳新鲜度兜底，不引入 `fcntl.flock` 长驻持锁；(2) `owner_pid` 不是 init 时一次性快照，而是每次生命周期子命令执行都刷新；(3) 心跳新鲜度阈值 24 小时，且仅作用于"pid 存活但可能是复用/不可探测"的兜底场景，pid 确认死亡时直接判孤儿、不受阈值影响；(4) `npc clean` 的同类缺陷一并修复，复用同一个 `owner_alive` 判定。
+用户在盘问阶段已就四个关键问题拍板（见下方 Pattern Mapping），核心结论：(1) 主判定机制选纯 pid 探测（`os.kill(pid, 0)`）+ 心跳新鲜度兜底，不引入 `fcntl.flock` 长驻持锁；(2) `owner_pid` 不是 init 时一次性快照，而是每次生命周期子命令执行都刷新；(3) 心跳新鲜度阈值 24 小时；(4) `npc clean` 的同类缺陷一并修复，复用同一个 `owner_alive` 判定。
+
+Review round 2 修订（实测证据驱动）：原裁决"pid 确认死亡时直接判孤儿、不受阈值影响"的前提在真实部署中不成立——`os.getppid()` 记录的常是每条命令独立的短命包装 shell（Bash 工具的 `zsh -c`），命令结束后数秒内即死。据此修订为 **pid 探测只能确认存活、不能确认死亡**：`ProcessLookupError` 一律退化为心跳判定，判死完全由心跳过期决定；同时新增 `npc init --takeover` 显式接管旗标（与 `--fresh` 互斥），覆盖"真崩溃但心跳尚未过期、用户要求立即恢复"的场景。
 
 ## Goals / Non-Goals
 
@@ -43,6 +45,8 @@
 3. **心跳新鲜度阈值**：24 小时。pid 已死时直接判孤儿、立即可续跑，不受此阈值影响；该阈值只作用于 pid 存活但可能是复用、或 pid 不可探测的兜底场景，用户选择宁可僵尸 worktree 多占一天也不误抢活跃 run。
 4. **clean.py 同类问题**：一并修复。clean.py 的 in-progress 永久保护逻辑复用同一个 owner 存活判定：owner 已死的 in-progress worktree 允许回收。同一语义一次落地，避免两套判定漂移。
 
+> **Review round 2 修订说明**：第 3 条中"pid 已死时直接判孤儿、立即可续跑"的前提被实测推翻（owner_pid 常是短命包装 shell，见 Context 末段），已修订为 pid 探测只能确认存活、判死完全由心跳过期决定；立即恢复通道改由 `npc init --takeover` 承担。上文保留原始裁决记录不改写。
+
 ## Decisions
 
 **D1：新增 `src/npc/owner.py`，作为 owner 存活语义的单一事实源；写入侧与判定侧各一个纯函数。**
@@ -73,11 +77,14 @@ def owner_alive(state: dict, *, now_ts: float | None = None) -> bool:
          抛出并中断当次子命令，不会留下缺 owner_pid 的新 state 文件）→
          退化为仅心跳判定；心跳也缺失 → 视为无 owner 信息，判定为不存活
          （向后兼容：走原有"无信息即孤儿候选"行为，只覆盖旧 schema 文件）。
-      2. owner_pid 存在 → os.kill(pid, 0) 探测：
-         - ProcessLookupError → pid 确认死亡 → 不存活（立即可续跑，不受心跳阈值影响）。
+      2. owner_pid 存在 → os.kill(pid, 0) 探测（只能确认存活、不能确认死亡）：
          - PermissionError → 进程存在（仅权限不足发信号）→ 存活分支，继续走 3。
          - 无异常（kill 成功）→ pid 存在 → 存活分支，继续走 3。
-         - 其它 OSError（如 pid<=0 非法值）→ 视为 pid 不可探测，退化为仅心跳判定。
+         - ProcessLookupError / 其它 OSError（如 pid<=0 非法值）→ pid 无法确认
+           存活，退化为仅心跳判定。实测（review round 2）：npc 经 Bash 工具的
+           zsh -c 调用时，os.getppid() 记录的包装 shell 在命令结束后数秒内即死，
+           若 pid 死亡即判死，活跃 run 在任意两次子命令之间都会被并发 init
+           抢走——原始缺陷原样复现。
       3. pid 判定为"存在"后，用心跳新鲜度做二次确认（防 pid 复用）：
          - owner_heartbeat_at 缺失 → 信任 pid 存活判定（避免心跳字段尚未写入时的误杀）。
          - owner_heartbeat_at 在 OWNER_HEARTBEAT_STALENESS_SECONDS（24h）内 → 存活。
@@ -165,7 +172,7 @@ if state_file is not None:
 ## Risks / Trade-offs
 
 - **[`owner_pid = os.getppid()` 未必是"长驻到 run 结束"的稳定进程]** pattern-interrogation Open Questions 已指出该风险：CC 某些启动方式下父进程可能是短命 wrapper shell。Decision 2 的取舍是接受这一不完美，靠"每次生命周期子命令都刷新 pid + 心跳"稀释单次快照不准的影响——只要 owner 在 24 小时内至少触发过一次子命令调用，心跳就会保持新鲜，即使某一次快照的 pid 恰好在下一刻退出也不影响后续判定（下一次子命令调用会写入新的、当时仍存活的 pid）。真正的风险窗口收窄为"心跳新鲜但夹在两次子命令调用之间 pid 恰好死亡且被无关进程复用"，概率低且已被 24 小时阈值兜底。
-- **[心跳阈值 24 小时可能让真崩溃的悬空 worktree 多占一天]** 用户已在 Decision 3 显式接受这一取舍（"宁可僵尸 worktree 多占一天也不误抢活跃 run"）。缓解：pid 确认死亡（`ProcessLookupError`）这一更常见的崩溃信号不受 24 小时阈值影响，立即可续跑；只有"pid 存活但可能是复用"这一较少见的场景才会等到心跳过期。
+- **[心跳阈值 24 小时可能让真崩溃的悬空 worktree 多占一天]** 用户已在 Decision 3 显式接受这一取舍（"宁可僵尸 worktree 多占一天也不误抢活跃 run"）。Review round 2 后判死完全由心跳过期决定（pid 死亡不再是快速判死信号），该窗口成为常态；缓解：需要立即恢复时用 `npc init --takeover` 显式接管，不必等心跳过期。
 - **[`os.kill(pid, 0)` 假设同机部署]** Non-Goals 已声明不处理跨机/容器场景；若未来引入远程 worktree 执行，本设计需要重新评估。
 - **[`clean.py` 的 age-gate 二次判定意味着 owner 已死的 in-progress worktree 不会立即被清理]** 这是 D5 的有意设计（避免与 D3 的续跑接管路径冲突），不是遗漏——真正陈旧的僵尸最终仍会被回收，只是不会比一个"正常完成后陈旧"的 run 更快被清理。
 

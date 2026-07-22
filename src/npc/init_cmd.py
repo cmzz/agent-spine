@@ -162,6 +162,7 @@ def _scan_spine_worktrees_for_resume(
     canonical_repo_root: Path,
     home: Path,
     runner=subprocess.run,
+    takeover: bool = False,
 ) -> tuple[bool, Path | None, bool]:
     """扫描 spine/* worktree，查找有 in-progress 或 initializing state 的悬空 worktree。
 
@@ -174,6 +175,9 @@ def _scan_spine_worktrees_for_resume(
     owner 存活门槛：in-progress 与 initializing 两类候选在进入候选池前 MUST 先过
     ``owner.owner_alive()`` 判定——owner 仍存活的 worktree 一律跳过（视为他人活跃
     run），只有 owner 已死（或无 owner 信息的旧 schema 文件）的候选才计入。
+    ``takeover=True``（``npc init --takeover``）时跳过该门槛，显式接管 owner 判定
+    仍存活的候选（崩溃后心跳未过期时的手动恢复通道）；孤儿标记的 owner 门槛
+    **不受** takeover 影响——接管是续跑语义，不是把他人骨架判残骸的许可。
 
     副作用：发现 worktree 缺失/残破的 initializing 记录时，将骨架文件的 status 更新为
     'orphan'（记录在案），以便后续 clean 命令可以发现并回收，同时 init 继续新建 worktree。
@@ -225,7 +229,8 @@ def _scan_spine_worktrees_for_resume(
         state_file = resume.find_latest_in_progress(wt_task_log_dir)
         if state_file is not None:
             # owner 存活判定：owner 仍存活 → 他人活跃 run，不进候选池
-            if _owner_alive_for_state_file(state_file):
+            # （--takeover 显式接管时豁免）
+            if not takeover and _owner_alive_for_state_file(state_file):
                 continue
             try:
                 mtime = state_file.stat().st_mtime
@@ -238,7 +243,8 @@ def _scan_spine_worktrees_for_resume(
         init_file = resume.find_latest_initializing(wt_task_log_dir)
         if init_file is not None:
             # owner 存活判定：owner 仍存活 → 他人正在初始化，不进候选池
-            if _owner_alive_for_state_file(init_file):
+            # （--takeover 显式接管时豁免）
+            if not takeover and _owner_alive_for_state_file(init_file):
                 continue
             try:
                 mtime = init_file.stat().st_mtime
@@ -351,7 +357,8 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
 
     if not no_worktree and not args.fresh:
         needs_resume_wt, resume_wt_path, is_initializing = _scan_spine_worktrees_for_resume(
-            canonical_repo_root, home, runner=runner
+            canonical_repo_root, home, runner=runner,
+            takeover=bool(getattr(args, "takeover", False)),
         )
         if needs_resume_wt and resume_wt_path is not None:
             if not is_initializing:
@@ -404,11 +411,14 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
     if not args.fresh and no_worktree:
         if task_log_dir_for_resume.is_dir():
             candidate = resume.find_latest_in_progress(task_log_dir_for_resume)
-            if candidate is not None and not _owner_alive_for_state_file(candidate):
+            _takeover = bool(getattr(args, "takeover", False))
+            if candidate is not None and (
+                _takeover or not _owner_alive_for_state_file(candidate)
+            ):
                 resume_state_json = candidate
                 needs_resume = True
-            # owner 存活 → resume_state_json 保持 None，needs_resume 保持 False，
-            # 步骤 5 走"新生成 run_ts"分支，等价于"未发现候选"。
+            # owner 存活且未 --takeover → resume_state_json 保持 None，
+            # needs_resume 保持 False，步骤 5 走"新生成 run_ts"分支，等价于"未发现候选"。
 
     # 4. worktree 模式：创建 worktree + 分支（跳过条件：已从 initializing 恢复）
     if not no_worktree and worktree_root is None:
@@ -604,6 +614,7 @@ def run(args: argparse.Namespace, runner=subprocess.run) -> None:
         "mode": mode,
         "runtime_host": p.runtime_host,
         "fresh": bool(args.fresh),
+        "takeover": bool(getattr(args, "takeover", False)),
         "auto_auth": auto_auth,
         "auto_local_dirs": auto_local,
         "provision": provision_info,

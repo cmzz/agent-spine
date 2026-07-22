@@ -638,6 +638,11 @@ def _fresh_heartbeat() -> str:
     return (datetime.now().astimezone() - timedelta(hours=1)).isoformat(timespec="seconds")
 
 
+def _stale_heartbeat() -> str:
+    """过期心跳（25h 前）。dead pid 本身不构成死亡证据，判死靠心跳过期。"""
+    return (datetime.now().astimezone() - timedelta(hours=25)).isoformat(timespec="seconds")
+
+
 def _skeleton_path_for(home: Path, worktree_root: str, run_ts: str) -> Path:
     from npc import paths as _paths
 
@@ -771,6 +776,34 @@ def test_scan_hits_in_progress_with_dead_owner(worktree_env, make_args):
         "status": "in-progress",
         "progress": [],
         "owner_pid": _dead_pid(),
+        "owner_heartbeat_at": _stale_heartbeat(),
+    })
+    mock_runner = _make_mock_runner(
+        worktree_list_output=_wt_list_output(wt_path, run_ts),
+        current_branch="main",
+    )
+    needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
+        repo, home, runner=mock_runner
+    )
+    assert (needs_resume, wt, is_init) == (True, wt_path, False)
+
+
+def test_scan_skips_dead_wrapper_pid_with_fresh_heartbeat(worktree_env, make_args):
+    """回归（review round 2 CRITICAL）：owner_pid 是已死的短命包装 shell、但心跳新鲜
+    → 视为存活，MUST NOT 进候选池。
+
+    真实部署里 npc 经 Bash 工具的 zsh -c 调用，os.getppid() 记录的 shell 在命令
+    结束后数秒内即死；若 pid 死亡即判死，活跃 run 在任意两次子命令之间都会被
+    并发 init 抢走——即原始并发踩踏缺陷原样复现。
+    """
+    repo, home = worktree_env
+    run_ts = "2026-05-01-1000"
+    wt_path = _setup_wt_with_state(home, "ts_wrapper", run_ts, {
+        "schema_version": 2,
+        "run_ts": run_ts,
+        "status": "in-progress",
+        "progress": [],
+        "owner_pid": _dead_pid(),
         "owner_heartbeat_at": _fresh_heartbeat(),
     })
     mock_runner = _make_mock_runner(
@@ -779,6 +812,28 @@ def test_scan_hits_in_progress_with_dead_owner(worktree_env, make_args):
     )
     needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
         repo, home, runner=mock_runner
+    )
+    assert (needs_resume, wt, is_init) == (False, None, False)
+
+
+def test_scan_takeover_bypasses_alive_owner_gate(worktree_env, make_args):
+    """--takeover：owner 判定存活的 in-progress 候选也进候选池（显式手动接管）。"""
+    repo, home = worktree_env
+    run_ts = "2026-05-01-1000"
+    wt_path = _setup_wt_with_state(home, "ts_alive_tk", run_ts, {
+        "schema_version": 2,
+        "run_ts": run_ts,
+        "status": "in-progress",
+        "progress": [],
+        "owner_pid": os.getpid(),
+        "owner_heartbeat_at": _fresh_heartbeat(),
+    })
+    mock_runner = _make_mock_runner(
+        worktree_list_output=_wt_list_output(wt_path, run_ts),
+        current_branch="main",
+    )
+    needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
+        repo, home, runner=mock_runner, takeover=True
     )
     assert (needs_resume, wt, is_init) == (True, wt_path, False)
 
@@ -815,7 +870,7 @@ def test_scan_initializing_owner_gate(worktree_env, make_args):
         "worktree_root": "placeholder",
         "progress": [],
         "owner_pid": _dead_pid(),
-        "owner_heartbeat_at": _fresh_heartbeat(),
+        "owner_heartbeat_at": _stale_heartbeat(),
     })
     mock_runner = _make_mock_runner(
         worktree_list_output=_wt_list_output(wt_dead, run_ts),
@@ -914,7 +969,7 @@ def test_init_no_worktree_owner_dead_resumes(init_env, capsys, make_args):
             "status": "in-progress",
             "progress": [],
             "owner_pid": _dead_pid(),
-            "owner_heartbeat_at": _fresh_heartbeat(),
+            "owner_heartbeat_at": _stale_heartbeat(),
         })
     )
 
@@ -925,13 +980,70 @@ def test_init_no_worktree_owner_dead_resumes(init_env, capsys, make_args):
     assert payload["run_ts"] == old_run_ts
 
 
+def test_cli_fresh_and_takeover_mutually_exclusive(capsys):
+    """npc init --fresh --takeover → argparse 拒绝（语义互斥：弃旧 vs 抢旧）。"""
+    from npc import cli as _cli
+
+    with pytest.raises(SystemExit) as exc_info:
+        _cli._build_parser().parse_args(["init", "--fresh", "--takeover"])
+    assert exc_info.value.code == 2
+
+
+def test_init_no_worktree_takeover_resumes_alive_owner(init_env, capsys, make_args):
+    """--no-worktree --takeover：owner 存活的 in-progress state 也被显式接管。"""
+    repo, home = init_env
+    proj_key = "-" + str(repo).lstrip("/").replace("/", "-")
+    task_log = home / "task_log" / proj_key
+    task_log.mkdir(parents=True)
+    old_run_ts = "2026-05-01-1000"
+    (task_log / f"{old_run_ts}-plan-state.json").write_text(
+        json.dumps({
+            "schema_version": 2,
+            "run_ts": old_run_ts,
+            "status": "in-progress",
+            "progress": [],
+            "owner_pid": os.getpid(),
+            "owner_heartbeat_at": _fresh_heartbeat(),
+        })
+    )
+
+    args = make_args(
+        auto=False, fresh=False, takeover=True, shell_exports=False, no_worktree=True
+    )
+    _init.run(args)
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is True
+    assert payload["run_ts"] == old_run_ts
+    assert payload["takeover"] is True
+
+
+def test_reverse_scan_orphan_mark_still_gated_under_takeover(worktree_env, make_args):
+    """--takeover 不豁免孤儿标记的 owner 门槛：接管是续跑语义，
+    不是把他人活跃骨架判残骸的许可。"""
+    repo, home = worktree_env
+    run_ts = "2026-05-02-1300"
+    skeleton_path = _initializing_skeleton(home, "ts_tk", run_ts, owner_pid=os.getpid())
+
+    mock_runner = _make_mock_runner(worktree_list_output="", current_branch="main")
+    _init._scan_spine_worktrees_for_resume(repo, home, runner=mock_runner, takeover=True)
+    data = json.loads(skeleton_path.read_text())
+    assert data["status"] == "initializing", (
+        f"takeover 下 owner 存活的骨架也不应被标孤儿，实际 status={data['status']!r}"
+    )
+
+
 # ============================================================
 # Review round-1 F2：孤儿标记 owner 门槛（竞态）
 # ============================================================
 
 
-def _initializing_skeleton(home: Path, name: str, run_ts: str, *, owner_pid: int) -> Path:
-    """写一个 worktree_root 指向不存在目录的 initializing 骨架（不建 worktree），返回骨架路径。"""
+def _initializing_skeleton(
+    home: Path, name: str, run_ts: str, *, owner_pid: int, heartbeat: str | None = None
+) -> Path:
+    """写一个 worktree_root 指向不存在目录的 initializing 骨架（不建 worktree），返回骨架路径。
+
+    heartbeat 缺省为新鲜心跳；模拟真死 owner 时传 ``_stale_heartbeat()``。
+    """
     from npc import paths as _paths
 
     wt_path = home / ".spine" / "worktrees" / "p" / name
@@ -949,7 +1061,7 @@ def _initializing_skeleton(home: Path, name: str, run_ts: str, *, owner_pid: int
         "plan_order": [],
         "progress": [],
         "owner_pid": owner_pid,
-        "owner_heartbeat_at": _fresh_heartbeat(),
+        "owner_heartbeat_at": heartbeat or _fresh_heartbeat(),
     }))
     return skeleton_path
 
@@ -975,7 +1087,9 @@ def test_reverse_scan_orphan_mark_marks_dead_owner(worktree_env, make_args):
     """反向扫描：worktree 缺失的 initializing 骨架 owner 已死 → 仍标 orphan（既有行为）。"""
     repo, home = worktree_env
     run_ts = "2026-05-02-1100"
-    skeleton_path = _initializing_skeleton(home, "ts_dead", run_ts, owner_pid=_dead_pid())
+    skeleton_path = _initializing_skeleton(
+        home, "ts_dead", run_ts, owner_pid=_dead_pid(), heartbeat=_stale_heartbeat()
+    )
 
     mock_runner = _make_mock_runner(worktree_list_output="", current_branch="main")
     _init._scan_spine_worktrees_for_resume(repo, home, runner=mock_runner)

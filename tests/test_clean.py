@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import subprocess
+from datetime import datetime, timedelta
 
 import pytest
 
@@ -410,7 +411,8 @@ def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60, owner=None)
     state 文件，scan_runs 现在能正确识别带 suffix 的格式。
     age_days 控制 run 目录及 state 文件的 mtime（默认 60 天前，足够旧）。
     对 in-progress 状态，age_days 不影响 find_latest_in_progress 的结果（它只读 status）。
-    owner="alive" / "dead" 时注入 owner_pid + 新鲜心跳（owner 存活语义）。
+    owner="alive" → 存活 pid + 新鲜心跳；owner="dead" → 已死 pid + 过期心跳
+    （pid 探测只能确认存活，判死由心跳过期决定）。
     """
     from npc import paths as _paths
     wt_proj_key = _paths.proj_key_for(wt_path)
@@ -423,8 +425,14 @@ def _make_wt_task_log(home, wt_path, run_ts, status, *, age_days=60, owner=None)
     (run_dir / "run.events.jsonl").write_text("", encoding="utf-8")
     state = {"run_ts": run_ts, "status": status, "progress": []}
     if owner is not None:
-        state["owner_pid"] = os.getpid() if owner == "alive" else _dead_pid()
-        state["owner_heartbeat_at"] = _clean._io.now_iso()
+        if owner == "alive":
+            state["owner_pid"] = os.getpid()
+            state["owner_heartbeat_at"] = _clean._io.now_iso()
+        else:
+            state["owner_pid"] = _dead_pid()
+            state["owner_heartbeat_at"] = (
+                datetime.now().astimezone() - timedelta(hours=25)
+            ).isoformat(timespec="seconds")
     state_file = wt_task_log / f"{run_ts}-plan-state.json"
     state_file.write_text(json.dumps(state), encoding="utf-8")
 

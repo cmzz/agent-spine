@@ -4,10 +4,14 @@
 - 写入侧 ``capture_owner_fields()``：当前调用方（npc 子命令进程）的 owner 快照。
   ``owner_pid`` 取 ``os.getppid()``——触发本次子命令调用的父进程（CC 主
   session / shell），而非 npc 子进程自身；每次调用返回最新值，不做缓存。
-- 判定侧 ``owner_alive(state)``：pid 探测（``os.kill(pid, 0)``）为主判据，
-  24 小时心跳新鲜度为兜底（防 pid 复用误判）。
+- 判定侧 ``owner_alive(state)``：pid 探测（``os.kill(pid, 0)``）**只能确认存活、
+  不能确认死亡**——真实部署里 npc 经 shell 包装调用，``os.getppid()`` 记录的常是
+  每条命令独立的短命子 shell，命令结束后数秒内即死；若把 pid 死亡当作 owner
+  死亡，活跃 run 在任意两次子命令之间都会被并发 session 误判为孤儿。因此
+  pid 不可确认存活时一律退化为 24 小时心跳新鲜度判定。
 
-崩溃安全：不引入锁文件；owner 进程崩溃后 pid 立即不可探测，无需显式清理。
+崩溃安全：不引入锁文件；owner 崩溃后心跳停止刷新，过期即可被接管
+（需立即接管时用 ``npc init --takeover`` 显式旗标）。
 """
 
 from __future__ import annotations
@@ -18,8 +22,9 @@ from datetime import datetime
 
 from . import _io
 
-# 心跳新鲜度阈值：24 小时。仅作用于"pid 存活但可能是复用 / pid 不可探测"
-# 的兜底场景；pid 确认死亡（ProcessLookupError）时立即判死，不受此阈值影响。
+# 心跳新鲜度阈值：24 小时。pid 无法确认存活（缺失/已死/不可探测）时的主判据，
+# pid 确认存活但心跳过期时的复用怀疑判据。判死完全由该阈值决定——owner_pid
+# 常是短命包装 shell，pid 死亡不构成 owner 死亡的证据。
 OWNER_HEARTBEAT_STALENESS_SECONDS = 24 * 60 * 60
 
 
@@ -48,14 +53,15 @@ def _heartbeat_fresh(heartbeat: object, now_ts: float) -> bool | None:
 def owner_alive(state: dict, *, now_ts: float | None = None) -> bool:
     """判定侧：给定 plan-state dict（骨架或正式 STATE_JSON），判断其 owner 是否存活。
 
-    算法：
-      1. owner_pid 缺失/非法 → 退化为仅心跳判定；心跳也缺失 → 不存活
+    算法（pid 探测只能确认存活、不能确认死亡）：
+      1. owner_pid 缺失/非法 → 仅心跳判定；心跳也缺失 → 不存活
          （向后兼容：本 change 落地前生成的旧 schema 文件视为"无 owner 信息"，
          即孤儿候选，不阻断其被续跑接管）。
       2. owner_pid 存在 → ``os.kill(pid, 0)`` 探测：
-         - ProcessLookupError → pid 确认死亡 → 不存活（不受心跳阈值影响）。
          - PermissionError / 无异常 → pid 存活 → 走第 3 步二次确认。
-         - 其它 OSError → pid 不可探测 → 退化为仅心跳判定（同第 1 步）。
+         - ProcessLookupError / 其它 OSError → pid 无法确认存活 → 仅心跳判定
+           （同第 1 步）。owner_pid 常是短命包装 shell，pid 死亡不构成 owner
+           死亡的证据；心跳新鲜的活跃 run 不得因包装 shell 退出而被抢占。
       3. pid 存活后用心跳新鲜度二次确认（防 pid 复用）：
          - 心跳缺失/不可解析 → 信任 pid 判定，视为存活。
          - 心跳在 OWNER_HEARTBEAT_STALENESS_SECONDS（24h）内 → 存活。
@@ -73,17 +79,16 @@ def owner_alive(state: dict, *, now_ts: float | None = None) -> bool:
         try:
             os.kill(pid, 0)
             pid_alive = True
-        except ProcessLookupError:
-            return False
         except PermissionError:
             pid_alive = True
         except OSError:
-            pid_alive = False  # 不可探测 → 退化为仅心跳判定
+            # ProcessLookupError 在内：pid 无法确认存活 → 退化为仅心跳判定。
+            pid_alive = False
 
     fresh = _heartbeat_fresh(heartbeat, now_ts)
 
     if pid_alive:
         # pid 存活：心跳缺失/不可解析 → 信任 pid；否则按新鲜度二次确认。
         return fresh is not False
-    # pid 缺失/非法/不可探测：仅心跳判定。
+    # pid 缺失/非法/已死/不可探测：仅心跳判定。
     return fresh is True

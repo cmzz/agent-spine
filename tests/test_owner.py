@@ -1,7 +1,8 @@
 """owner 存活判定模块测试（worktree-owner-liveness change）。
 
 覆盖 capture_owner_fields / owner_alive 的写入侧快照与判定侧算法：
-pid 探测为主、24h 心跳新鲜度为兜底。
+pid 探测只能确认存活、不能确认死亡（owner_pid 常是短命包装 shell）；
+判死由 24h 心跳新鲜度决定。
 """
 
 from __future__ import annotations
@@ -60,17 +61,30 @@ def test_owner_alive_live_pid_no_heartbeat_is_alive():
     assert _owner.owner_alive({"owner_pid": os.getpid()}) is True
 
 
-def test_owner_alive_dead_pid_is_dead():
-    """pid 确认不存在（ProcessLookupError）→ False，不受心跳阈值影响。"""
+def test_owner_alive_dead_pid_falls_back_to_heartbeat():
+    """pid 不存在（ProcessLookupError）→ 不构成死亡证据，退化为仅心跳判定。
+
+    owner_pid 在真实部署里常是每条命令独立的短命包装 shell（Bash 工具的
+    zsh -c），命令结束后数秒内即死；若 pid 死亡即判死，活跃 run 在任意两次
+    npc 子命令之间都会被并发 init 误判为孤儿——即原始并发踩踏缺陷复现。
+    """
     dead = _dead_pid()
-    assert _owner.owner_alive({"owner_pid": dead}) is False
-    # 即使心跳新鲜也不复活
+    # 心跳新鲜 → 存活（包装 shell 退出不代表 owner 死亡）
     assert (
         _owner.owner_alive(
             {"owner_pid": dead, "owner_heartbeat_at": _iso_hours_ago(0.1)}
         )
+        is True
+    )
+    # 心跳过期 → 不存活（真崩溃，过期即可接管）
+    assert (
+        _owner.owner_alive(
+            {"owner_pid": dead, "owner_heartbeat_at": _iso_hours_ago(25)}
+        )
         is False
     )
+    # 心跳缺失 → 不存活（无信息即孤儿候选）
+    assert _owner.owner_alive({"owner_pid": dead}) is False
 
 
 def test_owner_alive_live_pid_stale_heartbeat_is_dead():
