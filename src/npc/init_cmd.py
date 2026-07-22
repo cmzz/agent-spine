@@ -177,6 +177,8 @@ def _scan_spine_worktrees_for_resume(
 
     副作用：发现 worktree 缺失/残破的 initializing 记录时，将骨架文件的 status 更新为
     'orphan'（记录在案），以便后续 clean 命令可以发现并回收，同时 init 继续新建 worktree。
+    孤儿标记同样过 owner 存活门槛：骨架 owner 仍存活（并发 init 的「骨架已落盘、
+    worktree add 未完成」窗口）时跳过标记，避免把他人活跃 run 误判为残骸。
     """
     try:
         worktrees = _git_ops.list_worktrees(canonical_repo_root, runner=runner)
@@ -206,6 +208,10 @@ def _scan_spine_worktrees_for_resume(
             wt_task_log_dir = home / "task_log" / wt_proj_key
             init_file = resume.find_latest_initializing(wt_task_log_dir)
             if init_file is not None:
+                # owner 存活门槛：骨架 owner 仍存活时不得标孤儿（目录缺失可能是
+                # 并发窗口/瞬态，标孤儿会把活跃 run 误判为可回收残骸）。
+                if _owner_alive_for_state_file(init_file):
+                    continue
                 _mark_initializing_skeleton_orphan(init_file)
             continue
         # 按 worktree 路径推 task_log_dir
@@ -261,6 +267,11 @@ def _scan_spine_worktrees_for_resume(
             wt_root = Path(wt_root_str)
             # 如果 worktree 不在 git 列表里且目录不存在 → 标记孤儿
             if wt_root not in known_wt_dirs and not wt_root.is_dir():
+                # owner 存活门槛：骨架 owner 仍存活时不得标孤儿——并发 init 场景下
+                # 对方可能正处于「骨架已落盘、git worktree add 尚未完成」的窗口，
+                # 此时标孤儿会把活跃 run 误判为可回收残骸。
+                if _owner_alive_for_state_file(init_file):
+                    continue
                 _mark_initializing_skeleton_orphan(init_file)
 
     # in-progress 优先

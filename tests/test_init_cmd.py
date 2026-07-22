@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -921,3 +923,166 @@ def test_init_no_worktree_owner_dead_resumes(init_env, capsys, make_args):
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["needs_resume"] is True
     assert payload["run_ts"] == old_run_ts
+
+
+# ============================================================
+# Review round-1 F2：孤儿标记 owner 门槛（竞态）
+# ============================================================
+
+
+def _initializing_skeleton(home: Path, name: str, run_ts: str, *, owner_pid: int) -> Path:
+    """写一个 worktree_root 指向不存在目录的 initializing 骨架（不建 worktree），返回骨架路径。"""
+    from npc import paths as _paths
+
+    wt_path = home / ".spine" / "worktrees" / "p" / name
+    wt_proj_key = _paths.proj_key_for(wt_path)
+    wt_task_log = home / "task_log" / wt_proj_key
+    wt_task_log.mkdir(parents=True)
+    skeleton_path = wt_task_log / f"{run_ts}-plan-state.json"
+    skeleton_path.write_text(json.dumps({
+        "schema_version": 2,
+        "run_ts": run_ts,
+        "status": "initializing",
+        "worktree_root": str(wt_path),
+        "spine_branch": f"spine/{run_ts}",
+        "base_branch": "main",
+        "plan_order": [],
+        "progress": [],
+        "owner_pid": owner_pid,
+        "owner_heartbeat_at": _fresh_heartbeat(),
+    }))
+    return skeleton_path
+
+
+def test_reverse_scan_orphan_mark_skips_alive_owner(worktree_env, make_args):
+    """反向扫描：worktree 缺失的 initializing 骨架 owner 存活 → MUST NOT 标 orphan。"""
+    repo, home = worktree_env
+    run_ts = "2026-05-02-1000"
+    skeleton_path = _initializing_skeleton(home, "ts_alive", run_ts, owner_pid=os.getpid())
+
+    mock_runner = _make_mock_runner(worktree_list_output="", current_branch="main")
+    needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
+        repo, home, runner=mock_runner
+    )
+    assert (needs_resume, wt, is_init) == (False, None, False)
+    data = json.loads(skeleton_path.read_text())
+    assert data["status"] == "initializing", (
+        f"owner 存活的骨架不应被标孤儿，实际 status={data['status']!r}"
+    )
+
+
+def test_reverse_scan_orphan_mark_marks_dead_owner(worktree_env, make_args):
+    """反向扫描：worktree 缺失的 initializing 骨架 owner 已死 → 仍标 orphan（既有行为）。"""
+    repo, home = worktree_env
+    run_ts = "2026-05-02-1100"
+    skeleton_path = _initializing_skeleton(home, "ts_dead", run_ts, owner_pid=_dead_pid())
+
+    mock_runner = _make_mock_runner(worktree_list_output="", current_branch="main")
+    _init._scan_spine_worktrees_for_resume(repo, home, runner=mock_runner)
+    data = json.loads(skeleton_path.read_text())
+    assert data["status"] == "orphan", (
+        f"owner 已死且 worktree 缺失的骨架应被标孤儿，实际 status={data['status']!r}"
+    )
+
+
+def test_forward_scan_missing_dir_orphan_mark_skips_alive_owner(worktree_env, make_args):
+    """正向扫描：worktree 在 git list 但目录缺失，骨架 owner 存活 → MUST NOT 标 orphan。"""
+    repo, home = worktree_env
+    run_ts = "2026-05-02-1200"
+    skeleton_path = _initializing_skeleton(home, "ts_listed", run_ts, owner_pid=os.getpid())
+    # 骨架的 worktree_root 目录不存在，但出现在 git worktree list 里
+    wt_root = json.loads(skeleton_path.read_text())["worktree_root"]
+
+    mock_runner = _make_mock_runner(
+        worktree_list_output=_wt_list_output(Path(wt_root), run_ts),
+        current_branch="main",
+    )
+    needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
+        repo, home, runner=mock_runner
+    )
+    assert (needs_resume, wt, is_init) == (False, None, False)
+    data = json.loads(skeleton_path.read_text())
+    assert data["status"] == "initializing", (
+        f"owner 存活的骨架不应被标孤儿，实际 status={data['status']!r}"
+    )
+
+
+def test_init_concurrent_scan_does_not_orphan_live_skeleton(worktree_env, capsys, make_args):
+    """真实竞态回归（round-1 F2）：session A 骨架已落盘、add_worktree 未完成时，
+    session B 的扫描 MUST NOT 把 A 的活跃骨架标为 orphan。
+
+    测试方法：在真实 run() 路径上用 runner 把 git worktree add 卡住（threading.Event），
+    主线程轮询到 initializing 骨架出现后，以「git list 尚无该 worktree」的视角跑第二次
+    真实 _scan_spine_worktrees_for_resume，断言骨架 status 保持 initializing；
+    随后放行 add，断言 init 正常完成。不 mock 被修复路径本身。
+    """
+    repo, home = worktree_env
+    add_gate = threading.Event()
+    add_entered = threading.Event()
+
+    base_runner = _make_mock_runner(
+        worktree_list_output="", worktree_add_rc=0, current_branch="main"
+    )
+
+    def blocking_runner(cmd, cwd=None, capture_output=False, text=False, env=None, **kwargs):
+        if "worktree" in cmd and "add" in cmd:
+            add_entered.set()
+            # 模拟慢速 worktree add：在主线程放行前一直阻塞（超时兜底防死等）
+            assert add_gate.wait(timeout=30), "测试未放行 worktree add"
+        return base_runner(cmd, cwd=cwd, capture_output=capture_output, text=text, env=env, **kwargs)
+
+    args = make_args(auto=False, fresh=False, shell_exports=False)
+    run_errors: list[BaseException] = []
+
+    def _session_a():
+        try:
+            _init.run(args, runner=blocking_runner)
+        except BaseException as e:  # noqa: BLE001 — 透传到主线程断言
+            run_errors.append(e)
+
+    thread = threading.Thread(target=_session_a)
+    thread.start()
+
+    try:
+        # 等待 session A 骨架落盘并抵达被卡住的 add_worktree
+        deadline = time.monotonic() + 30
+        skeleton_path = None
+        while time.monotonic() < deadline:
+            candidates = list(home.glob("task_log/**/*-plan-state.json"))
+            for cand in candidates:
+                try:
+                    if json.loads(cand.read_text()).get("status") == "initializing":
+                        skeleton_path = cand
+                        break
+                except (OSError, json.JSONDecodeError):
+                    continue
+            if skeleton_path is not None and add_entered.is_set():
+                break
+            time.sleep(0.01)
+        assert skeleton_path is not None, "session A 的 initializing 骨架未落盘"
+        assert add_entered.is_set(), "session A 未抵达 worktree add（竞态窗口未构造成功）"
+
+        # session B：此刻 git worktree list 里还没有 A 的 worktree（add 未完成），
+        # 目录也不存在 → 走反向扫描分支。owner（本进程父 pid）存活 → 不得标孤儿。
+        scan_runner = _make_mock_runner(worktree_list_output="", current_branch="main")
+        needs_resume, wt, is_init = _init._scan_spine_worktrees_for_resume(
+            repo, home, runner=scan_runner
+        )
+        assert (needs_resume, wt, is_init) == (False, None, False)
+        data = json.loads(skeleton_path.read_text())
+        assert data["status"] == "initializing", (
+            "竞态窗口内 session B 不得把 session A 的活跃骨架标为 orphan，"
+            f"实际 status={data['status']!r}"
+        )
+    finally:
+        add_gate.set()
+        thread.join(timeout=30)
+
+    assert not thread.is_alive(), "session A 的 run() 未在放行后完成"
+    assert not run_errors, f"session A 的 run() 抛异常：{run_errors}"
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["needs_resume"] is False
+    assert Path(payload["worktree_root"]).is_dir()
+    # 骨架已被 init-run 正常升级（不再是 initializing / orphan 残骸）
+    final = json.loads(skeleton_path.read_text())
+    assert final["status"] != "orphan"
